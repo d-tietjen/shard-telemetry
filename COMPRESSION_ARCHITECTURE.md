@@ -54,11 +54,26 @@ and 512 GiB respectively. Both caches verify object checksums and per-chunk
 integrity before returning bytes, and expose hit, miss, occupancy, and source
 byte counters through `TelemetryService`.
 
+Verified immutable chunks also have a separately bounded RAM tier. Ranges
+contained in one chunk are returned as shared `Arc` slices, so repeated block
+reads neither reopen SSD files nor copy payload bytes. The control cache can
+additionally retain decoded catalog pages and group manifests under its own
+conservatively accounted byte budget; immutable object keys are the cache
+identity, and checksum validation still occurs before admission.
+
+Trace and metric block filters are unioned into group and page catalog entries.
+Cold correlation lookup can therefore reject an irrelevant root page before
+reading its page object, or reject a group before reading its manifest. Trace
+summaries combine the exact primary trace-ID range with the Bloom filter for
+linked trace IDs. Group/page unions can increase false positives but cannot
+create false negatives; decoded records remain the exact authority.
+
 Selected payload extents are sorted and read as one batch. The cache retains
-the current 4 MiB chunk in memory while copying adjacent block ranges, so one
-query neither reopens the same SSD chunk for every block nor repeats an object
-range request. This is an execution optimization only: every block retains its
-own checksum and is verified independently before decode.
+the current 4 MiB chunk in memory and returns adjacent single-chunk extents as
+shared views, so one query neither reopens the same SSD chunk for every block,
+repeats an object range request, nor copies every selected extent. This is an
+execution optimization only: every block retains its own checksum and is
+verified independently before decode.
 
 The Adam error-loop corpus reached 33.13x with bzip2 and 27.56x with zstd-9 as
 raw 8 MiB blocks. A trained dictionary and the current line-template prototype

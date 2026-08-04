@@ -859,6 +859,7 @@ pub struct CatalogGroupEntry {
     /// Highest optional trace ID or series fingerprint represented by the group.
     pub max_signal_identity: Option<u128>,
     /// Union filter for shared trace/resource/scope/attribute identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_filter: Option<CorrelationBlockFilter>,
 }
 
@@ -1046,6 +1047,7 @@ pub struct CatalogPageRef {
     /// Highest optional trace ID or series fingerprint covered by the page.
     pub max_signal_identity: Option<u128>,
     /// Union filter for shared trace/resource/scope/attribute identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_filter: Option<CorrelationBlockFilter>,
 }
 
@@ -3515,6 +3517,11 @@ mod tests {
                 .map(|entry| entry.group_sequence)
                 .collect::<Vec<_>>(),
             vec![2]
+        );
+        assert!(
+            !serde_json::to_string(&candidates[0])
+                .expect("log catalog entry serializes")
+                .contains("correlation_filter")
         );
         let loaded = tier
             .load_group(&candidates[0])

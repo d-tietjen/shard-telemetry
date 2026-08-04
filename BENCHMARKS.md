@@ -259,6 +259,92 @@ The final `perf.data` SHA-256 is
 These are native revision-pinned measurements, not deterministic-simulation
 campaign evidence.
 
+### Second profile pass: metric lookup, encoding, and object controls — 2026-08-04
+
+Revision `6ea8ca645225ac6476a241767c1e489c2bf88dd1` was built from a clean
+bundle checkout, prewarmed, and measured three times sequentially on Adam
+physical CPU 0. Each signal run used 262,144 records and 2,000 lookup
+iterations. The table reports medians.
+
+| Signal | Stored bytes | Ratio | Encode MiB/s | Lookup/s | p50 / p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Logs | 9,523,630 | 25.02x | **94.29** | 78,681.74 | 12.63 / 16.31 us |
+| Traces | 1,558,224 | 69.06x | 269.11 | 700,875.22 | 1.38 / 1.41 us |
+| Metrics | 2,242,781 | 56.38x | 622.73 | **169,598.60** | 5.91 / 5.99 us |
+| Cross-signal correlation | — | — | — | 98,249.85 | 10.07 / 13.63 us |
+
+The exact-series metric path is now 13.87x faster than the retained
+`ed9f097` median of 12,227.66 lookups/s. It caches bounded decoded immutable
+chunks and streams non-overlapping exact-series chunks only until the requested
+page is complete. The conflict/overlap path still performs durable-offset
+winner arbitration. Log, trace, and correlation lookup remained within 4% of
+their retained medians.
+
+Correlation ingestion now resolves each tenant/resource/scope/attribute
+identity once per immutable input identity and appends monotonic postings
+without a redundant map probe. In the comparable profile, correlation posting
+insertion fell from 9.56% to 2.19% self cycles. The final 10,000-iteration
+profile captured 11,454 samples and approximately 41.46 billion cycles with
+zero lost samples.
+
+Typed OTLP log metadata is serialized directly from borrowed records into the
+existing MessagePack lane. A byte-identity test compares mixed plain and fully
+typed records—including nested values and NaN payload bits—with the former
+owned serializer. On Adam, the retained median log encoding improved from
+92.85 to 94.29 MiB/s (+1.55%), while `encode_typed_metadata` fell from 2.28%
+to 0.88% inclusive profile cycles (-61.40%). All three stored signal sizes
+above are identical to the prior implementation.
+
+The object cache now retains verified immutable payload chunks as shared
+`Arc` slices, avoiding a copy for ranges contained in one chunk. Catalog pages
+and group manifests have a separate, conservatively accounted parsed-object
+budget. Group and page catalog entries also carry union correlation filters,
+allowing absent resource/scope/attribute/trace correlations to fail before a
+manifest or payload read. Primary trace-ID ranges and linked-trace filters are
+combined fail-open, so collisions only add work.
+
+| Adam CPU-0 cold-path ablation | Median latency | Comparison |
+| --- | ---: | ---: |
+| Batched cold 64 × 64 KiB ranges | 16,500.83 us | one 4 MiB source read |
+| Batched warm ranges | **1.786 us** | 3,254.80x faster than the former 5,813.08 us path |
+| Raw cached page + manifest decode | 11.222 us | baseline |
+| Parsed page + manifest cache | **0.691 us** | **16.24x faster** |
+| Absent correlation rejected by catalog root | **0.035 us** | **19.74x faster** than parsed control traversal; zero payload reads |
+
+The cold first read remains bounded by loading and verifying the same 4 MiB
+source chunk; the optimization targets repeated warm reads and petabyte-scale
+catalog traversal. The standalone tier benchmark now reports payload-copy,
+parsed-control, and catalog-correlation ablations in one run.
+
+Retained native evidence:
+
+```text
+/home/dtietjen/shard-telemetry-evidence-6ea8ca6
+```
+
+The final profile hashes are:
+
+```text
+perf.data          bcb4ae4c18e017ee882b8b1a29530a77dbaa95b8d9d406b7faa16fec7e5d5170
+perf-flat.txt      985e7514aa8156077807225961397fab221f9dbd2200dd6878193d5513858438
+perf-children.txt  fdf70a8f505d5b754f819111c75a8206b711852b6062962f34c065ce94805851
+```
+
+The retained three-run output hashes are:
+
+```text
+signal-run-1  a2e4409ca6609fc2348e4c0aff6e7b2cae5e140596e9e760937c316e7a5dec9d
+signal-run-2  ed946fdbd976fddcebb97600bd8e6e87fdcf2b76900c17e659dde60d6d16f144
+signal-run-3  0ae5aafb3cbb5f49aa0496072d2cb0b795dae458b78223263d782503c47206e7
+tier-run-1    870496c2243312b674c363b9d85e402f2dc88fd470b9ed4f54bbdd840d7fbe08
+tier-run-2    61320e9ef34987cec206ae610c534ffa3a1d3377c185285183d08092e12415dc
+tier-run-3    3eb558c195366ffb7715e165c18ffa37f00d30fb03137e71c1972a7ca34bc378
+```
+
+The deterministic-simulation framework checkout on Adam was dirty, so these
+are clean product-revision, native pinned measurements rather than an exact
+task-schedule replay campaign.
+
 ## Current single-format 80 GiB acceptance — 2026-08-04
 
 This is the current pre-release result for commit
