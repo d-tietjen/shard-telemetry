@@ -180,6 +180,23 @@ impl Default for CorrelationBlockFilter {
 }
 
 impl CorrelationBlockFilter {
+    #[cfg(test)]
+    pub(crate) fn from_query(query: &CorrelationQuery) -> Self {
+        let mut filter = Self::default();
+        for key in query_keys(query) {
+            filter.insert(&query.tenant, key);
+        }
+        filter
+    }
+
+    /// Merges another immutable filter into this one without introducing
+    /// false negatives. Used to summarize blocks into catalog groups/pages.
+    pub(crate) fn union_assign(&mut self, other: &Self) {
+        for (target, source) in self.bits.iter_mut().zip(other.bits) {
+            *target |= source;
+        }
+    }
+
     /// Builds a filter for one immutable trace block.
     #[must_use]
     pub fn for_spans(spans: &[DurableSpan]) -> Self {

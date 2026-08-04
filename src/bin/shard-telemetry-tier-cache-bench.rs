@@ -4,7 +4,12 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use shard_telemetry::{LocalObjectStore, SsdCacheConfig, SsdObjectCache, TelemetryObjectStore};
+use shard_stream_core::{LogicalPartitionId, ShardId, TopicPartition};
+use shard_telemetry::{
+    CorrelationBlockFilter, LocalObjectStore, METRICS_TOPIC_ID, ObjectTierConfig, SsdCacheConfig,
+    SsdObjectCache, TelemetryObjectStore, TelemetryObjectTier, TelemetrySignal, TierArtifactKind,
+    TierArtifactSource, TierBlockEntry, TierCheckpoint, TierGroupSource, TierQueryRange, TraceId,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut object_bytes = 64 * 1024 * 1024usize;
@@ -51,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chunk_bytes,
         max_read_bytes: chunk_bytes,
         memory_bytes: 2 * chunk_bytes,
+        parsed_memory_bytes: 0,
     };
     let legacy = SsdObjectCache::open(root.join("legacy-cache"), config)?;
     let batched = SsdObjectCache::open(root.join("batched-cache"), config)?;
@@ -102,6 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batched_warm = batched_start.elapsed();
     let legacy_stats = legacy.stats();
     let batched_stats = batched.stats();
+    let control = benchmark_control_cache(&root, iterations.saturating_mul(100).max(1))?;
 
     println!("ShardTelemetry tier-cache benchmark");
     println!(
@@ -130,8 +137,161 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         batched_stats.misses,
         batched_stats.source_bytes,
     );
+    println!(
+        "control_us_per_query raw_decode={:.3} parsed={:.3} speedup={:.2}x iterations={} parsed_hits={}",
+        control.raw_decode_us,
+        control.parsed_us,
+        control.raw_decode_us / control.parsed_us,
+        control.iterations,
+        control.parsed_hits,
+    );
+    println!(
+        "correlation_catalog_prune_us_per_query={:.3} speedup_vs_parsed_control={:.2}x",
+        control.correlation_pruned_us,
+        control.parsed_us / control.correlation_pruned_us,
+    );
     println!("evidence_directory={}", root.display());
     Ok(())
+}
+
+struct ControlResult {
+    raw_decode_us: f64,
+    parsed_us: f64,
+    correlation_pruned_us: f64,
+    iterations: usize,
+    parsed_hits: u64,
+}
+
+fn benchmark_control_cache(
+    root: &std::path::Path,
+    iterations: usize,
+) -> Result<ControlResult, Box<dyn std::error::Error>> {
+    let source_directory = root.join("control-sources");
+    fs::create_dir_all(&source_directory)?;
+    let payload_path = source_directory.join("payload");
+    let index_path = source_directory.join("index");
+    fs::write(&payload_path, b"compressed metric chunk")?;
+    fs::write(&index_path, b"metric recovery index")?;
+    let store = LocalObjectStore::open(root.join("control-objects"))?;
+    let shard_id = ShardId::new(7);
+    let partition = TopicPartition::new(METRICS_TOPIC_ID, LogicalPartitionId::new(3));
+    let payload = fs::read(&payload_path)?;
+    let block = TierBlockEntry::for_signal_payload(
+        TelemetrySignal::Metrics,
+        1,
+        42,
+        42,
+        0,
+        0,
+        1,
+        100,
+        100,
+        0,
+        u64::try_from(payload.len())?,
+        blake3::hash(&payload).to_hex().to_string(),
+        CorrelationBlockFilter::default(),
+    )?;
+    let mut publisher = TelemetryObjectTier::open(
+        store.clone(),
+        shard_id,
+        partition,
+        ObjectTierConfig::default(),
+    )?;
+    publisher.publish_group(TierGroupSource {
+        group_sequence: 0,
+        checkpoint: TierCheckpoint {
+            next_placement_sequence: 1,
+            next_offset: 1,
+        },
+        blocks: vec![block],
+        artifacts: vec![
+            TierArtifactSource {
+                kind: TierArtifactKind::PayloadPack,
+                name: "signal.payload".into(),
+                path: payload_path,
+            },
+            TierArtifactSource {
+                kind: TierArtifactKind::QueryIndex,
+                name: "signal.index".into(),
+                path: index_path,
+            },
+        ],
+    })?;
+
+    let raw_tier = TelemetryObjectTier::open(
+        store.clone(),
+        shard_id,
+        partition,
+        ObjectTierConfig::default(),
+    )?;
+    let parsed_tier =
+        TelemetryObjectTier::open(store, shard_id, partition, ObjectTierConfig::default())?;
+    let raw_cache = SsdObjectCache::open(
+        root.join("raw-control-cache"),
+        SsdCacheConfig {
+            max_bytes: 1024 * 1024,
+            chunk_bytes: 64 * 1024,
+            max_read_bytes: 1024 * 1024,
+            memory_bytes: 1024 * 1024,
+            parsed_memory_bytes: 0,
+        },
+    )?;
+    let parsed_cache = SsdObjectCache::open(
+        root.join("parsed-control-cache"),
+        SsdCacheConfig {
+            max_bytes: 1024 * 1024,
+            chunk_bytes: 64 * 1024,
+            max_read_bytes: 1024 * 1024,
+            memory_bytes: 1024 * 1024,
+            parsed_memory_bytes: 1024 * 1024,
+        },
+    )?;
+    query_control(&raw_tier, &raw_cache)?;
+    query_control(&parsed_tier, &parsed_cache)?;
+
+    let raw_start = Instant::now();
+    for _ in 0..iterations {
+        black_box(query_control(&raw_tier, &raw_cache)?);
+    }
+    let raw_elapsed = raw_start.elapsed();
+    let parsed_start = Instant::now();
+    for _ in 0..iterations {
+        black_box(query_control(&parsed_tier, &parsed_cache)?);
+    }
+    let parsed_elapsed = parsed_start.elapsed();
+    let absent_query = shard_telemetry::CorrelationQuery::new("tenant-a")
+        .with_trace_id(TraceId::from_bytes([9; 16]).expect("benchmark trace ID is valid"));
+    let correlation_start = Instant::now();
+    for _ in 0..iterations {
+        let groups = parsed_tier.candidate_groups_cached_for_correlation(
+            TierQueryRange::default(),
+            &parsed_cache,
+            &absent_query,
+            TelemetrySignal::Metrics,
+        )?;
+        if !groups.is_empty() {
+            return Err("absent correlation was not pruned by the catalog".into());
+        }
+        black_box(groups);
+    }
+    let correlation_elapsed = correlation_start.elapsed();
+    Ok(ControlResult {
+        raw_decode_us: raw_elapsed.as_secs_f64() * 1e6 / iterations as f64,
+        parsed_us: parsed_elapsed.as_secs_f64() * 1e6 / iterations as f64,
+        correlation_pruned_us: correlation_elapsed.as_secs_f64() * 1e6 / iterations as f64,
+        iterations,
+        parsed_hits: parsed_cache.stats().parsed_hits,
+    })
+}
+
+fn query_control(
+    tier: &TelemetryObjectTier<LocalObjectStore>,
+    cache: &SsdObjectCache,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let groups = tier.candidate_groups_cached(TierQueryRange::default(), cache)?;
+    let group = groups.first().ok_or("published group is missing")?;
+    let manifest = tier.load_group_cached(group, cache)?;
+    Ok(manifest.group_sequence)
 }
 
 fn time<T>(operation: impl FnOnce() -> T) -> (std::time::Duration, T) {

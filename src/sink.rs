@@ -1399,7 +1399,16 @@ fn read_signal_tier_payloads(
         let Some(tier) = state.tiers.get(partition) else {
             continue;
         };
-        for group in tier.candidate_groups_cached(range, &state.control_cache)? {
+        let groups = match correlation {
+            Some(query) => tier.candidate_groups_cached_for_correlation(
+                range,
+                &state.control_cache,
+                query,
+                state.signal,
+            )?,
+            None => tier.candidate_groups_cached(range, &state.control_cache)?,
+        };
+        for group in groups {
             let manifest = tier.load_group_cached(&group, &state.control_cache)?;
             let artifact = manifest
                 .artifact(TierArtifactKind::PayloadPack)
@@ -2206,12 +2215,14 @@ mod tests {
                     chunk_bytes: 64 * 1024,
                     max_read_bytes: 8 * 1024 * 1024,
                     memory_bytes: 1024 * 1024,
+                    parsed_memory_bytes: 1024 * 1024,
                 },
                 payload_cache: SsdCacheConfig {
                     max_bytes: 16 * 1024 * 1024,
                     chunk_bytes: 64 * 1024,
                     max_read_bytes: 8 * 1024 * 1024,
                     memory_bytes: 4 * 1024 * 1024,
+                    parsed_memory_bytes: 0,
                 },
             }),
             ..OtlpSinkConfig::default()
@@ -2334,5 +2345,24 @@ mod tests {
             .expect("cold linked-trace correlation query");
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].signal, TelemetrySignal::Traces);
+        let before_absent = service
+            .object_tier_cache_stats()
+            .expect("object-tier cache diagnostics exist");
+        let absent_trace_id = crate::TraceId::from_bytes([7; 16]).expect("absent trace ID");
+        assert!(
+            service
+                .query_correlations(
+                    &CorrelationQuery::new("tenant-a")
+                        .with_trace_id(absent_trace_id)
+                        .with_limit(10),
+                )
+                .expect("absent cold correlation query")
+                .is_empty()
+        );
+        let after_absent = service
+            .object_tier_cache_stats()
+            .expect("object-tier cache diagnostics exist");
+        assert_eq!(after_absent.payload.hits, before_absent.payload.hits);
+        assert_eq!(after_absent.payload.misses, before_absent.payload.misses);
     }
 }

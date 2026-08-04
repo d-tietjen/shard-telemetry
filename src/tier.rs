@@ -13,7 +13,7 @@ use shard_stream_core::{ShardId, TopicPartition};
 
 use crate::{
     BlockCatalog, BlockDescriptor, BlockId, CompressionCodec, CorrelationBlockFilter,
-    TelemetryError, TelemetryResult, TelemetrySignal,
+    CorrelationQuery, TelemetryError, TelemetryResult, TelemetrySignal,
 };
 
 const TIER_FORMAT_VERSION: u8 = 1;
@@ -858,6 +858,8 @@ pub struct CatalogGroupEntry {
     pub min_signal_identity: Option<u128>,
     /// Highest optional trace ID or series fingerprint represented by the group.
     pub max_signal_identity: Option<u128>,
+    /// Union filter for shared trace/resource/scope/attribute identities.
+    pub correlation_filter: Option<CorrelationBlockFilter>,
 }
 
 impl CatalogGroupEntry {
@@ -907,6 +909,15 @@ impl CatalogGroupEntry {
             .iter()
             .filter_map(|block| block.max_signal_identity)
             .max();
+        let correlation_filter = manifest
+            .blocks
+            .iter()
+            .filter_map(|block| block.correlation_filter.as_ref())
+            .fold(None::<CorrelationBlockFilter>, |filter, block| {
+                let mut filter = filter.unwrap_or_default();
+                filter.union_assign(block);
+                Some(filter)
+            });
         Ok(Self {
             group_sequence: manifest.group_sequence,
             checkpoint: manifest.checkpoint,
@@ -921,6 +932,7 @@ impl CatalogGroupEntry {
             payload_bytes,
             min_signal_identity,
             max_signal_identity,
+            correlation_filter,
         })
     }
 
@@ -934,6 +946,7 @@ impl CatalogGroupEntry {
             || self.payload_bytes == 0
             || self.last_offset >= self.checkpoint.next_offset
             || self.min_signal_identity.is_some() != self.max_signal_identity.is_some()
+            || self.min_signal_identity.is_some() != self.correlation_filter.is_some()
             || self
                 .min_signal_identity
                 .zip(self.max_signal_identity)
@@ -1032,6 +1045,8 @@ pub struct CatalogPageRef {
     pub min_signal_identity: Option<u128>,
     /// Highest optional trace ID or series fingerprint covered by the page.
     pub max_signal_identity: Option<u128>,
+    /// Union filter for shared trace/resource/scope/attribute identities.
+    pub correlation_filter: Option<CorrelationBlockFilter>,
 }
 
 impl CatalogPageRef {
@@ -1092,6 +1107,15 @@ impl CatalogPageRef {
                 .iter()
                 .filter_map(|group| group.max_signal_identity)
                 .max(),
+            correlation_filter: page
+                .groups
+                .iter()
+                .filter_map(|group| group.correlation_filter.as_ref())
+                .fold(None::<CorrelationBlockFilter>, |filter, group| {
+                    let mut filter = filter.unwrap_or_default();
+                    filter.union_assign(group);
+                    Some(filter)
+                }),
         })
     }
 
@@ -1105,6 +1129,7 @@ impl CatalogPageRef {
             || self.min_timestamp_unix_nanos > self.max_timestamp_unix_nanos
             || self.last_offset >= self.last_checkpoint.next_offset
             || self.min_signal_identity.is_some() != self.max_signal_identity.is_some()
+            || self.min_signal_identity.is_some() != self.correlation_filter.is_some()
             || self
                 .min_signal_identity
                 .zip(self.max_signal_identity)
@@ -1279,6 +1304,25 @@ impl TierQueryRange {
                     .zip(max_signal_identity)
                     .is_some_and(|(min, max)| identity >= min && identity <= max)
             })
+    }
+}
+
+fn catalog_correlation_may_match(
+    filter: Option<&CorrelationBlockFilter>,
+    min_signal_identity: Option<u128>,
+    max_signal_identity: Option<u128>,
+    query: &CorrelationQuery,
+    signal: TelemetrySignal,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    if signal == TelemetrySignal::Traces {
+        min_signal_identity
+            .zip(max_signal_identity)
+            .is_none_or(|(minimum, maximum)| filter.may_match_trace_block(query, minimum, maximum))
+    } else {
+        filter.may_match(query)
     }
 }
 
@@ -1668,6 +1712,57 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         Ok(groups)
     }
 
+    /// Returns correlation candidates after pruning immutable catalog pages
+    /// and groups, before any group manifest or payload is loaded.
+    pub fn candidate_groups_cached_for_correlation(
+        &self,
+        range: TierQueryRange,
+        cache: &SsdObjectCache,
+        query: &CorrelationQuery,
+        signal: TelemetrySignal,
+    ) -> TelemetryResult<Vec<CatalogGroupEntry>> {
+        range.validate()?;
+        let mut groups = Vec::new();
+        for page_ref in &self.root.pages {
+            if !range.overlaps(
+                page_ref.first_offset,
+                page_ref.last_offset,
+                page_ref.min_timestamp_unix_nanos,
+                page_ref.max_timestamp_unix_nanos,
+                page_ref.min_signal_identity,
+                page_ref.max_signal_identity,
+            ) || !catalog_correlation_may_match(
+                page_ref.correlation_filter.as_ref(),
+                page_ref.min_signal_identity,
+                page_ref.max_signal_identity,
+                query,
+                signal,
+            ) {
+                continue;
+            }
+            let page = self.load_page_cached(page_ref, cache)?;
+            for group in &page.groups {
+                if range.overlaps(
+                    group.first_offset,
+                    group.last_offset,
+                    group.min_timestamp_unix_nanos,
+                    group.max_timestamp_unix_nanos,
+                    group.min_signal_identity,
+                    group.max_signal_identity,
+                ) && catalog_correlation_may_match(
+                    group.correlation_filter.as_ref(),
+                    group.min_signal_identity,
+                    group.max_signal_identity,
+                    query,
+                    signal,
+                ) {
+                    groups.push(group.clone());
+                }
+            }
+        }
+        Ok(groups)
+    }
+
     /// Loads only the final catalog page and returns its newest group entry.
     pub fn latest_group(&self) -> TelemetryResult<Option<CatalogGroupEntry>> {
         let Some(reference) = self.root.pages.last() else {
@@ -1702,13 +1797,17 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         range: TierQueryRange,
         visit: impl FnMut(&CatalogGroupEntry) -> TelemetryResult<bool>,
     ) -> TelemetryResult<()> {
-        self.for_each_candidate_group_with(range, |reference| self.load_page(reference), visit)
+        self.for_each_candidate_group_with(
+            range,
+            |reference| self.load_page(reference).map(Arc::new),
+            visit,
+        )
     }
 
     fn for_each_candidate_group_with(
         &self,
         range: TierQueryRange,
-        mut load_page: impl FnMut(&CatalogPageRef) -> TelemetryResult<CatalogPage>,
+        mut load_page: impl FnMut(&CatalogPageRef) -> TelemetryResult<Arc<CatalogPage>>,
         mut visit: impl FnMut(&CatalogGroupEntry) -> TelemetryResult<bool>,
     ) -> TelemetryResult<()> {
         range.validate()?;
@@ -1755,10 +1854,13 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         &self,
         entry: &CatalogGroupEntry,
         cache: &SsdObjectCache,
-    ) -> TelemetryResult<TierGroupManifest> {
+    ) -> TelemetryResult<Arc<TierGroupManifest>> {
         entry.validate()?;
         if entry.manifest_bytes > cache.max_read_bytes() {
-            return self.load_group(entry);
+            return self.load_group(entry).map(Arc::new);
+        }
+        if let Some(manifest) = cache.parsed_manifest_hit(&entry.manifest_key)? {
+            return Ok(manifest);
         }
         let metadata = ObjectMetadata {
             bytes: entry.manifest_bytes,
@@ -1771,7 +1873,13 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
             &metadata,
             0..entry.manifest_bytes,
         )?;
-        self.decode_group(entry, &bytes)
+        let manifest = Arc::new(self.decode_group(entry, &bytes)?);
+        cache.admit_parsed_control(
+            entry.manifest_key.clone(),
+            ParsedControlObject::GroupManifest(Arc::clone(&manifest)),
+            entry.manifest_bytes,
+        )?;
+        Ok(manifest)
     }
 
     /// Reads and verifies a complete immutable artifact on demand.
@@ -1836,10 +1944,13 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         &self,
         reference: &CatalogPageRef,
         cache: &SsdObjectCache,
-    ) -> TelemetryResult<CatalogPage> {
+    ) -> TelemetryResult<Arc<CatalogPage>> {
         reference.validate()?;
         if reference.page_bytes > cache.max_read_bytes() {
-            return self.load_page(reference);
+            return self.load_page(reference).map(Arc::new);
+        }
+        if let Some(page) = cache.parsed_page_hit(&reference.page_key)? {
+            return Ok(page);
         }
         let metadata = ObjectMetadata {
             bytes: reference.page_bytes,
@@ -1852,7 +1963,13 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
             &metadata,
             0..reference.page_bytes,
         )?;
-        self.decode_page(reference, &bytes)
+        let page = Arc::new(self.decode_page(reference, &bytes)?);
+        cache.admit_parsed_control(
+            reference.page_key.clone(),
+            ParsedControlObject::CatalogPage(Arc::clone(&page)),
+            reference.page_bytes,
+        )?;
+        Ok(page)
     }
 
     fn decode_page(
@@ -1914,6 +2031,8 @@ pub struct SsdCacheConfig {
     pub max_read_bytes: u64,
     /// Maximum verified immutable chunk bytes retained in RAM.
     pub memory_bytes: u64,
+    /// Maximum decoded catalog-page and group-manifest bytes retained in RAM.
+    pub parsed_memory_bytes: u64,
 }
 
 impl Default for SsdCacheConfig {
@@ -1923,6 +2042,7 @@ impl Default for SsdCacheConfig {
             chunk_bytes: 4 * 1024 * 1024,
             max_read_bytes: 64 * 1024 * 1024,
             memory_bytes: 256 * 1024 * 1024,
+            parsed_memory_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -1956,15 +2076,31 @@ struct MemoryCacheEntry {
     stamp: u64,
 }
 
+#[derive(Debug, Clone)]
+enum ParsedControlObject {
+    CatalogPage(Arc<CatalogPage>),
+    GroupManifest(Arc<TierGroupManifest>),
+}
+
+#[derive(Debug)]
+struct ParsedControlEntry {
+    object: ParsedControlObject,
+    accounted_bytes: u64,
+    stamp: u64,
+}
+
 #[derive(Debug, Default)]
 struct CacheState {
     entries: HashMap<String, CacheEntry>,
     used_bytes: u64,
     memory_entries: HashMap<String, MemoryCacheEntry>,
     memory_used_bytes: u64,
+    parsed_entries: HashMap<String, ParsedControlEntry>,
+    parsed_used_bytes: u64,
     clock: u64,
     hits: u64,
     memory_hits: u64,
+    parsed_hits: u64,
     misses: u64,
     source_bytes: u64,
 }
@@ -1980,10 +2116,16 @@ pub struct SsdCacheStats {
     pub hits: u64,
     /// Hits served from already verified immutable RAM chunks.
     pub memory_hits: u64,
-    /// Immutable chunks currently retained in RAM.
+    /// Hits served from decoded immutable catalog pages or group manifests.
+    pub parsed_hits: u64,
+    /// Immutable chunks and decoded control objects currently retained in RAM.
     pub memory_entries: usize,
-    /// Verified immutable chunk bytes currently retained in RAM.
+    /// Verified raw and conservatively accounted decoded bytes retained in RAM.
     pub memory_used_bytes: u64,
+    /// Decoded immutable control objects currently retained in RAM.
+    pub parsed_entries: usize,
+    /// Conservative decoded-control memory accounted against the RAM budget.
+    pub parsed_used_bytes: u64,
     /// Chunks fetched from object storage since open.
     pub misses: u64,
     /// Object-store payload bytes fetched by cache misses since open.
@@ -2090,8 +2232,16 @@ impl SsdObjectCache {
                 used_bytes: state.used_bytes,
                 hits: state.hits,
                 memory_hits: state.memory_hits,
-                memory_entries: state.memory_entries.len(),
-                memory_used_bytes: state.memory_used_bytes,
+                parsed_hits: state.parsed_hits,
+                memory_entries: state
+                    .memory_entries
+                    .len()
+                    .saturating_add(state.parsed_entries.len()),
+                memory_used_bytes: state
+                    .memory_used_bytes
+                    .saturating_add(state.parsed_used_bytes),
+                parsed_entries: state.parsed_entries.len(),
+                parsed_used_bytes: state.parsed_used_bytes,
                 misses: state.misses,
                 source_bytes: state.source_bytes,
             },
@@ -2432,6 +2582,99 @@ impl SsdObjectCache {
         Ok(bytes)
     }
 
+    fn parsed_page_hit(&self, cache_key: &str) -> TelemetryResult<Option<Arc<CatalogPage>>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
+        state.clock = state.clock.wrapping_add(1);
+        let stamp = state.clock;
+        let page = state
+            .parsed_entries
+            .get_mut(cache_key)
+            .and_then(|entry| match &entry.object {
+                ParsedControlObject::CatalogPage(page) => {
+                    entry.stamp = stamp;
+                    Some(Arc::clone(page))
+                }
+                ParsedControlObject::GroupManifest(_) => None,
+            });
+        if page.is_some() {
+            state.hits = state.hits.saturating_add(1);
+            state.parsed_hits = state.parsed_hits.saturating_add(1);
+        }
+        Ok(page)
+    }
+
+    fn parsed_manifest_hit(
+        &self,
+        cache_key: &str,
+    ) -> TelemetryResult<Option<Arc<TierGroupManifest>>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
+        state.clock = state.clock.wrapping_add(1);
+        let stamp = state.clock;
+        let manifest =
+            state
+                .parsed_entries
+                .get_mut(cache_key)
+                .and_then(|entry| match &entry.object {
+                    ParsedControlObject::GroupManifest(manifest) => {
+                        entry.stamp = stamp;
+                        Some(Arc::clone(manifest))
+                    }
+                    ParsedControlObject::CatalogPage(_) => None,
+                });
+        if manifest.is_some() {
+            state.hits = state.hits.saturating_add(1);
+            state.parsed_hits = state.parsed_hits.saturating_add(1);
+        }
+        Ok(manifest)
+    }
+
+    fn admit_parsed_control(
+        &self,
+        cache_key: String,
+        object: ParsedControlObject,
+        source_bytes: u64,
+    ) -> TelemetryResult<()> {
+        // JSON control objects expand into strings and vectors. Four times the
+        // immutable source length is a conservative charge that keeps parsed
+        // state under the same hard RAM budget as verified raw chunks.
+        let accounted_bytes = source_bytes.saturating_mul(4);
+        if self.config.parsed_memory_bytes == 0 || accounted_bytes > self.config.parsed_memory_bytes
+        {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
+        state.clock = state.clock.wrapping_add(1);
+        let stamp = state.clock;
+        if let Some(previous) = state.parsed_entries.insert(
+            cache_key,
+            ParsedControlEntry {
+                object,
+                accounted_bytes,
+                stamp,
+            },
+        ) {
+            state.parsed_used_bytes = state
+                .parsed_used_bytes
+                .saturating_sub(previous.accounted_bytes);
+        }
+        state.parsed_used_bytes = state.parsed_used_bytes.saturating_add(accounted_bytes);
+        evict_memory_to_budgets(
+            &mut state,
+            self.config.memory_bytes,
+            self.config.parsed_memory_bytes,
+        );
+        Ok(())
+    }
+
     fn admit_memory_chunk(&self, cache_key: String, bytes: Arc<[u8]>) -> TelemetryResult<()> {
         let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if self.config.memory_bytes == 0 || bytes_len > self.config.memory_bytes {
@@ -2452,22 +2695,11 @@ impl SsdObjectCache {
                 .saturating_sub(u64::try_from(previous.bytes.len()).unwrap_or(u64::MAX));
         }
         state.memory_used_bytes = state.memory_used_bytes.saturating_add(bytes_len);
-        while state.memory_used_bytes > self.config.memory_bytes {
-            let Some(key) = state
-                .memory_entries
-                .iter()
-                .min_by_key(|(key, entry)| (entry.stamp, *key))
-                .map(|(key, _)| key.clone())
-            else {
-                state.memory_used_bytes = 0;
-                break;
-            };
-            if let Some(removed) = state.memory_entries.remove(&key) {
-                state.memory_used_bytes = state
-                    .memory_used_bytes
-                    .saturating_sub(u64::try_from(removed.bytes.len()).unwrap_or(u64::MAX));
-            }
-        }
+        evict_memory_to_budgets(
+            &mut state,
+            self.config.memory_bytes,
+            self.config.parsed_memory_bytes,
+        );
         Ok(())
     }
 
@@ -2550,6 +2782,41 @@ impl SsdObjectCache {
             .lock()
             .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
         evict_locked(&mut state, self.config.max_bytes)
+    }
+}
+
+fn evict_memory_to_budgets(state: &mut CacheState, raw_budget: u64, parsed_budget: u64) {
+    while state.memory_used_bytes > raw_budget {
+        let Some(key) = state
+            .memory_entries
+            .iter()
+            .min_by_key(|(key, entry)| (entry.stamp, *key))
+            .map(|(key, _)| key.clone())
+        else {
+            state.memory_used_bytes = 0;
+            break;
+        };
+        if let Some(removed) = state.memory_entries.remove(&key) {
+            state.memory_used_bytes = state
+                .memory_used_bytes
+                .saturating_sub(u64::try_from(removed.bytes.len()).unwrap_or(u64::MAX));
+        }
+    }
+    while state.parsed_used_bytes > parsed_budget {
+        let Some(key) = state
+            .parsed_entries
+            .iter()
+            .min_by_key(|(key, entry)| (entry.stamp, *key))
+            .map(|(key, _)| key.clone())
+        else {
+            state.parsed_used_bytes = 0;
+            break;
+        };
+        if let Some(removed) = state.parsed_entries.remove(&key) {
+            state.parsed_used_bytes = state
+                .parsed_used_bytes
+                .saturating_sub(removed.accounted_bytes);
+        }
     }
 }
 
@@ -3028,7 +3295,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        CompressionCohortId, CompressionPlacementId, CompressionTemperature, DictionaryId,
+        CompressionCohortId, CompressionPlacementId, CompressionTemperature, DictionaryId, TraceId,
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -3068,6 +3335,45 @@ mod tests {
 
     fn write_test_file(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).expect("test artifact is written");
+    }
+
+    #[test]
+    fn catalog_correlation_summary_keeps_primary_and_linked_trace_matches() {
+        let primary = TraceId::from_bytes([1; 16]).expect("primary trace ID is valid");
+        let linked = TraceId::from_bytes([2; 16]).expect("linked trace ID is valid");
+        let absent = TraceId::from_bytes([3; 16]).expect("absent trace ID is valid");
+        let primary_value = u128::from_be_bytes(*primary.as_bytes());
+        let linked_query = CorrelationQuery::new("tenant-a").with_trace_id(linked);
+        let linked_filter = CorrelationBlockFilter::from_query(&linked_query);
+
+        assert!(catalog_correlation_may_match(
+            Some(&CorrelationBlockFilter::default()),
+            Some(primary_value),
+            Some(primary_value),
+            &CorrelationQuery::new("tenant-a").with_trace_id(primary),
+            TelemetrySignal::Traces,
+        ));
+        assert!(catalog_correlation_may_match(
+            Some(&linked_filter),
+            Some(primary_value),
+            Some(primary_value),
+            &linked_query,
+            TelemetrySignal::Traces,
+        ));
+        assert!(!catalog_correlation_may_match(
+            Some(&linked_filter),
+            Some(primary_value),
+            Some(primary_value),
+            &CorrelationQuery::new("tenant-a").with_trace_id(absent),
+            TelemetrySignal::Traces,
+        ));
+        assert!(catalog_correlation_may_match(
+            Some(&linked_filter),
+            Some(99),
+            Some(99),
+            &linked_query,
+            TelemetrySignal::Metrics,
+        ));
     }
 
     fn group_source(
@@ -3481,6 +3787,7 @@ mod tests {
                 chunk_bytes: 4,
                 max_read_bytes: 16,
                 memory_bytes: 8,
+                parsed_memory_bytes: 0,
             },
         )
         .expect("cache opens");
@@ -3526,6 +3833,7 @@ mod tests {
                 chunk_bytes: 4,
                 max_read_bytes: 16,
                 memory_bytes: 16,
+                parsed_memory_bytes: 0,
             },
         )
         .expect("cache opens");
@@ -3579,6 +3887,7 @@ mod tests {
                 chunk_bytes: 1_024,
                 max_read_bytes: 64 * 1_024,
                 memory_bytes: 32 * 1_024,
+                parsed_memory_bytes: 32 * 1_024,
             },
         )
         .expect("cache opens");
@@ -3618,5 +3927,9 @@ mod tests {
             tier.object_store().range_reads.load(Ordering::Relaxed),
             reads_after_first_query
         );
+        let stats = cache.stats();
+        assert_eq!(stats.parsed_hits, 2);
+        assert_eq!(stats.parsed_entries, 2);
+        assert!(stats.memory_used_bytes <= 32 * 1_024);
     }
 }
