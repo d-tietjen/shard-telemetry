@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use pco::standalone::{simple_compress, simple_decompress_into};
 use pco::{ChunkConfig, DeltaSpec, ModeSpec};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use shard_stream_core::LogicalOffset;
 
@@ -102,7 +103,7 @@ pub struct DecodedStructuralRecord {
 }
 
 /// Borrowed exact OTLP metadata exposed to the structural encoder.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct StructuralLogMetadataRef<'a> {
     /// Original observed timestamp.
     pub observed_timestamp_unix_nanos: u64,
@@ -1622,18 +1623,23 @@ fn encode_fields(
 }
 
 fn encode_typed_metadata<R: StructuralRecordView>(records: &[R]) -> TelemetryResult<Vec<u8>> {
-    let metadata = records
+    if records
         .iter()
-        .map(|record| {
-            record
-                .structural_log_metadata()
-                .map(StructuralLogMetadata::from)
-        })
-        .collect::<Vec<_>>();
-    if metadata.iter().all(Option::is_none) {
+        .all(|record| record.structural_log_metadata().is_none())
+    {
         return Ok(Vec::new());
     }
-    let raw = rmp_serde::to_vec(&metadata)
+    let mut raw = Vec::with_capacity(records.len().saturating_mul(64));
+    let mut serializer = rmp_serde::Serializer::new(&mut raw);
+    let mut sequence = serde::Serializer::serialize_seq(&mut serializer, Some(records.len()))
+        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    for record in records {
+        sequence
+            .serialize_element(&record.structural_log_metadata())
+            .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    }
+    sequence
+        .end()
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
     let compressed = zstd::bulk::compress(&raw, 1)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
@@ -3199,6 +3205,76 @@ mod tests {
             })
             .collect::<Vec<_>>();
         encode_timestamps(&records).expect("timestamps encode")
+    }
+
+    fn encode_owned_typed_metadata(records: &[DurableLog]) -> Vec<u8> {
+        let metadata = records
+            .iter()
+            .map(|record| {
+                record
+                    .structural_log_metadata()
+                    .map(StructuralLogMetadata::from)
+            })
+            .collect::<Vec<_>>();
+        if metadata.iter().all(Option::is_none) {
+            return Vec::new();
+        }
+        let raw = rmp_serde::to_vec(&metadata).expect("owned metadata serializes");
+        let compressed = zstd::bulk::compress(&raw, 1).expect("owned metadata compresses");
+        let mut encoded = Vec::with_capacity(4 + compressed.len());
+        encoded.extend_from_slice(
+            &u32::try_from(raw.len())
+                .expect("test metadata length fits")
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&compressed);
+        encoded
+    }
+
+    #[test]
+    fn borrowed_typed_metadata_encoding_is_byte_identical_to_owned_encoding() {
+        let mut typed = record(4, "typed body");
+        typed.observed_timestamp_unix_nanos = 99;
+        typed.body = Some(TelemetryValue::Map(Arc::new(vec![
+            TelemetryAttribute::new("nested", TelemetryValue::Integer(-7)),
+            TelemetryAttribute::new("empty", TelemetryValue::Empty),
+        ])));
+        typed = typed.with_attribute(TelemetryAttribute::new(
+            "ratio",
+            TelemetryValue::DoubleBits(0x7ff8_0000_0000_0042),
+        ));
+        typed.resource = Arc::new(ResourceContext {
+            attributes: Arc::new(vec![TelemetryAttribute::new(
+                "service.name",
+                TelemetryValue::String(Arc::from("checkout")),
+            )]),
+            dropped_attributes_count: 2,
+            schema_url: Arc::from("https://example.test/resource"),
+            entity_refs: Arc::new(Vec::new()),
+        });
+        typed.scope = Arc::new(ScopeContext {
+            name: Arc::from("checkout.instrumentation"),
+            version: Arc::from("1.2.3"),
+            attributes: Arc::new(vec![TelemetryAttribute::new(
+                "scope.enabled",
+                TelemetryValue::Boolean(true),
+            )]),
+            dropped_attributes_count: 1,
+            schema_url: Arc::from("https://example.test/scope"),
+        });
+        typed.severity_number = 17;
+        typed.severity_text = Arc::from("ERROR");
+        typed.dropped_attributes_count = 3;
+        typed.flags = 1;
+        typed.trace_id = Some(TraceId::from_bytes([1; 16]).expect("trace ID is valid"));
+        typed.span_id = Some(SpanId::from_bytes([2; 8]).expect("span ID is valid"));
+        typed.event_name = Arc::from("payment.failed");
+
+        let records = vec![record(3, "plain body"), typed, record(5, "plain again")];
+        assert_eq!(
+            encode_typed_metadata(&records).expect("borrowed metadata encodes"),
+            encode_owned_typed_metadata(&records)
+        );
     }
 
     #[test]
