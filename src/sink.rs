@@ -18,6 +18,7 @@ use crate::correlation::{metric_matches_correlation, span_matches_correlation};
 use crate::ingest_pack::validate_ingest_pack;
 use crate::metric::metric_query_matches;
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
+use crate::tier::CachedObjectRange;
 use crate::trace::trace_query_matches;
 use crate::{
     CorrelationConfig, CorrelationIndex, CorrelationQuery, DictionaryCatalog, DurableMetricPoint,
@@ -1387,7 +1388,7 @@ fn read_signal_tier_payloads(
     partitions: &[TopicPartition],
     range: TierQueryRange,
     correlation: Option<&CorrelationQuery>,
-) -> TelemetryResult<Vec<Vec<u8>>> {
+) -> TelemetryResult<Vec<CachedObjectRange>> {
     let mut payloads = Vec::new();
     let expected_codec = match state.signal {
         TelemetrySignal::Traces => "trace-native",
@@ -1453,14 +1454,14 @@ fn read_signal_tier_payloads(
                     Ok(block.payload_offset..end)
                 })
                 .collect::<TelemetryResult<Vec<_>>>()?;
-            let encoded = state.payload_cache.read_ranges_with_metadata(
+            let encoded = state.payload_cache.read_shared_ranges_with_metadata(
                 tier.object_store(),
                 &artifact.object_key,
                 &metadata,
                 &ranges,
             )?;
             for (block, payload) in blocks.into_iter().zip(encoded) {
-                if blake3::hash(&payload).to_hex().as_str() != block.payload_checksum {
+                if blake3::hash(payload.as_ref()).to_hex().as_str() != block.payload_checksum {
                     return Err(TelemetryError::CorruptTier(format!(
                         "signal block {} payload checksum failed",
                         block.block_id
@@ -1503,7 +1504,7 @@ fn query_trace_stripe(
             },
             None,
         )? {
-            for span in decode_trace_block(&payload)?
+            for span in decode_trace_block(payload.as_ref())?
                 .into_iter()
                 .filter(|span| trace_query_matches(query, span))
             {
@@ -1555,7 +1556,7 @@ fn query_metric_stripe(
             },
             None,
         )? {
-            for point in decode_metric_chunk(&payload)?
+            for point in decode_metric_chunk(payload.as_ref())?
                 .into_iter()
                 .filter(|point| metric_query_matches(query, point))
             {
@@ -1678,13 +1679,13 @@ fn query_correlation_stripe(
         {
             match signal {
                 TelemetrySignal::Traces => refs.extend(
-                    decode_trace_block(&payload)?
+                    decode_trace_block(payload.as_ref())?
                         .into_iter()
                         .filter(|span| span_matches_correlation(query, span))
                         .map(|span| span.record_ref),
                 ),
                 TelemetrySignal::Metrics => refs.extend(
-                    decode_metric_chunk(&payload)?
+                    decode_metric_chunk(payload.as_ref())?
                         .into_iter()
                         .filter(|point| metric_matches_correlation(query, point))
                         .map(|point| point.record_ref),
@@ -2204,11 +2205,13 @@ mod tests {
                     max_bytes: 16 * 1024 * 1024,
                     chunk_bytes: 64 * 1024,
                     max_read_bytes: 8 * 1024 * 1024,
+                    memory_bytes: 1024 * 1024,
                 },
                 payload_cache: SsdCacheConfig {
                     max_bytes: 16 * 1024 * 1024,
                     chunk_bytes: 64 * 1024,
                     max_read_bytes: 8 * 1024 * 1024,
+                    memory_bytes: 4 * 1024 * 1024,
                 },
             }),
             ..OtlpSinkConfig::default()

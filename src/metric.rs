@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hash};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use foldhash::{HashMap, HashMapExt, HashSet};
@@ -23,6 +25,8 @@ const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_CHUNK_POINTS: usize = 4_096;
 const DEFAULT_CHUNK_NANOS: u64 = 2 * 60 * 60 * 1_000_000_000;
 const SERIES_ID_CACHE_ENTRIES: usize = 1_024;
+const DECODED_METRIC_CACHE_ENTRIES: usize = 256;
+const MAX_DECODED_METRIC_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Exact scalar number used by gauges, sums, and exemplars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1332,6 +1336,7 @@ pub struct MetricStripe {
     name_index: HashMap<Arc<str>, HashSet<SeriesFingerprint>>,
     label_index: HashMap<(Arc<str>, Arc<str>), HashSet<SeriesFingerprint>>,
     identity_fingerprints: Vec<Option<CachedSeriesIdentity>>,
+    decoded_chunks: RefCell<DecodedMetricCache>,
 }
 
 #[derive(Debug)]
@@ -1347,6 +1352,90 @@ struct SealedMetricChunk {
     min_timestamp_unix_nanos: u64,
     max_timestamp_unix_nanos: u64,
     payload: Arc<[u8]>,
+}
+
+#[derive(Debug)]
+struct CachedDecodedMetricChunk {
+    resident_id: u64,
+    estimated_bytes: usize,
+    points: Arc<[DurableMetricPoint]>,
+}
+
+#[derive(Debug)]
+struct DecodedMetricCache {
+    slots: Vec<Option<CachedDecodedMetricChunk>>,
+    max_bytes: usize,
+    used_bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl DecodedMetricCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            slots: std::iter::repeat_with(|| None)
+                .take(DECODED_METRIC_CACHE_ENTRIES)
+                .collect(),
+            max_bytes,
+            used_bytes: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, resident_id: u64) -> Option<Arc<[DurableMetricPoint]>> {
+        let slot = resident_id as usize & (DECODED_METRIC_CACHE_ENTRIES - 1);
+        if let Some(cached) = &self.slots[slot]
+            && cached.resident_id == resident_id
+        {
+            self.hits = self.hits.saturating_add(1);
+            return Some(Arc::clone(&cached.points));
+        }
+        self.misses = self.misses.saturating_add(1);
+        None
+    }
+
+    fn insert(
+        &mut self,
+        resident_id: u64,
+        estimated_bytes: usize,
+        points: Arc<[DurableMetricPoint]>,
+    ) {
+        if estimated_bytes > self.max_bytes {
+            return;
+        }
+        let slot = resident_id as usize & (DECODED_METRIC_CACHE_ENTRIES - 1);
+        if let Some(previous) = self.slots[slot].take() {
+            self.used_bytes = self.used_bytes.saturating_sub(previous.estimated_bytes);
+        }
+        while self.used_bytes.saturating_add(estimated_bytes) > self.max_bytes {
+            let Some(index) = self.slots.iter().position(Option::is_some) else {
+                break;
+            };
+            let previous = self.slots[index]
+                .take()
+                .expect("position selected an occupied metric cache slot");
+            self.used_bytes = self.used_bytes.saturating_sub(previous.estimated_bytes);
+        }
+        self.used_bytes = self.used_bytes.saturating_add(estimated_bytes);
+        self.slots[slot] = Some(CachedDecodedMetricChunk {
+            resident_id,
+            estimated_bytes,
+            points,
+        });
+    }
+
+    fn remove(&mut self, resident_ids: &[u64]) {
+        for slot in &mut self.slots {
+            if slot
+                .as_ref()
+                .is_some_and(|cached| resident_ids.contains(&cached.resident_id))
+            {
+                let removed = slot.take().expect("cache slot was occupied");
+                self.used_bytes = self.used_bytes.saturating_sub(removed.estimated_bytes);
+            }
+        }
+    }
 }
 
 enum ExactMetricSource<'a> {
@@ -1401,6 +1490,11 @@ impl MetricStripe {
             identity_fingerprints: std::iter::repeat_with(|| None)
                 .take(SERIES_ID_CACHE_ENTRIES)
                 .collect(),
+            decoded_chunks: RefCell::new(DecodedMetricCache::new(
+                head_budget_bytes
+                    .saturating_div(8)
+                    .min(MAX_DECODED_METRIC_CACHE_BYTES),
+            )),
         })
     }
 
@@ -1716,11 +1810,12 @@ impl MetricStripe {
                 continue;
             }
             for chunk in chunks {
-                for point in decode_metric_chunk(&chunk.payload)?
-                    .into_iter()
+                let decoded = self.decode_chunk(chunk)?;
+                for point in decoded
+                    .iter()
                     .filter(|point| metric_query_matches(query, point))
                 {
-                    retain_metric_winner(&mut winners, *series, point);
+                    retain_metric_winner(&mut winners, *series, point.clone());
                 }
             }
         }
@@ -1741,6 +1836,9 @@ impl MetricStripe {
         };
         if !metric_identity_matches(query, &head.identity) {
             return Ok(Vec::new());
+        }
+        if self.exact_series_sources_are_disjoint(series, head) {
+            return self.query_disjoint_exact_series(query, series, head, limit);
         }
         let mut sources = Vec::with_capacity(
             usize::from(!head.points.is_empty()) + self.chunks.get(&series).map_or(0, Vec::len),
@@ -1789,16 +1887,103 @@ impl MetricStripe {
                     }
                 }
                 ExactMetricSource::Chunk(chunk) => {
-                    for point in decode_metric_chunk(&chunk.payload)?
-                        .into_iter()
+                    let decoded = self.decode_chunk(chunk)?;
+                    for point in decoded
+                        .iter()
                         .filter(|point| metric_point_time_matches(query, point))
                     {
-                        retain_exact_metric_winner(&mut winners, point);
+                        retain_exact_metric_winner(&mut winners, point.clone());
                     }
                 }
             }
         }
         Ok(winners.into_values().take(limit).collect())
+    }
+
+    fn exact_series_sources_are_disjoint(
+        &self,
+        series: SeriesFingerprint,
+        head: &SeriesHead,
+    ) -> bool {
+        let chunks = self
+            .chunks
+            .get(&series)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if chunks
+            .windows(2)
+            .any(|pair| pair[0].max_timestamp_unix_nanos >= pair[1].min_timestamp_unix_nanos)
+        {
+            return false;
+        }
+        let Some(((head_min, _), _)) = head.points.first_key_value() else {
+            return true;
+        };
+        chunks
+            .last()
+            .is_none_or(|chunk| chunk.max_timestamp_unix_nanos < *head_min)
+    }
+
+    fn query_disjoint_exact_series(
+        &self,
+        query: &MetricQuery,
+        series: SeriesFingerprint,
+        head: &SeriesHead,
+        limit: usize,
+    ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        let mut selected = Vec::with_capacity(limit.min(4_096));
+        for chunk in self.chunks.get(&series).into_iter().flatten() {
+            if query
+                .start_time_unix_nanos
+                .is_some_and(|start| chunk.max_timestamp_unix_nanos < start)
+                || query
+                    .end_time_unix_nanos
+                    .is_some_and(|end| chunk.min_timestamp_unix_nanos > end)
+            {
+                continue;
+            }
+            let decoded = self.decode_chunk(chunk)?;
+            for point in decoded
+                .iter()
+                .filter(|point| metric_point_time_matches(query, point))
+            {
+                selected.push(point.clone());
+                if selected.len() == limit {
+                    return Ok(selected);
+                }
+            }
+        }
+        for point in head
+            .points
+            .values()
+            .filter(|point| metric_point_time_matches(query, point))
+        {
+            selected.push(point.clone());
+            if selected.len() == limit {
+                break;
+            }
+        }
+        Ok(selected)
+    }
+
+    fn decode_chunk(
+        &self,
+        chunk: &SealedMetricChunk,
+    ) -> TelemetryResult<Arc<[DurableMetricPoint]>> {
+        if let Some(points) = self.decoded_chunks.borrow_mut().get(chunk.resident_id) {
+            return Ok(points);
+        }
+        let points = Arc::<[DurableMetricPoint]>::from(decode_metric_chunk(&chunk.payload)?);
+        let estimated_bytes = points.iter().fold(
+            points.len().saturating_mul(size_of::<DurableMetricPoint>()),
+            |total, point| total.saturating_add(point.estimated_head_bytes()),
+        );
+        self.decoded_chunks.borrow_mut().insert(
+            chunk.resident_id,
+            estimated_bytes,
+            Arc::clone(&points),
+        );
+        Ok(points)
     }
 
     fn sealed_points_at(
@@ -1817,10 +2002,12 @@ impl MetricStripe {
                     && timestamp_unix_nanos <= chunk.max_timestamp_unix_nanos
             })
         {
+            let decoded = self.decode_chunk(chunk)?;
             points.extend(
-                decode_metric_chunk(&chunk.payload)?
-                    .into_iter()
-                    .filter(|point| point.timestamp_unix_nanos == timestamp_unix_nanos),
+                decoded
+                    .iter()
+                    .filter(|point| point.timestamp_unix_nanos == timestamp_unix_nanos)
+                    .cloned(),
             );
         }
         Ok(points)
@@ -1941,6 +2128,7 @@ impl MetricStripe {
     }
 
     pub(crate) fn release_published_chunks(&mut self, resident_ids: &[u64]) {
+        self.decoded_chunks.borrow_mut().remove(resident_ids);
         self.pending_chunks
             .retain(|payload| !resident_ids.contains(&payload.resident_id));
         self.chunks.retain(|_, chunks| {
@@ -2319,6 +2507,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ranged[0].timestamp_unix_nanos, 300);
+        let cache = stripe.decoded_chunks.borrow();
+        assert!(cache.hits > 0);
+        assert!(cache.misses > 0);
+        assert!(cache.used_bytes <= cache.max_bytes);
     }
 
     #[test]

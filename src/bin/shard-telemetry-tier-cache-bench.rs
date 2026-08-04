@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_bytes: 2 * (chunk_bytes + 64),
         chunk_bytes,
         max_read_bytes: chunk_bytes,
+        memory_bytes: 2 * chunk_bytes,
     };
     let legacy = SsdObjectCache::open(root.join("legacy-cache"), config)?;
     let batched = SsdObjectCache::open(root.join("batched-cache"), config)?;
@@ -63,11 +64,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect::<Result<Vec<_>, _>>()
     });
     let legacy_cold = legacy_cold?;
-    let (batched_cold_elapsed, batched_cold) =
-        time(|| batched.read_ranges_with_metadata(&store, "payload/pack", &metadata, &selected));
+    let (batched_cold_elapsed, batched_cold) = time(|| {
+        batched.read_shared_ranges_with_metadata(&store, "payload/pack", &metadata, &selected)
+    });
     let batched_cold = batched_cold?;
     let legacy_expected = legacy_cold.iter().flatten().copied().collect::<Vec<_>>();
-    let batched_expected = batched_cold.iter().flatten().copied().collect::<Vec<_>>();
+    let batched_expected = batched_cold
+        .iter()
+        .flat_map(|range| range.as_ref().iter().copied())
+        .collect::<Vec<_>>();
     if legacy_expected != batched_expected || legacy_expected != payload[..selected_bytes as usize]
     {
         return Err("batched and independent range reads disagree".into());
@@ -87,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let legacy_warm = legacy_start.elapsed();
     let batched_start = Instant::now();
     for _ in 0..iterations {
-        black_box(batched.read_ranges_with_metadata(
+        black_box(batched.read_shared_ranges_with_metadata(
             &store,
             "payload/pack",
             &metadata,
@@ -115,11 +120,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         legacy_warm.as_secs_f64() / batched_warm.as_secs_f64(),
     );
     println!(
-        "cache legacy_hits={} legacy_misses={} legacy_source_bytes={} batched_hits={} batched_misses={} batched_source_bytes={}",
+        "cache legacy_hits={} legacy_memory_hits={} legacy_misses={} legacy_source_bytes={} batched_hits={} batched_memory_hits={} batched_misses={} batched_source_bytes={}",
         legacy_stats.hits,
+        legacy_stats.memory_hits,
         legacy_stats.misses,
         legacy_stats.source_bytes,
         batched_stats.hits,
+        batched_stats.memory_hits,
         batched_stats.misses,
         batched_stats.source_bytes,
     );

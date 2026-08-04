@@ -1912,6 +1912,8 @@ pub struct SsdCacheConfig {
     pub chunk_bytes: u64,
     /// Maximum bytes returned by one cache read.
     pub max_read_bytes: u64,
+    /// Maximum verified immutable chunk bytes retained in RAM.
+    pub memory_bytes: u64,
 }
 
 impl Default for SsdCacheConfig {
@@ -1920,6 +1922,7 @@ impl Default for SsdCacheConfig {
             max_bytes: 512 * 1024 * 1024 * 1024,
             chunk_bytes: 4 * 1024 * 1024,
             max_read_bytes: 64 * 1024 * 1024,
+            memory_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -1947,12 +1950,21 @@ struct CacheEntry {
     stamp: u64,
 }
 
+#[derive(Debug)]
+struct MemoryCacheEntry {
+    bytes: Arc<[u8]>,
+    stamp: u64,
+}
+
 #[derive(Debug, Default)]
 struct CacheState {
     entries: HashMap<String, CacheEntry>,
     used_bytes: u64,
+    memory_entries: HashMap<String, MemoryCacheEntry>,
+    memory_used_bytes: u64,
     clock: u64,
     hits: u64,
+    memory_hits: u64,
     misses: u64,
     source_bytes: u64,
 }
@@ -1964,12 +1976,47 @@ pub struct SsdCacheStats {
     pub entries: usize,
     /// Framed bytes currently retained on SSD.
     pub used_bytes: u64,
-    /// Successful integrity-checked SSD chunk reads since open.
+    /// Successful SSD or RAM cache hits since open.
     pub hits: u64,
+    /// Hits served from already verified immutable RAM chunks.
+    pub memory_hits: u64,
+    /// Immutable chunks currently retained in RAM.
+    pub memory_entries: usize,
+    /// Verified immutable chunk bytes currently retained in RAM.
+    pub memory_used_bytes: u64,
     /// Chunks fetched from object storage since open.
     pub misses: u64,
     /// Object-store payload bytes fetched by cache misses since open.
     pub source_bytes: u64,
+}
+
+/// One immutable object range backed by a shared verified cache chunk.
+#[derive(Debug, Clone)]
+pub struct CachedObjectRange {
+    bytes: Arc<[u8]>,
+    start: usize,
+    end: usize,
+}
+
+impl CachedObjectRange {
+    fn empty() -> Self {
+        Self::from_owned(Vec::new())
+    }
+
+    fn from_owned(bytes: Vec<u8>) -> Self {
+        let end = bytes.len();
+        Self {
+            bytes: Arc::from(bytes),
+            start: 0,
+            end,
+        }
+    }
+}
+
+impl AsRef<[u8]> for CachedObjectRange {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes[self.start..self.end]
+    }
 }
 
 /// Recoverable, integrity-checked SSD cache for immutable object ranges.
@@ -2042,6 +2089,9 @@ impl SsdObjectCache {
                 entries: state.entries.len(),
                 used_bytes: state.used_bytes,
                 hits: state.hits,
+                memory_hits: state.memory_hits,
+                memory_entries: state.memory_entries.len(),
+                memory_used_bytes: state.memory_used_bytes,
                 misses: state.misses,
                 source_bytes: state.source_bytes,
             },
@@ -2204,6 +2254,116 @@ impl SsdObjectCache {
         Ok(outputs)
     }
 
+    /// Reads sorted immutable ranges as shared verified chunk slices.
+    ///
+    /// Ranges contained in one cache chunk allocate no payload copy after the
+    /// chunk has been admitted to RAM. A range spanning chunks is assembled
+    /// into one owned shared buffer.
+    pub fn read_shared_ranges_with_metadata<S: TelemetryObjectStore>(
+        &self,
+        store: &S,
+        object_key: &str,
+        metadata: &ObjectMetadata,
+        ranges: &[Range<u64>],
+    ) -> TelemetryResult<Vec<CachedObjectRange>> {
+        if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
+            return Err(TelemetryError::ObjectStore(
+                "shared SSD cache ranges must be sorted and non-overlapping".into(),
+            ));
+        }
+        let mut outputs = Vec::with_capacity(ranges.len());
+        let mut loaded = None::<(u64, u64, Arc<[u8]>)>;
+        for range in ranges {
+            if range.start > range.end
+                || range.end > metadata.bytes
+                || range.end - range.start > self.config.max_read_bytes
+            {
+                return Err(TelemetryError::ObjectStore(
+                    "shared SSD cache range is invalid or exceeds its limit".into(),
+                ));
+            }
+            if range.is_empty() {
+                outputs.push(CachedObjectRange::empty());
+                continue;
+            }
+            let first_chunk = range.start / self.config.chunk_bytes;
+            let last_chunk = (range.end - 1) / self.config.chunk_bytes;
+            if first_chunk == last_chunk {
+                let chunk_start = first_chunk
+                    .checked_mul(self.config.chunk_bytes)
+                    .ok_or_else(|| {
+                        TelemetryError::ObjectStore("cache chunk offset overflow".into())
+                    })?;
+                let chunk_end = chunk_start
+                    .saturating_add(self.config.chunk_bytes)
+                    .min(metadata.bytes);
+                if loaded
+                    .as_ref()
+                    .is_none_or(|(index, _, _)| *index != first_chunk)
+                {
+                    loaded = Some((
+                        first_chunk,
+                        chunk_start,
+                        self.load_or_fetch_shared_chunk(
+                            store,
+                            object_key,
+                            metadata,
+                            first_chunk,
+                            chunk_start..chunk_end,
+                        )?,
+                    ));
+                }
+                let (_, loaded_start, chunk) =
+                    loaded.as_ref().expect("requested cache chunk was loaded");
+                let start = usize::try_from(range.start - *loaded_start).map_err(|_| {
+                    TelemetryError::ObjectStore("cache slice offset overflow".into())
+                })?;
+                let end = usize::try_from(range.end - *loaded_start).map_err(|_| {
+                    TelemetryError::ObjectStore("cache slice offset overflow".into())
+                })?;
+                outputs.push(CachedObjectRange {
+                    bytes: Arc::clone(chunk),
+                    start,
+                    end,
+                });
+                continue;
+            }
+
+            let output_bytes = usize::try_from(range.end - range.start).map_err(|_| {
+                TelemetryError::ObjectStore("SSD cache read cannot fit in memory".into())
+            })?;
+            let mut output = Vec::with_capacity(output_bytes);
+            for chunk_index in first_chunk..=last_chunk {
+                let chunk_start = chunk_index
+                    .checked_mul(self.config.chunk_bytes)
+                    .ok_or_else(|| {
+                        TelemetryError::ObjectStore("cache chunk offset overflow".into())
+                    })?;
+                let chunk_end = chunk_start
+                    .saturating_add(self.config.chunk_bytes)
+                    .min(metadata.bytes);
+                let chunk = self.load_or_fetch_shared_chunk(
+                    store,
+                    object_key,
+                    metadata,
+                    chunk_index,
+                    chunk_start..chunk_end,
+                )?;
+                let copy_start = usize::try_from(range.start.max(chunk_start) - chunk_start)
+                    .map_err(|_| {
+                        TelemetryError::ObjectStore("cache slice offset overflow".into())
+                    })?;
+                let copy_end =
+                    usize::try_from(range.end.min(chunk_end) - chunk_start).map_err(|_| {
+                        TelemetryError::ObjectStore("cache slice offset overflow".into())
+                    })?;
+                output.extend_from_slice(&chunk[copy_start..copy_end]);
+            }
+            outputs.push(CachedObjectRange::from_owned(output));
+        }
+        Ok(outputs)
+    }
+
     fn load_or_fetch_chunk<S: TelemetryObjectStore>(
         &self,
         store: &S,
@@ -2212,9 +2372,26 @@ impl SsdObjectCache {
         chunk_index: u64,
         range: Range<u64>,
     ) -> TelemetryResult<Vec<u8>> {
+        Ok(self
+            .load_or_fetch_shared_chunk(store, object_key, metadata, chunk_index, range)?
+            .as_ref()
+            .to_vec())
+    }
+
+    fn load_or_fetch_shared_chunk<S: TelemetryObjectStore>(
+        &self,
+        store: &S,
+        object_key: &str,
+        metadata: &ObjectMetadata,
+        chunk_index: u64,
+        range: Range<u64>,
+    ) -> TelemetryResult<Arc<[u8]>> {
         let cache_key = checksum_bytes(
             format!("{object_key}\0{}\0{chunk_index}", metadata.version_token).as_bytes(),
         );
+        if let Some(bytes) = self.memory_cache_hit(&cache_key)? {
+            return Ok(bytes);
+        }
         if let Some(path) = self.cache_hit(&cache_key)? {
             match read_cache_chunk(&path) {
                 Ok(bytes)
@@ -2222,6 +2399,8 @@ impl SsdObjectCache {
                         == range.end - range.start =>
                 {
                     self.record_cache_hit()?;
+                    let bytes = Arc::<[u8]>::from(bytes);
+                    self.admit_memory_chunk(cache_key, Arc::clone(&bytes))?;
                     return Ok(bytes);
                 }
                 Ok(_) | Err(_) => self.remove_entry(&cache_key)?,
@@ -2230,7 +2409,66 @@ impl SsdObjectCache {
         let bytes = store.get_range(object_key, range)?;
         self.record_cache_miss(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
         self.install_chunk(&cache_key, &bytes)?;
+        let bytes = Arc::<[u8]>::from(bytes);
+        self.admit_memory_chunk(cache_key, Arc::clone(&bytes))?;
         Ok(bytes)
+    }
+
+    fn memory_cache_hit(&self, cache_key: &str) -> TelemetryResult<Option<Arc<[u8]>>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
+        state.clock = state.clock.wrapping_add(1);
+        let stamp = state.clock;
+        let bytes = state.memory_entries.get_mut(cache_key).map(|entry| {
+            entry.stamp = stamp;
+            Arc::clone(&entry.bytes)
+        });
+        if bytes.is_some() {
+            state.hits = state.hits.saturating_add(1);
+            state.memory_hits = state.memory_hits.saturating_add(1);
+        }
+        Ok(bytes)
+    }
+
+    fn admit_memory_chunk(&self, cache_key: String, bytes: Arc<[u8]>) -> TelemetryResult<()> {
+        let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self.config.memory_bytes == 0 || bytes_len > self.config.memory_bytes {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
+        state.clock = state.clock.wrapping_add(1);
+        let stamp = state.clock;
+        if let Some(previous) = state
+            .memory_entries
+            .insert(cache_key, MemoryCacheEntry { bytes, stamp })
+        {
+            state.memory_used_bytes = state
+                .memory_used_bytes
+                .saturating_sub(u64::try_from(previous.bytes.len()).unwrap_or(u64::MAX));
+        }
+        state.memory_used_bytes = state.memory_used_bytes.saturating_add(bytes_len);
+        while state.memory_used_bytes > self.config.memory_bytes {
+            let Some(key) = state
+                .memory_entries
+                .iter()
+                .min_by_key(|(key, entry)| (entry.stamp, *key))
+                .map(|(key, _)| key.clone())
+            else {
+                state.memory_used_bytes = 0;
+                break;
+            };
+            if let Some(removed) = state.memory_entries.remove(&key) {
+                state.memory_used_bytes = state
+                    .memory_used_bytes
+                    .saturating_sub(u64::try_from(removed.bytes.len()).unwrap_or(u64::MAX));
+            }
+        }
+        Ok(())
     }
 
     fn record_cache_hit(&self) -> TelemetryResult<()> {
@@ -3242,6 +3480,7 @@ mod tests {
                 max_bytes: 2 * (CACHE_HEADER_BYTES as u64 + 4),
                 chunk_bytes: 4,
                 max_read_bytes: 16,
+                memory_bytes: 8,
             },
         )
         .expect("cache opens");
@@ -3286,6 +3525,7 @@ mod tests {
                 max_bytes: 4 * (CACHE_HEADER_BYTES as u64 + 4),
                 chunk_bytes: 4,
                 max_read_bytes: 16,
+                memory_bytes: 16,
             },
         )
         .expect("cache opens");
@@ -3301,10 +3541,19 @@ mod tests {
         assert_eq!(cache.stats().misses, 1);
         assert_eq!(cache.stats().source_bytes, 4);
         cache
-            .read_ranges_with_metadata(&store, "payload/object", &metadata, &ranges)
-            .expect("batched ranges are served from SSD");
+            .read_shared_ranges_with_metadata(&store, "payload/object", &metadata, &ranges)
+            .expect("batched ranges are served from verified RAM");
         assert_eq!(store.range_reads.load(Ordering::Relaxed), 1);
         assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().memory_hits, 1);
+        assert!(cache.stats().memory_used_bytes <= 16);
+
+        let shared = cache
+            .read_shared_ranges_with_metadata(&store, "payload/object", &metadata, &ranges)
+            .expect("shared ranges remain readable");
+        assert_eq!(shared[0].as_ref(), b"ef");
+        assert_eq!(shared[1].as_ref(), b"gh");
+        assert!(Arc::ptr_eq(&shared[0].bytes, &shared[1].bytes));
     }
 
     #[test]
@@ -3329,6 +3578,7 @@ mod tests {
                 max_bytes: 32 * (CACHE_HEADER_BYTES as u64 + 1_024),
                 chunk_bytes: 1_024,
                 max_read_bytes: 64 * 1_024,
+                memory_bytes: 32 * 1_024,
             },
         )
         .expect("cache opens");
