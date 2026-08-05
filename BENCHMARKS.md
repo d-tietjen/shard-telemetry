@@ -1,6 +1,6 @@
 # Compression benchmark results
 
-## Logs, traces, metrics, and correlation — local v1 storage run (2026-08-03)
+## Logs, traces, metrics, and correlation — local v1 storage run (2026-08-04)
 
 `shard-telemetry-signal-bench` generates one deterministic, correlated
 production-like corpus for all three signals. Every signal shares exact typed
@@ -19,16 +19,16 @@ cold-filter construction; log encode also includes structural indexing.
 
 | Signal | Canonical bytes | Payload bytes | Auxiliary bytes | Stored bytes | Ratio | Encode | Decode |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Logs | 29,773,336 | 1,188,990 | 0 | 1,188,990 | **25.04x** | 290.97 MiB/s | 529.80 MiB/s |
-| Traces | 13,371,009 | 194,521 | 604 | 195,125 | **68.53x** | 707.91 MiB/s | 3,846.34 MiB/s |
-| Metrics | 14,806,656 | 313,678 | 3,814 | 317,492 | **46.64x** | 1,432.72 MiB/s | 4,274.31 MiB/s |
+| Logs | 29,773,336 | 446,851 | 0 | 446,851 | **66.63x** | 224.33 MiB/s | 1,297.90 MiB/s |
+| Traces | 13,371,009 | 112,481 | 604 | 113,085 | **118.24x** | 465.97 MiB/s | 2,789.85 MiB/s |
+| Metrics | 15,756,928 | 298,047 | 31,650 | 329,697 | **47.79x** | 814.35 MiB/s | 2,365.99 MiB/s |
 
 | Lookup path | Results/page | Lookups/s | p50 | p99 |
 | --- | ---: | ---: | ---: | ---: |
-| Log term + exact metadata | 100 | 52,639 | 18.75 us | 21.83 us |
-| Trace ID | 8 | 97,541 | 10.29 us | 11.17 us |
-| Exact metric series | 100 | 2,723 | 364.92 us | 400.96 us |
-| Resource + typed-label correlation | 1,000 | 4,653 | 214.83 us | 242.21 us |
+| Log term + exact metadata | 100 | 231,159 | 4.25 us | 5.21 us |
+| Trace ID | 8 | 1,683,502 | 0.54 us | 0.71 us |
+| Exact metric series | 100 | 527,073 | 1.88 us | 2.13 us |
+| Resource + typed-label correlation | 1,000 | 156,597 | 6.33 us | 7.00 us |
 
 An earlier codec-only ablation omitted block grouping, structural log storage,
 and cold-correlation bytes. It reported 25.41x logs, 68.98x traces, and 47.20x
@@ -345,10 +345,85 @@ The deterministic-simulation framework checkout on Adam was dirty, so these
 are clean product-revision, native pinned measurements rather than an exact
 task-schedule replay campaign.
 
+### Signal-native storage layout pass — 2026-08-04
+
+Revision `34a8b6fe8bb5120ce71b20a4f40fdb4dc4ecffc8` changes only the single
+pre-release format. It removes repeated semantic values before compression
+rather than asking Zstandard to rediscover them:
+
+- typed logs use block dictionaries for exact OTLP bodies, attribute sets,
+  resources, scopes, severity text, and event names; a string body equal to
+  the indexed message and canonical trace/span ID fields are referenced rather
+  than stored twice; observed time is stored as a wrapping delta from event
+  time;
+- trace IDs are stored once per contiguous sorted trace, and parent IDs use
+  exact previous-span or first-span references when those topologies apply;
+- periodic metric timestamp delta-of-delta values use bounded runs, and the
+  bit-exact floating-point lane reuses the previous Gorilla XOR window.
+
+Every fallback remains inline and lossless. Attribute order, absent versus
+empty values, arbitrary timestamp bit patterns, NaN payload bits, unknown OTLP
+flags, nonlocal trace parents, and high-cardinality values reconstruct exactly.
+
+The following table compares three-run Adam CPU-0 medians with the retained
+`6ea8ca645225ac6476a241767c1e489c2bf88dd1` run. Each trial used the same
+262,144 records per signal and 2,000 warm lookup iterations.
+
+| Signal | Baseline durable bytes | Current durable bytes | Reduction | Ratio | Encode MiB/s | Decode MiB/s | Lookup/s | p50 / p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Logs | 9,523,630 | **3,581,357** | **62.40%** | **66.54x** | 105.39 | 827.60 | 81,634.40 | 12.13 / 15.70 us |
+| Traces | 1,558,224 | **901,869** | **42.12%** | **119.32x** | 281.59 | 1,265.42 | 700,348.04 | 1.38 / 1.44 us |
+| Metrics | 2,242,781 | **1,964,404** | **12.41%** | **64.37x** | 664.47 | 1,853.65 | 173,261.84 | 5.71 / 6.12 us |
+
+Relative to the retained baseline, median encoding improved 11.77% for logs,
+4.64% for traces, and 6.70% for metrics. Exact lookup rates stayed within
+normal run variance or improved. On the Apple M5 Max development host, the
+same 262,144-record run produced 3,581,357, 901,869, and 1,964,404 durable
+bytes and measured 325.65, 694.04, and 1,241.14 MiB/s encode throughput for
+logs, traces, and metrics respectively. Only the metric path clears 1 GiB/s
+per core in that local run; none of the rich signal paths clears that target
+on Adam yet.
+
+Section accounting prevented an unproductive sidecar rewrite. Before this
+pass, 99.2% of trace payload bytes were IDs, while trace sidecars were only
+5,879 bytes. Metric values and timestamps were 85.3% and 11.9% of payload;
+sidecars were 42,513 bytes. The retained changes target those dominant lanes:
+the metric timestamp lane fell from 263,552 to 2,048 bytes, and trace payload
+fell from 1,554,298 to 897,943 bytes. A row-to-column trace-sidecar experiment
+was discarded after adding 225 bytes.
+
+Using the retained same-corpus ClickHouse 26.5.1.882 measurements, the current
+trace format uses 84.32% fewer bytes and encodes 2.72x faster; the metric format
+uses 49.41% fewer bytes and encodes 6.01x faster. ClickHouse was not rerun
+because its input and settings are unchanged; this is a comparison with the
+retained sequential CPU-0 result, not a newly executed competitor trial.
+
+The immutable 80 GiB Docker JSON corpus was rerun on CPUs `0-15`. Since it has
+no typed OTLP metadata, every durable file is byte-identical to the retained
+baseline: 620,912,446 total bytes, 138.34x, 10,240 valid block checksums, and
+exact first/middle/final reconstruction. The current run completed ingest in
+13.624549 seconds at 6,012.68 MiB/s. This timing is a fresh host-scheduled run;
+the byte identity, rather than the faster timing, is the no-regression gate.
+
+All 200 library tests, every binary target, formatting, and Clippy with
+warnings denied passed. Retained native evidence is at:
+
+```text
+/home/dtietjen/shard-telemetry-storage-evidence-34a8b6f
+```
+
+The product checkout was clean and detached at the exact revision above. The
+benchmark binary SHA-256 is
+`84d66a081d3e58dd366aa262021210b3b5932363706f2eec9bc1cb6d8555d647`;
+the source bundle SHA-256 is
+`510f2f3a671df0964f7d7caf982f5f9bf50fb53ad5701665638ec3d9004031fb`.
+Adam's deterministic-simulation framework checkout was dirty, so this remains
+revision-pinned native evidence, not deterministic task-schedule replay.
+
 ## Current single-format 80 GiB acceptance — 2026-08-04
 
 This is the current pre-release result for commit
-`bdcb1c84e37fa3d9d24f097106bbb002a850c0c2`. It measures the only supported
+`34a8b6fe8bb5120ce71b20a4f40fdb4dc4ecffc8`. It measures the only supported
 `STEL` structural format; there are no legacy readers, compatibility formats,
 or alternate ShardTelemetry implementations in this comparison.
 
@@ -374,8 +449,8 @@ second persistent term/field sidecar.
 | Manifest bytes | 819,217 |
 | Durable total | **620,912,446** |
 | Raw-source compression ratio | **138.34x** |
-| Ingest wall time | **17.883 s** |
-| End-to-end throughput | **4,580.79 MiB/s** |
+| Ingest wall time | **13.625 s** |
+| End-to-end throughput | **6,012.68 MiB/s** |
 
 All 10,240 payload checksums passed. The verifier also reconstructed the first,
 middle, and final blocks exactly. Compared with the accepted historical Pco-8
@@ -400,27 +475,27 @@ same-protocol claim.
 
 | Engine | Settled durable bytes | Ratio | Wall time | Throughput |
 | --- | ---: | ---: | ---: | ---: |
-| ShardTelemetry `bdcb1c8` | **620,912,446** | **138.34x** | **17.883 s** | **4,580.79 MiB/s** |
+| ShardTelemetry `34a8b6f` | **620,912,446** | **138.34x** | **13.625 s** | **6,012.68 MiB/s** |
 | ClickHouse 26.5.1.882 | 1,175,650,470 | 73.07x | 89.46 s | 915.72 MiB/s |
 | Loki 3.7.2 | 4,905,868,184 | 17.51x | 1,010.043 s | 81.11 MiB/s |
 
-On this corpus ShardTelemetry is 5.00x faster than ClickHouse and uses 47.2%
-fewer durable bytes. It is 56.5x faster than the Loki compatibility run and
+On this corpus ShardTelemetry is 6.57x faster than ClickHouse and uses 47.2%
+fewer durable bytes. It is 74.1x faster than the Loki compatibility run and
 uses 7.90x less settled storage. These results do not establish the separate
 1 GiB/s-per-core or 80%-scaling-through-16-cores gates: the measured aggregate
-rate is 4.47 GiB/s, or about 286 MiB/s per assigned core if divided naively.
+rate is 5.87 GiB/s, or about 376 MiB/s per assigned core if divided naively.
 
 Retained Adam evidence:
 
 ```text
-/home/dtietjen/shard-telemetry-evidence-bdcb1c8/full80-{report,stdout,time}.txt
-/home/dtietjen/shard-telemetry-evidence-bdcb1c8/full80-output
+/home/dtietjen/shard-telemetry-storage-evidence-34a8b6f/full80-{report,stdout,time}.txt
+/home/dtietjen/shard-telemetry-storage-evidence-34a8b6f/full80-output
 /home/dtietjen/shard-telemetry-validation-suite-20260803/head-to-head/stel-current-ca5-20260803
 /home/dtietjen/shard-telemetry-validation-suite-20260803/loki/loki-3.7.2-e004916-20260803
 ```
 
 The current ShardTelemetry report and stdout both have SHA-256
-`ee6909d1a2ed54b423e7d454e36162782708c1ba3a90961d6df0102b930b7bc8`.
+`2f69837c3849c40e4a17c41c12711de0a5966caa36c0e09c391fcc0e5818c3c7`.
 The settled Loki correction summary has SHA-256
 `c6a8f6918dc792fa7003a771c0f26268630430f5f012b14af43d5e411e7949c1`.
 

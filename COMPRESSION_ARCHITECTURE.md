@@ -442,7 +442,7 @@ measurement without putting memory mapping or unsafe code in the storage
 library. Production callers may provide any stable borrowed input buffer.
 
 The current single pre-release format, with locality disabled, stored
-620,912,446 bytes at 138.34x and 3,622.67 MiB/s on 16 physical cores. All
+620,912,446 bytes at 138.34x and 6,012.68 MiB/s on 16 physical cores. All
 10,240 payload checksums and sampled exact reconstructions passed. It is
 7,561,221 bytes smaller than the accepted historical Pco-8 result even though
 the current payload retains its compression-derived lookup index. The
@@ -621,6 +621,44 @@ matching record, merge unlike templates, alter metadata, or change exact
 reconstruction. Corrupt compressed payloads are rejected by their checksum;
 malformed index sections, packed columns, counts, and structural sections are
 strictly validated.
+
+## Signal-native semantic deduplication
+
+The single pre-release format removes duplication at the type boundary before
+general-purpose compression. This is deliberately signal-specific because the
+remaining entropy differs sharply between logs, traces, and metrics.
+
+Typed log metadata is a block-local dictionary graph. Exact non-message
+`TelemetryValue` bodies, ordered attribute sets, resource contexts, scope
+contexts, severity strings, and event names are interned once. A string body
+that is byte-identical to the structural message is represented by a semantic
+message reference. Binary trace/span IDs are represented by canonical
+`otel.trace_id` and `otel.span_id` fields when those fields already contain the
+same lowercase bytes; malformed, absent, or noncanonical fields force inline
+IDs. Observed timestamps use an `i64` wrapping delta from the primary `u64`
+timestamp, which reconstructs every pair exactly across the complete unsigned
+range. Empty and absent values retain distinct sentinels.
+
+Trace blocks are sorted by trace ID and start time, so the ID lane stores each
+contiguous trace ID once with a bounded run count. Span IDs retain prefix/XOR
+encoding. Parent IDs use compact references when the exact parent is the
+previous span or first span in the current trace, covering chain and star
+topologies without assuming either one. External, late, or otherwise nonlocal
+parents remain inline with XOR encoding.
+
+Metric timestamps retain their first timestamp and first delta. Consecutive
+zero delta-of-delta values are represented by one bounded run, while nonzero
+changes use a disjoint incremented zigzag code. Floating-point samples preserve
+all 64 bits and use Gorilla controls: unchanged values consume one bit,
+compatible XORs reuse the previous leading/trailing window, and incompatible
+XORs publish a new bounded window. Integer and histogram lanes keep their
+existing Pco and exact typed encodings.
+
+These transformations do not create cross-record decoding dependencies beyond
+one immutable block or chunk. Checksums, exact reconstruction, durable offsets,
+typed correlation identities, and query results remain authoritative. A
+missing dictionary entry, invalid run, conflicting semantic reference, or
+malformed XOR window fails closed.
 
 Current limitations are explicit:
 
