@@ -143,6 +143,7 @@ impl OtlpIngestService {
                 topic_partition,
                 envelope: prepare_log_envelope(&self.config.tenant, &events)
                     .map_err(|error| error.to_string())?,
+                transient_context: None,
             });
         }
         self.append(appends)?;
@@ -162,6 +163,7 @@ impl OtlpIngestService {
                 topic_partition,
                 envelope: prepare_trace_envelope(topic_partition, events)
                     .map_err(|error| error.to_string())?,
+                transient_context: None,
             });
         }
         self.append(appends)?;
@@ -181,6 +183,7 @@ impl OtlpIngestService {
                 topic_partition,
                 envelope: prepare_metric_envelope(topic_partition, events)
                     .map_err(|error| error.to_string())?,
+                transient_context: None,
             });
         }
         self.append(appends)?;

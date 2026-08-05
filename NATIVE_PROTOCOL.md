@@ -31,6 +31,17 @@ An append payload is one `STB1` batch containing 1–256 routed partitions. Its 
 | 4 | Logical partition ID |
 | 4 | Encoded envelope length |
 | variable | One checksummed `STEL` envelope |
+| 4 | Process-local transient-context length |
+| variable | Optional transient context; `SLT1` for indexed log appends |
+
+The transient context is not part of the durable envelope and is never written
+to shard-stream WAL or object storage. For log appends it carries the embedded
+frame-index bytes produced while the structural pack is encoded. The owner
+stripe validates the context against the durable `SLW1` frame and installs the
+index without decompressing the structural payload. If the context is absent,
+the owner falls back to decompressing the embedded index. Recovery always uses
+the embedded durable index, so losing the process-local context cannot affect
+correctness.
 
 The topic must match the envelope signal. Duplicate topic/partition pairs are rejected. The server validates the complete request before appending partitions in parallel under bounded backpressure.
 

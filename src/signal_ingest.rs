@@ -244,6 +244,15 @@ pub fn prepare_docker_log_envelope(
     tenant: &str,
     records: Vec<DockerLogRecord>,
 ) -> TelemetryResult<TelemetryEnvelope> {
+    prepare_docker_log_envelope_with_context(tenant, records).map(|(envelope, _)| envelope)
+}
+
+/// Builds a Docker log envelope and the process-local index context used by
+/// the live owner stripe to avoid decompressing the frame during indexing.
+pub fn prepare_docker_log_envelope_with_context(
+    tenant: &str,
+    records: Vec<DockerLogRecord>,
+) -> TelemetryResult<(TelemetryEnvelope, Arc<[u8]>)> {
     if tenant.is_empty() {
         return Err(TelemetryError::InvalidNativePayload(
             "Docker tenant must not be empty".into(),
@@ -330,13 +339,14 @@ pub fn prepare_docker_log_envelope(
     let item_count =
         u32::try_from(structural_records.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
     let prepared = prepare_single_cohort_ingest_pack(&structural_records, cohort)?;
-    TelemetryEnvelope::new(
+    let envelope = TelemetryEnvelope::new(
         TelemetrySignal::Logs,
         tenant,
         item_count,
         Arc::<[u8]>::from([]),
         Arc::<[u8]>::from(prepared.payload),
-    )
+    )?;
+    Ok((envelope, Arc::<[u8]>::from(prepared.transient_context)))
 }
 
 fn docker_source_cohort() -> CompressionCohortId {

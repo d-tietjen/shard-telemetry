@@ -1055,9 +1055,11 @@ impl LogStripe {
             record_count,
             payload,
             None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_checkpointed_ingest_pack(
         &mut self,
         tenant: Arc<str>,
@@ -1065,6 +1067,7 @@ impl LogStripe {
         first_offset: LogicalOffset,
         record_count: u32,
         payload: Bytes,
+        transient_context: Option<&[u8]>,
         checkpoints: (DurableSinkCheckpoint, DurableSinkCheckpoint),
     ) -> TelemetryResult<()> {
         let (expected_checkpoint, next_checkpoint) = checkpoints;
@@ -1081,10 +1084,12 @@ impl LogStripe {
             first_offset,
             record_count,
             payload,
+            transient_context,
             Some(next_checkpoint),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_indexed_ingest_pack_inner(
         &mut self,
         tenant: Arc<str>,
@@ -1092,6 +1097,7 @@ impl LogStripe {
         first_offset: LogicalOffset,
         record_count: u32,
         payload: Bytes,
+        transient_context: Option<&[u8]>,
         next_checkpoint: Option<DurableSinkCheckpoint>,
     ) -> TelemetryResult<()> {
         if tenant.is_empty() || record_count == 0 {
@@ -1122,7 +1128,7 @@ impl LogStripe {
                 observed: first_offset,
             });
         }
-        let mut frames = decode_indexed_ingest_frames(payload, None, record_count)?;
+        let mut frames = decode_indexed_ingest_frames(payload, transient_context, record_count)?;
         for frame in &mut frames {
             frame.frame_id = self.next_frame_id;
             self.next_frame_id = self

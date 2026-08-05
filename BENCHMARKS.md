@@ -60,6 +60,54 @@ ShardTelemetry's timestamp directory and compressed-domain term index win the
 latest and token cases. The full live ingestion path remains far below the
 separate 1 GiB/s-per-core objective; that objective is not claimed here.
 
+### Isolated single-partition server path — 2026-08-05
+
+This is a server-owner measurement, not a claim that the entire machine used
+one core. The ShardTelemetry server was pinned to physical CPU 0, while the
+16-worker native loader was pinned to CPUs 1-15. The server used one physical
+owner stripe and the fixed homogeneous route sent every append to one logical
+partition. The immutable corpus was prewarmed before each run; the source was
+the same ClickHouse Docker JSON corpus used above:
+
+```text
+source=/home/dtietjen/log-compression-samples/clickhouse-docker-json-error-loop-tail-80g-20260729.log
+sha256=4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508
+```
+
+The baseline was the valid current native path before the transient-index
+handoff. The optimized path keeps the same durable `STEL`/`SLW1` bytes but
+adds an `SLT1` process-local index context to the native request. The owner
+stripe uses that context instead of decompressing the structural frame to
+recover its already-built index. The native server also avoids re-encoding and
+re-decoding an already validated batch, and the one-partition store path skips
+multi-partition dispatch setup.
+
+| Run | Source prefix | Records | Native wire bytes | Durable bytes | Source throughput | Server cycles | Server instructions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 2 GiB | 15,184,074 | 67,674,722 | 67,761,920 | 994.92 MiB/s | 2,621,965,327 | 3,264,718,379 |
+| Optimized | 2 GiB | 15,184,074 | 77,273,224 | 67,761,920 | **1,021.87 MiB/s** | **2,020,851,787** | **2,706,718,919** |
+| Change | identical | identical | +14.2% transient bytes | **0%** | **+2.7%** | **-22.9%** | **-17.1%** |
+
+The transient index context increases request bytes but does not enter the
+durable store or object tier. Both runs had zero CPU migrations. The optimized
+4-GiB confirmation sustained 1,006.67 MiB/s versus 976.39 MiB/s for the prior
+path, with durable bytes unchanged at 135,518,896. Short runs vary with shared
+host scheduling, so the 4-GiB result is the preferred throughput comparison.
+
+The remaining owner-core profile is dominated by TCP receive/send and
+shard-stream WAL/page-cache work. Structural encoding remains producer-side:
+moving it to the single owner would trade away the existing multi-core
+producer throughput rather than remove a server bottleneck.
+
+Retained evidence:
+
+```text
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/single-partition-one-core-20260805-v1
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/single-partition-one-core-20260805-v5
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/single-partition-one-core-20260805-v4
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/single-partition-one-core-profile-20260805-v2
+```
+
 Retained evidence:
 
 ```text

@@ -1176,7 +1176,7 @@ fn index_payload(
     first_offset: shard_stream_core::LogicalOffset,
     expected_count: Option<u32>,
     payload: &[u8],
-    _transient_context: Option<&[u8]>,
+    transient_context: Option<&[u8]>,
     checkpoints: (DurableSinkCheckpoint, DurableSinkCheckpoint),
 ) -> TelemetryResult<()> {
     if !TelemetryEnvelope::is_encoded(payload) {
@@ -1204,6 +1204,7 @@ fn index_payload(
                 first_offset,
                 envelope.item_count,
                 Bytes::copy_from_slice(&envelope.payload),
+                transient_context,
                 checkpoints,
             )?;
         }

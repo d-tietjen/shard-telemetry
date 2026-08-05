@@ -417,6 +417,11 @@ pub struct IndexedStructuralBlock {
     pub structural: Vec<u8>,
     /// In-memory view produced by the same dictionary-building pass.
     pub index: EmbeddedFrameIndex,
+    /// Exact encoded index bytes produced by that same pass.
+    ///
+    /// Live ingest can forward this sidecar without serializing the index a
+    /// second time. Recovery still reads the copy embedded in `structural`.
+    pub embedded_index: Vec<u8>,
     /// Structural bytes occupied by the embedded index section before outer compression.
     pub embedded_index_bytes: usize,
 }
@@ -1097,13 +1102,14 @@ pub fn encode_indexed_structural_records<R: StructuralRecordView>(
         attribute_tables,
         fields,
         typed_metadata,
-        embedded_index,
     ] {
         append_bytes(&mut encoded, &section)?;
     }
+    append_bytes(&mut encoded, &embedded_index)?;
     Ok(IndexedStructuralBlock {
         structural: encoded,
         index,
+        embedded_index,
         embedded_index_bytes,
     })
 }

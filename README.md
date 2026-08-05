@@ -56,6 +56,13 @@ This pre-release codebase has one durable format and one native append format.
 Historical grouped-log append payloads are not decoded. The grouped `STR1`
 encoding is response-only for native log queries.
 
+Native log append batches may include an `SLT1` transient index context. It is
+validated by the owning stripe, used to install the compressor-derived lookup
+index without decompressing the `SLW1` frame, and discarded after indexing. The
+durable `STEL`/`SLW1` bytes remain authoritative for restart and object-tier
+recovery. For a single partition, the server also bypasses multi-partition
+parallel-dispatch overhead; independent partitions still execute in parallel.
+
 See [NATIVE_PROTOCOL.md](NATIVE_PROTOCOL.md) for the wire layout, bounds,
 acknowledgement semantics, query primitive, and initial Adam ablation.
 

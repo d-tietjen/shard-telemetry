@@ -16,7 +16,7 @@ use shard_stream_core::TopicPartition;
 use shard_telemetry::{
     DockerLogRecord, DockerLogStream, NATIVE_FRAME_HEADER_BYTES, NativeFrame, NativeFrameHeader,
     NativeOpcode, NativePartitionAppend, NativeStatus, NativeTelemetryAppendAck,
-    NativeTelemetryBatch, TelemetryRouter, prepare_docker_log_envelope,
+    NativeTelemetryBatch, TelemetryRouter, prepare_docker_log_envelope_with_context,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -458,11 +458,13 @@ impl NativeConnection {
         next_request: &AtomicU64,
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
         let request_id = u128::from(next_request.fetch_add(1, Ordering::Relaxed));
-        let envelope = prepare_docker_log_envelope(tenant, entries)?;
+        let (envelope, transient_context) =
+            prepare_docker_log_envelope_with_context(tenant, entries)?;
         let payload = NativeTelemetryBatch {
             partitions: vec![NativePartitionAppend {
                 topic_partition: self.topic_partition,
                 envelope,
+                transient_context: Some(transient_context),
             }],
         }
         .encode()?;

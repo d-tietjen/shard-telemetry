@@ -229,6 +229,7 @@ fn persist_server_store(
                     partitions: vec![NativePartitionAppend {
                         topic_partition: trace_partition,
                         envelope,
+                        transient_context: None,
                     }],
                 },
                 true,
@@ -270,6 +271,7 @@ fn persist_server_store(
                 partitions: vec![NativePartitionAppend {
                     topic_partition: metric_partition,
                     envelope,
+                    transient_context: None,
                 }],
             },
             true,

@@ -92,6 +92,12 @@ impl StructuralRecordView for IngestRecordView<'_> {
 
 pub(crate) struct PreparedIngestPack {
     pub(crate) payload: Vec<u8>,
+    /// Process-local query-index context for the live durable sink.
+    ///
+    /// The authoritative payload remains `payload`; this sidecar is only
+    /// forwarded until the owner stripe indexes the append and is omitted
+    /// during recovery.
+    pub(crate) transient_context: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,13 +143,23 @@ pub(crate) fn prepare_single_cohort_ingest_pack<R: StructuralRecordView>(
     encoded.extend_from_slice(&record_count.to_le_bytes());
     encoded.extend_from_slice(&group_count.to_le_bytes());
     encoded.extend_from_slice(&0_u16.to_le_bytes());
+    let mut transient_context = Vec::with_capacity(TRANSIENT_PACK_HEADER_BYTES);
+    transient_context.extend_from_slice(TRANSIENT_PACK_MAGIC);
+    transient_context.extend_from_slice(&group_count.to_le_bytes());
+    transient_context.extend_from_slice(&0_u16.to_le_bytes());
     if !records.is_empty() {
-        append_ingest_group(&mut encoded, cohort, records)?;
+        append_ingest_group(&mut encoded, &mut transient_context, cohort, records)?;
     }
     if encoded.len() > crate::native_protocol::MAX_NATIVE_FRAME_BYTES {
         return Err(TelemetryError::RecordTooLarge);
     }
-    Ok(PreparedIngestPack { payload: encoded })
+    if transient_context.len() > crate::native_protocol::MAX_NATIVE_FRAME_BYTES {
+        return Err(TelemetryError::RecordTooLarge);
+    }
+    Ok(PreparedIngestPack {
+        payload: encoded,
+        transient_context,
+    })
 }
 
 fn prepare_grouped_ingest_pack<R: StructuralRecordView>(
@@ -156,21 +172,33 @@ fn prepare_grouped_ingest_pack<R: StructuralRecordView>(
     encoded.extend_from_slice(&record_count.to_le_bytes());
     encoded.extend_from_slice(&group_count.to_le_bytes());
     encoded.extend_from_slice(&0_u16.to_le_bytes());
+    let mut transient_context = Vec::with_capacity(TRANSIENT_PACK_HEADER_BYTES);
+    transient_context.extend_from_slice(TRANSIENT_PACK_MAGIC);
+    transient_context.extend_from_slice(&group_count.to_le_bytes());
+    transient_context.extend_from_slice(&0_u16.to_le_bytes());
     for (cohort, records) in cohorts {
-        append_ingest_group(&mut encoded, cohort, &records)?;
+        append_ingest_group(&mut encoded, &mut transient_context, cohort, &records)?;
     }
     if encoded.len() > crate::native_protocol::MAX_NATIVE_FRAME_BYTES {
         return Err(TelemetryError::RecordTooLarge);
     }
-    Ok(PreparedIngestPack { payload: encoded })
+    if transient_context.len() > crate::native_protocol::MAX_NATIVE_FRAME_BYTES {
+        return Err(TelemetryError::RecordTooLarge);
+    }
+    Ok(PreparedIngestPack {
+        payload: encoded,
+        transient_context,
+    })
 }
 
 fn append_ingest_group<R: StructuralRecordView>(
     encoded: &mut Vec<u8>,
+    transient_context: &mut Vec<u8>,
     cohort: CompressionCohortId,
     records: &[R],
 ) -> TelemetryResult<()> {
     let indexed = encode_indexed_structural_records(records)?;
+    let transient_index = indexed.embedded_index;
     let structural = indexed.structural;
     if structural.len() > MAX_INGEST_STRUCTURAL_BYTES {
         return Err(TelemetryError::RecordTooLarge);
@@ -180,6 +208,23 @@ fn append_ingest_group<R: StructuralRecordView>(
             .compress(&structural)
             .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))
     })?;
+    transient_context.extend_from_slice(&cohort.get().to_le_bytes());
+    transient_context.extend_from_slice(
+        &u32::try_from(records.len())
+            .map_err(|_| TelemetryError::RecordTooLarge)?
+            .to_le_bytes(),
+    );
+    transient_context.extend_from_slice(
+        &u32::try_from(structural.len())
+            .map_err(|_| TelemetryError::RecordTooLarge)?
+            .to_le_bytes(),
+    );
+    transient_context.extend_from_slice(
+        &u32::try_from(transient_index.len())
+            .map_err(|_| TelemetryError::RecordTooLarge)?
+            .to_le_bytes(),
+    );
+    transient_context.extend_from_slice(&transient_index);
     encoded.extend_from_slice(&cohort.get().to_le_bytes());
     encoded.extend_from_slice(
         &u32::try_from(records.len())
@@ -642,7 +687,7 @@ mod tests {
         let prepared = prepare_ingest_pack(&events).expect("indexed pack prepares");
         let live = decode_indexed_ingest_frames(
             Bytes::from(prepared.payload.clone()),
-            None,
+            Some(&prepared.transient_context),
             events.len() as u32,
         )
         .expect("live indexes install");

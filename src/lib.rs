@@ -113,8 +113,8 @@ pub use remote_write::{
 };
 pub use signal_ingest::{
     DockerLogRecord, DockerLogStream, decode_log_envelope, prepare_docker_log_envelope,
-    prepare_log_envelope, prepare_loki_log_envelope, prepare_metric_envelope,
-    prepare_metric_envelope_with_protocol, prepare_trace_envelope,
+    prepare_docker_log_envelope_with_context, prepare_log_envelope, prepare_loki_log_envelope,
+    prepare_metric_envelope, prepare_metric_envelope_with_protocol, prepare_trace_envelope,
 };
 pub use sink::{OtlpSinkConfig, SinkObjectTierConfig, TelemetryService, TelemetrySinkFactory};
 pub use stripe::{IndexReceipt, LogStripe, ShardStreamDurableSink, ShardTelemetry, StripeConfig};

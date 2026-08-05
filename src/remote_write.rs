@@ -70,6 +70,7 @@ impl DecodedRemoteWrite {
                     events,
                     crate::MetricIngestProtocol::RemoteWrite,
                 )?,
+                transient_context: None,
             });
         }
         Ok(NativeTelemetryBatch {

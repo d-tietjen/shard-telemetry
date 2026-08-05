@@ -620,6 +620,38 @@ group-local; the structural offset lane stores the original append ordinal, so
 interleaved compression cohorts map back to exact durable offsets without an
 extra remap table.
 
+### Live owner indexing without a decompression pass
+
+The native v1 producer already builds the exact embedded frame index while it
+encodes `SLW1`. Re-deriving that index on the owner stripe would require a
+Zstandard decompression pass for every append, even though the durable frame
+already contains the same index. The native `STB1` batch therefore carries an
+optional process-local `SLT1` transient context alongside each `STEL` envelope.
+
+The owner stripe checks the transient group metadata and decodes the supplied
+index bytes, then retains only the durable compressed frame and in-memory index.
+The transient context is bounded by the native frame limit, is charged to
+shard-stream's sink-context budget, is not replicated or journaled, and is
+discarded after the sink callback. A replayed append has no context and follows
+the durable recovery path, which decompresses and validates the embedded index.
+This makes the optimization a live-ingest shortcut rather than a second format
+or a durability dependency. The producer forwards the exact index bytes from
+the structural encoder, avoiding a second index serialization as well.
+
+The native server also decodes and validates `STB1` once, then calls the store's
+validated-batch path. The store no longer re-encodes and re-decodes the same
+multi-partition request before shard-stream append. Single-partition batches
+use a direct append path; multi-partition batches retain bounded parallel
+dispatch. These changes reduce owner-core work without moving structural
+encoding onto the single owner, preserving the multi-core producer model.
+
+Adam validation on the ClickHouse Docker corpus used server CPU 0, loader CPUs
+1-15, one physical owner stripe, and 16 persistent loader connections. The
+2-GiB run reduced server cycles by about 23% and instructions by about 17%
+while keeping durable bytes byte-identical. The longer 4-GiB run sustained just
+over 1 GiB/s of source throughput on the isolated server core; the detailed
+measurements and retained evidence paths are in [BENCHMARKS.md](BENCHMARKS.md).
+
 Shard-stream keeps immutable pack paths and extent metadata, not one open
 `File` per rolled pack. Fetch opens a reader for one coalesced range and closes
 it afterward. This is deliberate: a nominally bounded per-shard reader cache

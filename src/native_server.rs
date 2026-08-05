@@ -365,7 +365,7 @@ async fn dispatch(
                         total.saturating_add(partition.envelope.item_count)
                     });
                 let result = store
-                    .append_telemetry_batch(&telemetry_batch, wait_for_index)
+                    .append_validated_telemetry_batch(&telemetry_batch, wait_for_index)
                     .and_then(|ack| {
                         ack.encode()
                             .map(|encoded| (encoded, records))
@@ -590,6 +590,7 @@ mod tests {
                 topic_partition,
                 envelope: prepare_loki_log_envelope("tenant-a", vec![entry.clone()])
                     .expect("log envelope"),
+                transient_context: None,
             }],
         }
         .encode()

@@ -501,11 +501,25 @@ impl DurableTelemetryStore {
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
         let validated = crate::NativeTelemetryBatch::decode(&encoded)
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
-        let acknowledgements = validated
-            .partitions
-            .par_iter()
-            .map(|partition| self.append_telemetry_partition(partition, wait_for_index))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.append_validated_telemetry_batch(&validated, wait_for_index)
+    }
+
+    /// Appends a native batch that has already been decoded and checksum
+    /// validated by the native protocol server.
+    pub(crate) fn append_validated_telemetry_batch(
+        &self,
+        batch: &crate::NativeTelemetryBatch,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        let acknowledgements = if batch.partitions.len() == 1 {
+            vec![self.append_telemetry_partition(&batch.partitions[0], wait_for_index)?]
+        } else {
+            batch
+                .partitions
+                .par_iter()
+                .map(|partition| self.append_telemetry_partition(partition, wait_for_index))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         Ok(crate::NativeTelemetryAppendAck {
             partitions: acknowledgements,
         })
@@ -612,21 +626,27 @@ impl DurableTelemetryStore {
             .envelope
             .encode()
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
-        let appended = self
-            .engine
-            .append(AppendRequest {
-                request_id: u128::from(request_id),
-                topic_id: partition.topic_partition.topic_id,
-                partition_id: partition.topic_partition.partition_id,
-                record_count: partition.envelope.item_count,
-                payload: Bytes::from(payload),
-                durability: Durability::Leader,
-                producer: None,
-                atomic_group: None,
-                leader_epoch: None,
-                extension_context: None,
-            })
-            .map_err(engine_error)?;
+        let request = AppendRequest {
+            request_id: u128::from(request_id),
+            topic_id: partition.topic_partition.topic_id,
+            partition_id: partition.topic_partition.partition_id,
+            record_count: partition.envelope.item_count,
+            payload: Bytes::from(payload),
+            durability: Durability::Leader,
+            producer: None,
+            atomic_group: None,
+            leader_epoch: None,
+            extension_context: None,
+        };
+        let appended = if let Some(transient_context) = &partition.transient_context {
+            self.engine.append_with_durable_sink_context(
+                request,
+                Bytes::copy_from_slice(transient_context),
+            )
+        } else {
+            self.engine.append(request)
+        }
+        .map_err(engine_error)?;
         if wait_for_index {
             let target = DurableSinkCheckpoint {
                 topic_partition: partition.topic_partition,
@@ -813,6 +833,7 @@ impl LokiStore for DurableTelemetryStore {
             &crate::NativePartitionAppend {
                 topic_partition,
                 envelope,
+                transient_context: None,
             },
             true,
         )?;
@@ -1611,15 +1632,18 @@ mod tests {
                 crate::NativePartitionAppend {
                     topic_partition: log_partition,
                     envelope: crate::prepare_log_envelope("tenant-a", &log_events).unwrap(),
+                    transient_context: None,
                 },
                 crate::NativePartitionAppend {
                     topic_partition: trace_partition,
                     envelope: crate::prepare_trace_envelope(trace_partition, trace_events).unwrap(),
+                    transient_context: None,
                 },
                 crate::NativePartitionAppend {
                     topic_partition: metric_partition,
                     envelope: crate::prepare_metric_envelope(metric_partition, metric_events)
                         .unwrap(),
+                    transient_context: None,
                 },
             ],
         };

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 use shard_stream_core::{LogicalPartitionId, TopicId, TopicPartition};
 
@@ -278,6 +279,12 @@ pub struct NativePartitionAppend {
     pub topic_partition: TopicPartition,
     /// Checksummed signal envelope for that partition.
     pub envelope: TelemetryEnvelope,
+    /// Optional process-local index context forwarded to the durable sink.
+    ///
+    /// This is never part of the authoritative STEL payload and is discarded
+    /// after the owner stripe publishes its index. Recovery reconstructs the
+    /// same index from the durable envelope.
+    pub transient_context: Option<Arc<[u8]>>,
 }
 
 /// Native protocol v1 append containing one envelope per resulting partition.
@@ -295,7 +302,7 @@ impl NativeTelemetryBatch {
                 "native telemetry batch requires 1..=256 partitions",
             ));
         }
-        let mut seen = BTreeSet::new();
+        let mut seen = (self.partitions.len() > 1).then(BTreeSet::new);
         let mut encoded = Vec::new();
         encoded.extend_from_slice(&TELEMETRY_BATCH_MAGIC);
         encoded.extend_from_slice(
@@ -305,7 +312,9 @@ impl NativeTelemetryBatch {
         );
         encoded.extend_from_slice(&[0; 2]);
         for partition in &self.partitions {
-            if !seen.insert(partition.topic_partition) {
+            if let Some(seen) = &mut seen
+                && !seen.insert(partition.topic_partition)
+            {
                 return Err(NativeProtocolError::new(
                     "native telemetry batch contains a duplicate partition",
                 ));
@@ -327,6 +336,13 @@ impl NativeTelemetryBatch {
                     .to_le_bytes(),
             );
             encoded.extend_from_slice(&envelope);
+            let transient_context = partition.transient_context.as_deref().unwrap_or_default();
+            encoded.extend_from_slice(
+                &u32::try_from(transient_context.len())
+                    .map_err(|_| NativeProtocolError::new("transient context exceeds u32"))?
+                    .to_le_bytes(),
+            );
+            encoded.extend_from_slice(transient_context);
         }
         if encoded.len() > MAX_NATIVE_FRAME_BYTES {
             return Err(NativeProtocolError::new(
@@ -353,7 +369,7 @@ impl NativeTelemetryBatch {
         }
         let mut cursor = Cursor::at(payload, 8);
         let mut partitions = Vec::with_capacity(count);
-        let mut seen = BTreeSet::new();
+        let mut seen = (count > 1).then(BTreeSet::new);
         for _ in 0..count {
             let topic_partition = TopicPartition::new(
                 TopicId::new(cursor.u128("telemetry topic ID")?),
@@ -363,12 +379,22 @@ impl NativeTelemetryBatch {
             let envelope =
                 TelemetryEnvelope::decode(cursor.bytes(envelope_len, "telemetry envelope")?)
                     .map_err(|error| NativeProtocolError::new(error.to_string()))?;
+            let transient_len = cursor.u32("transient context length")? as usize;
+            let transient_context = if transient_len == 0 {
+                None
+            } else {
+                Some(Arc::<[u8]>::from(
+                    cursor.bytes(transient_len, "transient context")?,
+                ))
+            };
             if topic_partition.topic_id != envelope.signal.topic_id() {
                 return Err(NativeProtocolError::new(
                     "native telemetry partition topic disagrees with its signal",
                 ));
             }
-            if !seen.insert(topic_partition) {
+            if let Some(seen) = &mut seen
+                && !seen.insert(topic_partition)
+            {
                 return Err(NativeProtocolError::new(
                     "native telemetry batch contains a duplicate partition",
                 ));
@@ -376,6 +402,7 @@ impl NativeTelemetryBatch {
             partitions.push(NativePartitionAppend {
                 topic_partition,
                 envelope,
+                transient_context,
             });
         }
         cursor.finish()?;
@@ -1022,6 +1049,7 @@ mod tests {
                     &b"payload"[..],
                 )
                 .unwrap(),
+                transient_context: Some(Arc::<[u8]>::from(&b"context"[..])),
             }],
         };
         assert_eq!(
