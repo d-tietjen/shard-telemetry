@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::borrow::Cow;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -12,10 +12,11 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
+use shard_stream_core::TopicPartition;
 use shard_telemetry::{
-    LokiEntry, NATIVE_FRAME_HEADER_BYTES, NativeFrame, NativeFrameHeader, NativeOpcode,
-    NativePartitionAppend, NativeStatus, NativeTelemetryAppendAck, NativeTelemetryBatch,
-    TelemetryRouter, prepare_loki_log_envelope,
+    DockerLogRecord, DockerLogStream, NATIVE_FRAME_HEADER_BYTES, NativeFrame, NativeFrameHeader,
+    NativeOpcode, NativePartitionAppend, NativeStatus, NativeTelemetryAppendAck,
+    NativeTelemetryBatch, TelemetryRouter, prepare_docker_log_envelope,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -59,11 +60,14 @@ struct Arguments {
 }
 
 #[derive(Debug, Deserialize)]
-struct DockerRecord {
-    log: String,
+struct DockerRecord<'a> {
+    #[serde(borrow)]
+    log: Cow<'a, str>,
     #[serde(default)]
-    stream: String,
-    time: String,
+    #[serde(borrow)]
+    stream: Cow<'a, str>,
+    #[serde(borrow)]
+    time: Cow<'a, str>,
 }
 
 #[derive(Debug, Default)]
@@ -165,7 +169,7 @@ fn run_worker(
         let mut partial = Vec::new();
         position += reader.read_until(b'\n', &mut partial)? as u64;
     }
-    let mut connection = Connection::connect(protocol, host, port)?;
+    let mut connection = Connection::connect(protocol, host, port, tenant)?;
     let mut result = WorkerResult::default();
     let mut batch = LoadBatch::new(protocol, batch_bytes);
     let mut line = Vec::with_capacity(4096);
@@ -180,7 +184,7 @@ fn run_worker(
         if !line.ends_with(b"\n") && position >= end {
             break;
         }
-        let record: DockerRecord = match serde_json::from_slice(&line) {
+        let record: DockerRecord<'_> = match serde_json::from_slice(&line) {
             Ok(record) => record,
             Err(_) => {
                 result.malformed_records = result.malformed_records.saturating_add(1);
@@ -209,7 +213,7 @@ enum LoadBatch {
         records: usize,
     },
     Native {
-        entries: Vec<LokiEntry>,
+        entries: Vec<DockerLogRecord>,
         estimated_bytes: usize,
     },
 }
@@ -231,7 +235,7 @@ impl LoadBatch {
     fn push(
         &mut self,
         timestamp: u64,
-        record: DockerRecord,
+        record: DockerRecord<'_>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         match self {
             Self::Loki { values, records } => {
@@ -241,10 +245,10 @@ impl LoadBatch {
                 values.push_str("[\"");
                 values.push_str(&timestamp.to_string());
                 values.push_str("\",");
-                values.push_str(&serde_json::to_string(&record.log)?);
+                values.push_str(&serde_json::to_string(record.log.as_ref())?);
                 if !record.stream.is_empty() {
                     values.push_str(",{\"docker_stream\":");
-                    values.push_str(&serde_json::to_string(&record.stream)?);
+                    values.push_str(&serde_json::to_string(record.stream.as_ref())?);
                     values.push('}');
                 }
                 values.push(']');
@@ -254,22 +258,15 @@ impl LoadBatch {
                 entries,
                 estimated_bytes,
             } => {
-                let timestamp_unix_nanos =
-                    i64::try_from(timestamp).map_err(|_| "timestamp exceeds i64")?;
                 let metadata_bytes = record.stream.len();
                 *estimated_bytes = estimated_bytes
                     .saturating_add(record.log.len())
                     .saturating_add(metadata_bytes)
                     .saturating_add(32);
-                entries.push(LokiEntry {
-                    timestamp_unix_nanos,
-                    labels: BTreeMap::from([("source".to_owned(), "clickhouse-docker".to_owned())]),
-                    line: record.log,
-                    structured_metadata: if record.stream.is_empty() {
-                        BTreeMap::new()
-                    } else {
-                        BTreeMap::from([("docker_stream".to_owned(), record.stream)])
-                    },
+                entries.push(DockerLogRecord {
+                    timestamp_unix_nanos: timestamp,
+                    message: record.log.into_owned(),
+                    stream: docker_stream(record.stream),
                 });
             }
         }
@@ -303,10 +300,11 @@ impl Connection {
         protocol: LoadProtocol,
         host: &str,
         port: u16,
+        tenant: &str,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         match protocol {
             LoadProtocol::Loki => HttpConnection::connect(host, port).map(Self::Loki),
-            LoadProtocol::Native => NativeConnection::connect(host, port).map(Self::Native),
+            LoadProtocol::Native => NativeConnection::connect(host, port, tenant).map(Self::Native),
         }
     }
 
@@ -432,15 +430,23 @@ impl HttpConnection {
 
 struct NativeConnection {
     stream: TcpStream,
+    topic_partition: TopicPartition,
     pending_request_ids: Vec<u128>,
 }
 
 impl NativeConnection {
-    fn connect(host: &str, port: u16) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    fn connect(host: &str, port: u16, tenant: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let stream = TcpStream::connect((host, port))?;
         stream.set_nodelay(true)?;
+        let mut route_identity = Vec::with_capacity(8 + 6 + 8 + 17);
+        route_identity.extend_from_slice(&6_u64.to_le_bytes());
+        route_identity.extend_from_slice(b"source");
+        route_identity.extend_from_slice(&17_u64.to_le_bytes());
+        route_identity.extend_from_slice(b"clickhouse-docker");
+        let router = TelemetryRouter::new(NonZeroU16::new(256).expect("constant is nonzero"));
         Ok(Self {
             stream,
+            topic_partition: router.log(tenant, None, &route_identity),
             pending_request_ids: Vec::new(),
         })
     }
@@ -448,25 +454,14 @@ impl NativeConnection {
     fn push(
         &mut self,
         tenant: &str,
-        entries: Vec<LokiEntry>,
+        entries: Vec<DockerLogRecord>,
         next_request: &AtomicU64,
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
         let request_id = u128::from(next_request.fetch_add(1, Ordering::Relaxed));
-        let mut route_identity = Vec::new();
-        if let Some(entry) = entries.first() {
-            for (key, value) in &entry.labels {
-                route_identity.extend_from_slice(&(key.len() as u64).to_le_bytes());
-                route_identity.extend_from_slice(key.as_bytes());
-                route_identity.extend_from_slice(&(value.len() as u64).to_le_bytes());
-                route_identity.extend_from_slice(value.as_bytes());
-            }
-        }
-        let router = TelemetryRouter::new(NonZeroU16::new(256).expect("constant is nonzero"));
-        let topic_partition = router.log(tenant, None, &route_identity);
-        let envelope = prepare_loki_log_envelope(tenant, entries)?;
+        let envelope = prepare_docker_log_envelope(tenant, entries)?;
         let payload = NativeTelemetryBatch {
             partitions: vec![NativePartitionAppend {
-                topic_partition,
+                topic_partition: self.topic_partition,
                 envelope,
             }],
         }
@@ -517,6 +512,23 @@ impl NativeConnection {
 
     fn pending(&self) -> usize {
         self.pending_request_ids.len()
+    }
+}
+
+fn docker_stream(stream: Cow<'_, str>) -> DockerLogStream {
+    match stream {
+        Cow::Borrowed(value) => match value {
+            "" => DockerLogStream::Empty,
+            "stdout" => DockerLogStream::Stdout,
+            "stderr" => DockerLogStream::Stderr,
+            value => DockerLogStream::Other(value.to_owned()),
+        },
+        Cow::Owned(value) => match value.as_str() {
+            "" => DockerLogStream::Empty,
+            "stdout" => DockerLogStream::Stdout,
+            "stderr" => DockerLogStream::Stderr,
+            _ => DockerLogStream::Other(value),
+        },
     }
 }
 

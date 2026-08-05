@@ -1,18 +1,99 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use shard_stream_core::{LogicalOffset, ShardId, TopicPartition};
 
-use crate::ingest_pack::{decode_ingest_pack, prepare_ingest_pack};
+use crate::ingest_pack::{
+    decode_ingest_pack, prepare_ingest_pack, prepare_single_cohort_ingest_pack,
+};
 use crate::{
     CompressionCohortId, LokiEntry, MetadataField, MetricIngestProtocol, OtlpLogEvent,
-    OtlpMetricEvent, OtlpSpanEvent, ResourceContext, ScopeContext, TelemetryAttribute,
-    TelemetryEnvelope, TelemetryError, TelemetryResult, TelemetrySignal, TelemetryValue,
-    encode_metric_chunk, encode_trace_block,
+    OtlpMetricEvent, OtlpSpanEvent, ResourceContext, ScopeContext, StructuralLogMetadataRef,
+    StructuralRecordView, TelemetryAttribute, TelemetryEnvelope, TelemetryError, TelemetryResult,
+    TelemetrySignal, TelemetryValue, encode_metric_chunk, encode_trace_block,
 };
 
 const LABEL_PREFIX: &str = "resource.loki.label.";
 const METADATA_PREFIX: &str = "attr.loki.metadata.";
 const TENANT_FIELD: &str = "resource.loki.tenant";
+
+/// Stream value from a Docker `json-file` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DockerLogStream {
+    /// No stream metadata was present.
+    Empty,
+    /// The conventional Docker stdout stream.
+    Stdout,
+    /// The conventional Docker stderr stream.
+    Stderr,
+    /// An arbitrary stream value retained without normalization.
+    Other(String),
+}
+
+/// Minimal owned Docker record used by the native ingestion fast path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerLogRecord {
+    /// Event timestamp in Unix nanoseconds.
+    pub timestamp_unix_nanos: u64,
+    /// Exact decoded Docker log body.
+    pub message: String,
+    /// Exact Docker stream value.
+    pub stream: DockerLogStream,
+}
+
+struct DockerStructuralRecord {
+    ordinal: u32,
+    timestamp_unix_nanos: u64,
+    message: Arc<str>,
+    body: TelemetryValue,
+    fields: Arc<Vec<MetadataField>>,
+    attributes: Arc<Vec<TelemetryAttribute>>,
+    resource: Arc<ResourceContext>,
+    scope: Arc<ScopeContext>,
+    severity_text: Arc<str>,
+    event_name: Arc<str>,
+}
+
+impl StructuralRecordView for DockerStructuralRecord {
+    fn structural_offset(&self) -> shard_stream_core::LogicalOffset {
+        shard_stream_core::LogicalOffset::new(u64::from(self.ordinal))
+    }
+
+    fn structural_timestamp_unix_nanos(&self) -> u64 {
+        self.timestamp_unix_nanos
+    }
+
+    fn structural_message(&self) -> &str {
+        &self.message
+    }
+
+    fn structural_field_count(&self) -> usize {
+        self.fields.len()
+    }
+
+    fn structural_field(&self, index: usize) -> Option<(&str, &str)> {
+        self.fields
+            .get(index)
+            .map(|field| (field.key.as_ref(), field.value.as_ref()))
+    }
+
+    fn structural_log_metadata(&self) -> Option<StructuralLogMetadataRef<'_>> {
+        Some(StructuralLogMetadataRef {
+            observed_timestamp_unix_nanos: 0,
+            body: Some(&self.body),
+            attributes: &self.attributes,
+            resource: &self.resource,
+            scope: &self.scope,
+            severity_number: 0,
+            severity_text: &self.severity_text,
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: None,
+            span_id: None,
+            event_name: &self.event_name,
+        })
+    }
+}
 
 /// Builds one durable STEL log envelope from already validated events.
 pub fn prepare_log_envelope(
@@ -157,6 +238,121 @@ pub fn prepare_loki_log_envelope(
     prepare_log_envelope(tenant, &events)
 }
 
+/// Builds a log envelope directly from Docker records without constructing
+/// compatibility maps for every record.
+pub fn prepare_docker_log_envelope(
+    tenant: &str,
+    records: Vec<DockerLogRecord>,
+) -> TelemetryResult<TelemetryEnvelope> {
+    if tenant.is_empty() {
+        return Err(TelemetryError::InvalidNativePayload(
+            "Docker tenant must not be empty".into(),
+        ));
+    }
+    let tenant: Arc<str> = Arc::from(tenant);
+    let source_key: Arc<str> = Arc::from("source");
+    let source_value: Arc<str> = Arc::from("clickhouse-docker");
+    let resource = Arc::new(ResourceContext {
+        attributes: Arc::new(vec![TelemetryAttribute::new(
+            Arc::clone(&source_key),
+            TelemetryValue::String(Arc::clone(&source_value)),
+        )]),
+        ..ResourceContext::default()
+    });
+    let scope = Arc::new(ScopeContext::default());
+    let resource_id: Arc<str> = Arc::from(resource.id().to_string());
+    let scope_id: Arc<str> = Arc::from(scope.id().to_string());
+    let cohort = docker_source_cohort();
+    let stream_metadata = |stream: Option<&str>| {
+        let stream = stream.map(Arc::<str>::from);
+        let mut fields = Vec::with_capacity(if stream.is_some() { 5 } else { 4 });
+        fields.push(MetadataField::new(
+            Arc::<str>::from(TENANT_FIELD),
+            Arc::clone(&tenant),
+        ));
+        fields.push(MetadataField::new(
+            Arc::<str>::from(format!("{LABEL_PREFIX}{source_key}")),
+            Arc::clone(&source_value),
+        ));
+        if let Some(stream) = &stream {
+            fields.push(MetadataField::new(
+                Arc::<str>::from(format!("{METADATA_PREFIX}docker_stream")),
+                Arc::clone(stream),
+            ));
+        }
+        fields.push(MetadataField::new(
+            Arc::<str>::from("otel.resource.id"),
+            Arc::clone(&resource_id),
+        ));
+        fields.push(MetadataField::new(
+            Arc::<str>::from("otel.scope.id"),
+            Arc::clone(&scope_id),
+        ));
+        let attributes = stream.map_or_else(Vec::new, |stream| {
+            vec![TelemetryAttribute::new(
+                Arc::<str>::from("docker_stream"),
+                TelemetryValue::String(stream),
+            )]
+        });
+        (Arc::new(fields), Arc::new(attributes))
+    };
+    let empty = stream_metadata(None);
+    let stdout = stream_metadata(Some("stdout"));
+    let stderr = stream_metadata(Some("stderr"));
+    let mut other_streams =
+        HashMap::<String, (Arc<Vec<MetadataField>>, Arc<Vec<TelemetryAttribute>>)>::new();
+    let empty_text: Arc<str> = Arc::from("");
+    let mut structural_records = Vec::with_capacity(records.len());
+    for (ordinal, record) in records.into_iter().enumerate() {
+        let metadata = match record.stream {
+            DockerLogStream::Empty => &empty,
+            DockerLogStream::Stdout => &stdout,
+            DockerLogStream::Stderr => &stderr,
+            DockerLogStream::Other(stream) => other_streams
+                .entry(stream.clone())
+                .or_insert_with(|| stream_metadata(Some(&stream))),
+        };
+        let (fields, attributes) = metadata;
+        let message: Arc<str> = Arc::from(record.message);
+        structural_records.push(DockerStructuralRecord {
+            ordinal: u32::try_from(ordinal).map_err(|_| TelemetryError::RecordTooLarge)?,
+            timestamp_unix_nanos: record.timestamp_unix_nanos,
+            body: TelemetryValue::String(Arc::clone(&message)),
+            message,
+            fields: Arc::clone(fields),
+            attributes: Arc::clone(attributes),
+            resource: Arc::clone(&resource),
+            scope: Arc::clone(&scope),
+            severity_text: Arc::clone(&empty_text),
+            event_name: Arc::clone(&empty_text),
+        });
+    }
+    let item_count =
+        u32::try_from(structural_records.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+    let prepared = prepare_single_cohort_ingest_pack(&structural_records, cohort)?;
+    TelemetryEnvelope::new(
+        TelemetrySignal::Logs,
+        tenant,
+        item_count,
+        Arc::<[u8]>::from([]),
+        Arc::<[u8]>::from(prepared.payload),
+    )
+}
+
+fn docker_source_cohort() -> CompressionCohortId {
+    let mut cohort = blake3::Hasher::new();
+    cohort.update(&("source".len() as u64).to_le_bytes());
+    cohort.update(b"source");
+    cohort.update(&("clickhouse-docker".len() as u64).to_le_bytes());
+    cohort.update(b"clickhouse-docker");
+    let digest = cohort.finalize();
+    CompressionCohortId::new(u64::from_le_bytes(
+        digest.as_bytes()[..8]
+            .try_into()
+            .expect("BLAKE3 output contains eight bytes"),
+    ))
+}
+
 /// Builds one durable STEL trace envelope for a single routed partition.
 pub fn prepare_trace_envelope(
     topic_partition: TopicPartition,
@@ -259,6 +455,7 @@ pub fn prepare_metric_envelope_with_protocol(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroU16;
 
     use opentelemetry_proto::tonic::{
@@ -287,6 +484,65 @@ mod tests {
         let mut conflicting = event;
         conflicting.fields = Arc::new(vec![MetadataField::new(TENANT_FIELD, "tenant-b")]);
         assert!(prepare_log_envelope("tenant-a", &[conflicting]).is_err());
+    }
+
+    #[test]
+    fn docker_fast_path_matches_loki_envelope_bytes_after_decode() {
+        let optimized = prepare_docker_log_envelope(
+            "tenant-a",
+            vec![
+                DockerLogRecord {
+                    timestamp_unix_nanos: 10,
+                    message: "hello".to_owned(),
+                    stream: DockerLogStream::Stdout,
+                },
+                DockerLogRecord {
+                    timestamp_unix_nanos: 20,
+                    message: "world".to_owned(),
+                    stream: DockerLogStream::Stderr,
+                },
+                DockerLogRecord {
+                    timestamp_unix_nanos: 30,
+                    message: "empty".to_owned(),
+                    stream: DockerLogStream::Empty,
+                },
+            ],
+        )
+        .unwrap();
+        let generic = prepare_loki_log_envelope(
+            "tenant-a",
+            vec![
+                LokiEntry {
+                    timestamp_unix_nanos: 10,
+                    labels: BTreeMap::from([("source".to_owned(), "clickhouse-docker".to_owned())]),
+                    line: "hello".to_owned(),
+                    structured_metadata: BTreeMap::from([(
+                        "docker_stream".to_owned(),
+                        "stdout".to_owned(),
+                    )]),
+                },
+                LokiEntry {
+                    timestamp_unix_nanos: 20,
+                    labels: BTreeMap::from([("source".to_owned(), "clickhouse-docker".to_owned())]),
+                    line: "world".to_owned(),
+                    structured_metadata: BTreeMap::from([(
+                        "docker_stream".to_owned(),
+                        "stderr".to_owned(),
+                    )]),
+                },
+                LokiEntry {
+                    timestamp_unix_nanos: 30,
+                    labels: BTreeMap::from([("source".to_owned(), "clickhouse-docker".to_owned())]),
+                    line: "empty".to_owned(),
+                    structured_metadata: BTreeMap::new(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            decode_log_envelope(&optimized).unwrap(),
+            decode_log_envelope(&generic).unwrap()
+        );
     }
 
     #[test]

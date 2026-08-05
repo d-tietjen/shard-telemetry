@@ -112,7 +112,8 @@ pub use remote_write::{
     RemoteWriteStats, RemoteWriteVersion,
 };
 pub use signal_ingest::{
-    decode_log_envelope, prepare_log_envelope, prepare_loki_log_envelope, prepare_metric_envelope,
+    DockerLogRecord, DockerLogStream, decode_log_envelope, prepare_docker_log_envelope,
+    prepare_log_envelope, prepare_loki_log_envelope, prepare_metric_envelope,
     prepare_metric_envelope_with_protocol, prepare_trace_envelope,
 };
 pub use sink::{OtlpSinkConfig, SinkObjectTierConfig, TelemetryService, TelemetrySinkFactory};

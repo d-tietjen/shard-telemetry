@@ -126,6 +126,26 @@ pub(crate) fn prepare_ingest_pack(events: &[OtlpLogEvent]) -> TelemetryResult<Pr
     prepare_grouped_ingest_pack(record_count, cohorts)
 }
 
+pub(crate) fn prepare_single_cohort_ingest_pack<R: StructuralRecordView>(
+    records: &[R],
+    cohort: CompressionCohortId,
+) -> TelemetryResult<PreparedIngestPack> {
+    let record_count = u32::try_from(records.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+    let group_count: u16 = if records.is_empty() { 0 } else { 1 };
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(INGEST_PACK_MAGIC);
+    encoded.extend_from_slice(&record_count.to_le_bytes());
+    encoded.extend_from_slice(&group_count.to_le_bytes());
+    encoded.extend_from_slice(&0_u16.to_le_bytes());
+    if !records.is_empty() {
+        append_ingest_group(&mut encoded, cohort, records)?;
+    }
+    if encoded.len() > crate::native_protocol::MAX_NATIVE_FRAME_BYTES {
+        return Err(TelemetryError::RecordTooLarge);
+    }
+    Ok(PreparedIngestPack { payload: encoded })
+}
+
 fn prepare_grouped_ingest_pack<R: StructuralRecordView>(
     record_count: u32,
     cohorts: BTreeMap<CompressionCohortId, Vec<R>>,
@@ -137,51 +157,60 @@ fn prepare_grouped_ingest_pack<R: StructuralRecordView>(
     encoded.extend_from_slice(&group_count.to_le_bytes());
     encoded.extend_from_slice(&0_u16.to_le_bytes());
     for (cohort, records) in cohorts {
-        let indexed = encode_indexed_structural_records(&records)?;
-        let structural = indexed.structural;
-        if structural.len() > MAX_INGEST_STRUCTURAL_BYTES {
-            return Err(TelemetryError::RecordTooLarge);
-        }
-        let compressed = INGEST_COMPRESSOR.with_borrow_mut(|compressor| {
-            compressor
-                .compress(&structural)
-                .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))
-        })?;
-        encoded.extend_from_slice(&cohort.get().to_le_bytes());
-        encoded.extend_from_slice(
-            &u32::try_from(records.len())
-                .map_err(|_| TelemetryError::RecordTooLarge)?
-                .to_le_bytes(),
-        );
-        encoded.extend_from_slice(
-            &u32::try_from(structural.len())
-                .map_err(|_| TelemetryError::RecordTooLarge)?
-                .to_le_bytes(),
-        );
-        encoded.extend_from_slice(
-            &u32::try_from(compressed.len())
-                .map_err(|_| TelemetryError::RecordTooLarge)?
-                .to_le_bytes(),
-        );
-        encoded.extend_from_slice(&payload_checksum(&compressed).to_le_bytes());
-        let min_timestamp_unix_nanos = records
-            .iter()
-            .map(StructuralRecordView::structural_timestamp_unix_nanos)
-            .min()
-            .expect("ingest cohort groups are nonempty");
-        let max_timestamp_unix_nanos = records
-            .iter()
-            .map(StructuralRecordView::structural_timestamp_unix_nanos)
-            .max()
-            .expect("ingest cohort groups are nonempty");
-        encoded.extend_from_slice(&min_timestamp_unix_nanos.to_le_bytes());
-        encoded.extend_from_slice(&max_timestamp_unix_nanos.to_le_bytes());
-        encoded.extend_from_slice(&compressed);
+        append_ingest_group(&mut encoded, cohort, &records)?;
     }
     if encoded.len() > crate::native_protocol::MAX_NATIVE_FRAME_BYTES {
         return Err(TelemetryError::RecordTooLarge);
     }
     Ok(PreparedIngestPack { payload: encoded })
+}
+
+fn append_ingest_group<R: StructuralRecordView>(
+    encoded: &mut Vec<u8>,
+    cohort: CompressionCohortId,
+    records: &[R],
+) -> TelemetryResult<()> {
+    let indexed = encode_indexed_structural_records(records)?;
+    let structural = indexed.structural;
+    if structural.len() > MAX_INGEST_STRUCTURAL_BYTES {
+        return Err(TelemetryError::RecordTooLarge);
+    }
+    let compressed = INGEST_COMPRESSOR.with_borrow_mut(|compressor| {
+        compressor
+            .compress(&structural)
+            .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))
+    })?;
+    encoded.extend_from_slice(&cohort.get().to_le_bytes());
+    encoded.extend_from_slice(
+        &u32::try_from(records.len())
+            .map_err(|_| TelemetryError::RecordTooLarge)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(
+        &u32::try_from(structural.len())
+            .map_err(|_| TelemetryError::RecordTooLarge)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(
+        &u32::try_from(compressed.len())
+            .map_err(|_| TelemetryError::RecordTooLarge)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&payload_checksum(&compressed).to_le_bytes());
+    let min_timestamp_unix_nanos = records
+        .iter()
+        .map(StructuralRecordView::structural_timestamp_unix_nanos)
+        .min()
+        .expect("ingest cohort groups are nonempty");
+    let max_timestamp_unix_nanos = records
+        .iter()
+        .map(StructuralRecordView::structural_timestamp_unix_nanos)
+        .max()
+        .expect("ingest cohort groups are nonempty");
+    encoded.extend_from_slice(&min_timestamp_unix_nanos.to_le_bytes());
+    encoded.extend_from_slice(&max_timestamp_unix_nanos.to_le_bytes());
+    encoded.extend_from_slice(&compressed);
+    Ok(())
 }
 
 pub(crate) fn validate_ingest_pack(

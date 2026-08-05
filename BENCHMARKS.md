@@ -85,6 +85,34 @@ ClickHouse adapter/query node, ShardTelemetry p50 values were 51, 49, and
 protocol path therefore does **not** yet satisfy the 1 GiB/s-per-core target;
 123.20 MiB/s is the measured aggregate result for this run.
 
+### Native ingress ablation — Adam, 2 GiB
+
+`ingress-direct-view-2g-attempt1` used the same 16 physical CPUs, source
+prefix, prewarm, native protocol, and one malformed-line condition as the
+earlier ingress smoke runs. The current path keeps the borrowed `serde_json`
+Docker parser, caches the repeated Docker metadata, emits one source-cohort
+structural group, and writes directly through `StructuralRecordView` instead
+of first constructing one `OtlpLogEvent` per record.
+
+| Path | Source MiB/s | Records | Wire bytes | Stored bytes | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Previous native baseline | 133.09 | 15,184,074 | 67,674,722 | 67,808,000 | reference |
+| Borrowed parser + metadata fast path | 135.36 | 15,184,074 | 67,674,722 | 67,808,000 | superseded |
+| **Direct structural view + single cohort** | **135.83** | 15,184,074 | 67,674,722 | 67,808,000 | **current** |
+| SIMD `sonic-rs` parser candidate | 134.30 | 15,184,074 | 67,674,722 | 67,808,000 | rejected |
+
+The direct-view change improves the measured native loader by 2.06% over the
+baseline without changing bytes or reconstruction. The ClickHouse control in
+the same direct-view harness measured 192.48 MiB/s and 152,459,902 stored
+bytes. Ingress remains the only measured full-corpus throughput category where
+ClickHouse is ahead; the SIMD parser candidate was removed because it regressed
+the direct-view result. Retained evidence is under:
+
+```text
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-adapter-20260804-v1/ingress-direct-view-2g-attempt1
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-adapter-20260804-v1/ingress-sonic-2g-attempt1
+```
+
 ### Traces and metrics, one core
 
 `signals-server-1core-attempt4` used 262,144 deterministic correlated records
