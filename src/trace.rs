@@ -464,31 +464,60 @@ fn resolve_sidecar<T: Clone>(values: &[T], id: u32, lane: &'static str) -> Telem
 }
 
 fn encode_span_ids(records: &[&DurableSpan]) -> TelemetryResult<Vec<u8>> {
-    let mut encoded = Vec::with_capacity(records.len().saturating_mul(18));
+    let mut trace_groups = Vec::with_capacity(records.len());
+    let mut previous_group_trace = [0; 16];
+    let mut group_start = 0usize;
+    while group_start < records.len() {
+        let trace = records[group_start].trace_id.as_bytes();
+        let mut group_end = group_start + 1;
+        while group_end < records.len() && records[group_end].trace_id.as_bytes() == trace {
+            group_end += 1;
+        }
+        let prefix = trace
+            .iter()
+            .zip(previous_group_trace)
+            .take_while(|(left, right)| **left == *right)
+            .count();
+        debug_assert!(prefix < 16, "adjacent trace groups must differ");
+        trace_groups.push(u8::try_from(prefix).expect("trace prefix is at most 15"));
+        trace_groups.extend_from_slice(&trace[prefix..]);
+        write_trace_run(group_end - group_start, &mut trace_groups)?;
+        previous_group_trace = *trace;
+        group_start = group_end;
+    }
+
+    let mut span_lane = Vec::with_capacity(records.len().saturating_mul(10));
     let mut previous_trace = [0; 16];
     let mut previous_span = [0; 8];
     let mut previous_parent = [0; 8];
+    let mut first_span_in_trace = [0; 8];
     for record in records {
         let trace = record.trace_id.as_bytes();
-        let prefix = trace
-            .iter()
-            .zip(previous_trace)
-            .take_while(|(left, right)| **left == *right)
-            .count();
-        encoded.push(u8::try_from(prefix).expect("trace prefix is at most 16"));
-        encoded.extend_from_slice(&trace[prefix..]);
-        encode_xor_id(record.span_id.as_bytes(), &previous_span, &mut encoded);
+        let same_trace = trace == &previous_trace;
+        encode_xor_id(record.span_id.as_bytes(), &previous_span, &mut span_lane);
         match record.parent_span_id {
             Some(parent) => {
-                encoded.push(1);
-                encode_xor_id(parent.as_bytes(), &previous_parent, &mut encoded);
+                if same_trace && parent.as_bytes() == &previous_span {
+                    span_lane.push(2);
+                } else if same_trace && parent.as_bytes() == &first_span_in_trace {
+                    span_lane.push(3);
+                } else {
+                    span_lane.push(1);
+                    encode_xor_id(parent.as_bytes(), &previous_parent, &mut span_lane);
+                }
                 previous_parent = *parent.as_bytes();
             }
-            None => encoded.push(0),
+            None => span_lane.push(0),
+        }
+        if !same_trace {
+            first_span_in_trace = *record.span_id.as_bytes();
         }
         previous_trace = *trace;
         previous_span = *record.span_id.as_bytes();
     }
+    let mut encoded = Vec::with_capacity(4 + trace_groups.len() + span_lane.len());
+    append_section(&mut encoded, &trace_groups)?;
+    encoded.extend_from_slice(&span_lane);
     Ok(encoded)
 }
 
@@ -503,28 +532,34 @@ fn encode_xor_id(current: &[u8; 8], previous: &[u8; 8], encoded: &mut Vec<u8>) {
 type DecodedSpanIds = (TraceId, SpanId, Option<SpanId>);
 
 fn decode_span_ids(encoded: &[u8], count: usize) -> TelemetryResult<Vec<DecodedSpanIds>> {
+    let mut lane_cursor = 0;
+    let trace_groups = read_section(encoded, &mut lane_cursor, encoded.len())?;
+    let traces = decode_trace_groups(trace_groups, count)?;
+    let span_lane = &encoded[lane_cursor..];
     let mut cursor = 0;
     let mut previous_trace = [0; 16];
     let mut previous_span = [0; 8];
     let mut previous_parent = [0; 8];
+    let mut first_span_in_trace = [0; 8];
     let mut decoded = Vec::with_capacity(count);
-    for _ in 0..count {
-        let prefix = read_byte(encoded, &mut cursor)? as usize;
-        if prefix > 16 || encoded.len().saturating_sub(cursor) < 16 - prefix {
-            return Err(TelemetryError::InvalidBlockEncoding(
-                "invalid trace ID prefix lane",
-            ));
-        }
-        let mut trace = previous_trace;
-        trace[prefix..].copy_from_slice(&encoded[cursor..cursor + 16 - prefix]);
-        cursor += 16 - prefix;
-        let span = decode_xor_id(encoded, &mut cursor, previous_span)?;
-        let parent = match read_byte(encoded, &mut cursor)? {
+    for trace_id in traces {
+        let trace = *trace_id.as_bytes();
+        let same_trace = trace == previous_trace;
+        let span = decode_xor_id(span_lane, &mut cursor, previous_span)?;
+        let parent = match read_byte(span_lane, &mut cursor)? {
             0 => None,
             1 => {
-                let parent = decode_xor_id(encoded, &mut cursor, previous_parent)?;
+                let parent = decode_xor_id(span_lane, &mut cursor, previous_parent)?;
                 previous_parent = parent;
                 Some(SpanId::from_bytes(parent)?)
+            }
+            2 if same_trace => {
+                previous_parent = previous_span;
+                Some(SpanId::from_bytes(previous_span)?)
+            }
+            3 if same_trace => {
+                previous_parent = first_span_in_trace;
+                Some(SpanId::from_bytes(first_span_in_trace)?)
             }
             _ => {
                 return Err(TelemetryError::InvalidBlockEncoding(
@@ -532,18 +567,84 @@ fn decode_span_ids(encoded: &[u8], count: usize) -> TelemetryResult<Vec<DecodedS
                 ));
             }
         };
-        let trace_id = TraceId::from_bytes(trace)?;
         let span_id = SpanId::from_bytes(span)?;
         decoded.push((trace_id, span_id, parent));
+        if !same_trace {
+            first_span_in_trace = span;
+        }
         previous_trace = trace;
         previous_span = span;
     }
-    if cursor != encoded.len() {
+    if cursor != span_lane.len() {
         return Err(TelemetryError::InvalidBlockEncoding(
             "trailing span ID lane bytes",
         ));
     }
     Ok(decoded)
+}
+
+fn decode_trace_groups(encoded: &[u8], count: usize) -> TelemetryResult<Vec<TraceId>> {
+    let mut cursor = 0usize;
+    let mut previous_trace = [0; 16];
+    let mut traces = Vec::with_capacity(count);
+    while traces.len() < count {
+        let prefix = read_byte(encoded, &mut cursor)? as usize;
+        if prefix >= 16 || encoded.len().saturating_sub(cursor) < 16 - prefix {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "invalid grouped trace ID prefix lane",
+            ));
+        }
+        let mut trace = previous_trace;
+        trace[prefix..].copy_from_slice(&encoded[cursor..cursor + 16 - prefix]);
+        cursor += 16 - prefix;
+        let run = read_trace_run(encoded, &mut cursor)?;
+        if run == 0 || run > count - traces.len() {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "invalid grouped trace ID run length",
+            ));
+        }
+        let trace_id = TraceId::from_bytes(trace)?;
+        traces.extend(std::iter::repeat_n(trace_id, run));
+        previous_trace = trace;
+    }
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "trailing grouped trace ID bytes",
+        ));
+    }
+    Ok(traces)
+}
+
+fn write_trace_run(run: usize, encoded: &mut Vec<u8>) -> TelemetryResult<()> {
+    let mut value = u64::try_from(run).map_err(|_| TelemetryError::RecordTooLarge)?;
+    while value >= 0x80 {
+        encoded.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    encoded.push(value as u8);
+    Ok(())
+}
+
+fn read_trace_run(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<usize> {
+    let mut value = 0u64;
+    for index in 0..10 {
+        let byte = read_byte(encoded, cursor)?;
+        if index == 9 && byte & 0xfe != 0 {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "grouped trace ID run length overflow",
+            ));
+        }
+        let shift = index * 7;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return usize::try_from(value).map_err(|_| {
+                TelemetryError::InvalidBlockEncoding("grouped trace ID run length overflow")
+            });
+        }
+    }
+    Err(TelemetryError::InvalidBlockEncoding(
+        "grouped trace ID run length overflow",
+    ))
 }
 
 fn decode_xor_id(
@@ -1422,6 +1523,41 @@ mod tests {
         assert_eq!(decoded[0], records[2]);
         assert_eq!(decoded[1], records[1]);
         assert_eq!(decoded[2], records[0]);
+    }
+
+    #[test]
+    fn grouped_trace_and_parent_references_compact_common_topologies() {
+        let mut records = (1..=8)
+            .map(|ordinal| {
+                let mut record = span(ordinal, 1, ordinal as u8);
+                record.span_id = SpanId::from_bytes(ordinal.to_be_bytes()).unwrap();
+                record
+            })
+            .collect::<Vec<_>>();
+        for ordinal in 1..records.len() {
+            records[ordinal].parent_span_id = Some(records[ordinal - 1].span_id);
+        }
+        let mut star = (9..=16)
+            .map(|ordinal| {
+                let mut record = span(ordinal, 2, ordinal as u8);
+                record.span_id = SpanId::from_bytes(ordinal.to_be_bytes()).unwrap();
+                record
+            })
+            .collect::<Vec<_>>();
+        let root = star[0].span_id;
+        for record in &mut star[1..] {
+            record.parent_span_id = Some(root);
+        }
+        records.extend(star);
+        let refs = records.iter().collect::<Vec<_>>();
+        let encoded = encode_span_ids(&refs).unwrap();
+        let decoded = decode_span_ids(&encoded, records.len()).unwrap();
+        let expected = records
+            .iter()
+            .map(|record| (record.trace_id, record.span_id, record.parent_span_id))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, expected);
+        assert!(encoded.len() < records.len() * 6);
     }
 
     #[test]

@@ -802,18 +802,32 @@ fn encode_double_value_lane(codec: u8, values: &[u64]) -> TelemetryResult<Vec<u8
     };
     let mut writer = MetricBitWriter::new();
     let mut previous = first;
+    let mut previous_window = None::<(u8, u8)>;
     for &value in rest {
         let xor = value ^ previous;
         if xor == 0 {
             writer.write_bit(false);
         } else {
             writer.write_bit(true);
-            let leading = xor.leading_zeros() as u8;
+            let leading = (xor.leading_zeros() as u8).min(31);
             let trailing = xor.trailing_zeros() as u8;
-            let significant = 64 - leading - trailing;
-            writer.write_bits(u64::from(leading), 6);
-            writer.write_bits(u64::from(trailing), 6);
-            writer.write_bits(xor >> trailing, significant);
+            if let Some((window_leading, window_trailing)) = previous_window
+                && leading >= window_leading
+                && trailing >= window_trailing
+            {
+                writer.write_bit(false);
+                writer.write_bits(
+                    xor >> window_trailing,
+                    64 - window_leading - window_trailing,
+                );
+            } else {
+                writer.write_bit(true);
+                let significant = 64 - leading - trailing;
+                writer.write_bits(u64::from(leading), 5);
+                writer.write_bits(u64::from(significant) & 0x3f, 6);
+                writer.write_bits(xor >> trailing, significant);
+                previous_window = Some((leading, trailing));
+            }
         }
         previous = value;
     }
@@ -835,13 +849,33 @@ fn decode_double_value_lane(encoded: &[u8], count: usize) -> TelemetryResult<Vec
     let mut values = Vec::with_capacity(count);
     values.push(first);
     let mut previous = first;
+    let mut previous_window = None::<(u8, u8)>;
     let mut reader = MetricBitReader::new(&encoded[8..]);
     for _ in 1..count {
         let value = if !reader.read_bit()? {
             previous
         } else {
-            let leading = reader.read_bits(6)? as u8;
-            let trailing = reader.read_bits(6)? as u8;
+            let (leading, trailing) = if !reader.read_bit()? {
+                previous_window.ok_or(TelemetryError::InvalidBlockEncoding(
+                    "metric double lane reuses a missing XOR window",
+                ))?
+            } else {
+                let leading = reader.read_bits(5)? as u8;
+                let encoded_significant = reader.read_bits(6)? as u8;
+                let significant = if encoded_significant == 0 {
+                    64
+                } else {
+                    encoded_significant
+                };
+                if u16::from(leading) + u16::from(significant) > 64 {
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "invalid metric double XOR window",
+                    ));
+                }
+                let trailing = 64 - leading - significant;
+                previous_window = Some((leading, trailing));
+                (leading, trailing)
+            };
             if leading.saturating_add(trailing) >= 64 {
                 return Err(TelemetryError::InvalidBlockEncoding(
                     "invalid metric double XOR window",
@@ -1049,16 +1083,45 @@ fn encode_timestamp_delta_of_delta(timestamps: &[u64]) -> TelemetryResult<Vec<u8
             ))?;
     write_varint(previous_delta, &mut encoded);
     let mut previous = timestamps[1];
-    for &timestamp in &timestamps[2..] {
+    let mut remaining = &timestamps[2..];
+    while let Some((&timestamp, rest)) = remaining.split_first() {
         let delta = timestamp
             .checked_sub(previous)
             .ok_or(TelemetryError::InvalidBlockEncoding(
                 "metric timestamps are not sorted",
             ))?;
         let delta_of_delta = i128::from(delta) - i128::from(previous_delta);
-        write_varint128(zigzag_i128(delta_of_delta), &mut encoded);
+        if delta_of_delta == 0 {
+            let mut run = 1usize;
+            let mut run_previous = timestamp;
+            while let Some(&candidate) = rest.get(run - 1) {
+                let candidate_delta = candidate.checked_sub(run_previous).ok_or(
+                    TelemetryError::InvalidBlockEncoding("metric timestamps are not sorted"),
+                )?;
+                if candidate_delta != delta {
+                    break;
+                }
+                run += 1;
+                run_previous = candidate;
+            }
+            write_varint128(0, &mut encoded);
+            write_varint(
+                u64::try_from(run).map_err(|_| TelemetryError::RecordTooLarge)?,
+                &mut encoded,
+            );
+            previous = run_previous;
+            remaining = &remaining[run..];
+            continue;
+        }
+        write_varint128(
+            zigzag_i128(delta_of_delta)
+                .checked_add(1)
+                .ok_or(TelemetryError::RecordTooLarge)?,
+            &mut encoded,
+        );
         previous = timestamp;
         previous_delta = delta;
+        remaining = rest;
     }
     Ok(encoded)
 }
@@ -1089,8 +1152,26 @@ fn decode_timestamp_delta_of_delta(encoded: &[u8], count: usize) -> TelemetryRes
                 "metric timestamp overflow",
             ))?;
     timestamps.push(previous);
-    for _ in 2..count {
-        let delta_of_delta = unzigzag_i128(read_varint128(encoded, &mut cursor)?);
+    while timestamps.len() < count {
+        let token = read_varint128(encoded, &mut cursor)?;
+        if token == 0 {
+            let run = usize::try_from(read_varint(encoded, &mut cursor)?).map_err(|_| {
+                TelemetryError::InvalidBlockEncoding("metric timestamp run length overflow")
+            })?;
+            if run == 0 || run > count - timestamps.len() {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "invalid metric timestamp run length",
+                ));
+            }
+            for _ in 0..run {
+                previous = previous.checked_add(previous_delta).ok_or(
+                    TelemetryError::InvalidBlockEncoding("metric timestamp overflow"),
+                )?;
+                timestamps.push(previous);
+            }
+            continue;
+        }
+        let delta_of_delta = unzigzag_i128(token - 1);
         let delta = i128::from(previous_delta)
             .checked_add(delta_of_delta)
             .and_then(|value| u64::try_from(value).ok())
@@ -2358,6 +2439,20 @@ mod tests {
         let encoded = encode_metric_chunk(&points).unwrap();
         let decoded = decode_metric_chunk(&encoded).unwrap();
         assert_eq!(decoded, points);
+
+        let bits = points
+            .iter()
+            .map(|point| match point.value {
+                MetricValue::Gauge(NumberValue::DoubleBits(bits)) => bits,
+                _ => unreachable!("test points are doubles"),
+            })
+            .collect::<Vec<_>>();
+        let compressed = encode_double_value_lane(2, &bits).unwrap();
+        assert_eq!(
+            decode_double_value_lane(&compressed[1..], bits.len()).unwrap(),
+            bits
+        );
+        assert!(compressed.len() < 8 * bits.len());
     }
 
     #[test]
@@ -2520,6 +2615,19 @@ mod tests {
         assert_eq!(
             decode_timestamp_delta_of_delta(&encoded, timestamps.len()).unwrap(),
             timestamps
+        );
+
+        let periodic = (0..4_096)
+            .map(|ordinal| 1_000_000_000 + ordinal * 15_000_000_000)
+            .collect::<Vec<_>>();
+        let encoded = encode_timestamp_delta_of_delta(&periodic).unwrap();
+        assert!(
+            encoded.len() <= 20,
+            "periodic timestamps use one bounded run"
+        );
+        assert_eq!(
+            decode_timestamp_delta_of_delta(&encoded, periodic.len()).unwrap(),
+            periodic
         );
     }
 

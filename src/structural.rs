@@ -1,12 +1,12 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 
 use pco::standalone::{simple_compress, simple_decompress_into};
 use pco::{ChunkConfig, DeltaSpec, ModeSpec};
-use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use shard_stream_core::LogicalOffset;
 
@@ -131,7 +131,7 @@ pub struct StructuralLogMetadataRef<'a> {
     pub event_name: &'a str,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StructuralLogMetadata {
     observed_timestamp_unix_nanos: u64,
     body: Option<TelemetryValue>,
@@ -147,22 +147,79 @@ struct StructuralLogMetadata {
     event_name: Arc<str>,
 }
 
-impl From<StructuralLogMetadataRef<'_>> for StructuralLogMetadata {
-    fn from(value: StructuralLogMetadataRef<'_>) -> Self {
+const ABSENT_LOG_BODY_ID: u32 = 0;
+const MESSAGE_LOG_BODY_ID: u32 = 1;
+const LOG_BODY_DICTIONARY_ID_BASE: u32 = 2;
+const EMPTY_STRING_ID: u32 = 0;
+const STRING_DICTIONARY_ID_BASE: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PackedLogMetadataRow {
+    observed_timestamp_delta: i64,
+    body_id: u32,
+    attributes_id: u32,
+    resource_id: u32,
+    scope_id: u32,
+    severity_number: i32,
+    severity_text_id: u32,
+    dropped_attributes_count: u32,
+    flags: u32,
+    trace_id: Option<TraceId>,
+    trace_id_from_fields: bool,
+    span_id: Option<SpanId>,
+    span_id_from_fields: bool,
+    event_name_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PackedLogMetadata {
+    bodies: Vec<TelemetryValue>,
+    attribute_sets: Vec<Arc<Vec<TelemetryAttribute>>>,
+    resources: Vec<Arc<ResourceContext>>,
+    scopes: Vec<Arc<ScopeContext>>,
+    strings: Vec<Arc<str>>,
+    rows: Vec<Option<PackedLogMetadataRow>>,
+}
+
+struct MetadataInterner<T> {
+    values: Vec<T>,
+    candidates: HashMap<u64, Vec<u32>>,
+}
+
+impl<T> MetadataInterner<T> {
+    fn with_capacity(capacity: usize) -> Self {
         Self {
-            observed_timestamp_unix_nanos: value.observed_timestamp_unix_nanos,
-            body: value.body.cloned(),
-            attributes: Arc::new(value.attributes.to_vec()),
-            resource: Arc::new(value.resource.clone()),
-            scope: Arc::new(value.scope.clone()),
-            severity_number: value.severity_number,
-            severity_text: Arc::from(value.severity_text),
-            dropped_attributes_count: value.dropped_attributes_count,
-            flags: value.flags,
-            trace_id: value.trace_id,
-            span_id: value.span_id,
-            event_name: Arc::from(value.event_name),
+            values: Vec::new(),
+            candidates: HashMap::with_capacity(capacity.min(4_096)),
         }
+    }
+
+    fn intern<Q: Hash + ?Sized>(
+        &mut self,
+        value: &Q,
+        equals: impl Fn(&T, &Q) -> bool,
+        own: impl FnOnce(&Q) -> T,
+    ) -> TelemetryResult<u32> {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        let hash = hasher.finish();
+        if let Some(candidates) = self.candidates.get(&hash) {
+            for candidate in candidates {
+                let index =
+                    usize::try_from(*candidate).map_err(|_| TelemetryError::RecordTooLarge)?;
+                if equals(&self.values[index], value) {
+                    return Ok(*candidate);
+                }
+            }
+        }
+        let id = u32::try_from(self.values.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+        self.values.push(own(value));
+        self.candidates.entry(hash).or_default().push(id);
+        Ok(id)
+    }
+
+    fn into_values(self) -> Vec<T> {
+        self.values
     }
 }
 
@@ -1116,7 +1173,13 @@ pub fn decode_structural_block(encoded: &[u8]) -> TelemetryResult<Vec<DecodedStr
     let messages = decode_bodies(bodies_section, &templates, &embedded_index, record_count)?;
     let attributes = decode_attribute_tables(attributes_section)?;
     let fields = decode_fields(fields_section, &attributes, record_count)?;
-    let typed_metadata = decode_typed_metadata(typed_metadata_section, record_count)?;
+    let typed_metadata = decode_typed_metadata(
+        typed_metadata_section,
+        record_count,
+        &timestamps,
+        &messages,
+        &fields,
+    )?;
     Ok(offsets
         .into_iter()
         .zip(timestamps)
@@ -1204,8 +1267,14 @@ pub fn decode_structural_records(
     let attributes = decode_attribute_tables(attributes_section)?;
     let fields =
         decode_selected_fields(fields_section, &attributes, record_count, record_ordinals)?;
-    let typed_metadata =
-        decode_selected_typed_metadata(typed_metadata_section, record_count, record_ordinals)?;
+    let typed_metadata = decode_selected_typed_metadata(
+        typed_metadata_section,
+        record_count,
+        record_ordinals,
+        &timestamps,
+        &messages,
+        &fields,
+    )?;
     let mut decoded = Vec::with_capacity(record_ordinals.len());
     for (((record_ordinal, message), fields), metadata) in record_ordinals
         .iter()
@@ -1629,17 +1698,83 @@ fn encode_typed_metadata<R: StructuralRecordView>(records: &[R]) -> TelemetryRes
     {
         return Ok(Vec::new());
     }
-    let mut raw = Vec::with_capacity(records.len().saturating_mul(64));
-    let mut serializer = rmp_serde::Serializer::new(&mut raw);
-    let mut sequence = serde::Serializer::serialize_seq(&mut serializer, Some(records.len()))
-        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    let mut bodies = MetadataInterner::with_capacity(records.len());
+    let mut attribute_sets = MetadataInterner::with_capacity(records.len());
+    let mut resources = MetadataInterner::with_capacity(records.len());
+    let mut scopes = MetadataInterner::with_capacity(records.len());
+    let mut strings = MetadataInterner::with_capacity(records.len());
+    let mut rows = Vec::with_capacity(records.len());
     for record in records {
-        sequence
-            .serialize_element(&record.structural_log_metadata())
-            .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+        let Some(metadata) = record.structural_log_metadata() else {
+            rows.push(None);
+            continue;
+        };
+        let body_id = match metadata.body {
+            None => ABSENT_LOG_BODY_ID,
+            Some(TelemetryValue::String(value))
+                if value.as_ref() == record.structural_message() =>
+            {
+                MESSAGE_LOG_BODY_ID
+            }
+            Some(value) => bodies
+                .intern(value, |candidate, value| candidate == value, Clone::clone)?
+                .checked_add(LOG_BODY_DICTIONARY_ID_BASE)
+                .ok_or(TelemetryError::RecordTooLarge)?,
+        };
+        let attributes_id = attribute_sets.intern(
+            metadata.attributes,
+            |candidate: &Arc<Vec<TelemetryAttribute>>, value| candidate.as_slice() == value,
+            |value| Arc::new(value.to_vec()),
+        )?;
+        let resource_id = resources.intern(
+            metadata.resource,
+            |candidate: &Arc<ResourceContext>, value| candidate.as_ref() == value,
+            |value| Arc::new(value.clone()),
+        )?;
+        let scope_id = scopes.intern(
+            metadata.scope,
+            |candidate: &Arc<ScopeContext>, value| candidate.as_ref() == value,
+            |value| Arc::new(value.clone()),
+        )?;
+        let severity_text_id = intern_optional_string(&mut strings, metadata.severity_text)?;
+        let event_name_id = intern_optional_string(&mut strings, metadata.event_name)?;
+        let trace_id_from_fields = metadata.trace_id.is_some_and(|trace_id| {
+            has_structural_hex_field(record, "otel.trace_id", trace_id.as_bytes())
+        });
+        let span_id_from_fields = metadata.span_id.is_some_and(|span_id| {
+            has_structural_hex_field(record, "otel.span_id", span_id.as_bytes())
+        });
+        rows.push(Some(PackedLogMetadataRow {
+            observed_timestamp_delta: metadata
+                .observed_timestamp_unix_nanos
+                .wrapping_sub(record.structural_timestamp_unix_nanos())
+                as i64,
+            body_id,
+            attributes_id,
+            resource_id,
+            scope_id,
+            severity_number: metadata.severity_number,
+            severity_text_id,
+            dropped_attributes_count: metadata.dropped_attributes_count,
+            flags: metadata.flags,
+            trace_id: (!trace_id_from_fields)
+                .then_some(metadata.trace_id)
+                .flatten(),
+            trace_id_from_fields,
+            span_id: (!span_id_from_fields).then_some(metadata.span_id).flatten(),
+            span_id_from_fields,
+            event_name_id,
+        }));
     }
-    sequence
-        .end()
+    let packed = PackedLogMetadata {
+        bodies: bodies.into_values(),
+        attribute_sets: attribute_sets.into_values(),
+        resources: resources.into_values(),
+        scopes: scopes.into_values(),
+        strings: strings.into_values(),
+        rows,
+    };
+    let raw = rmp_serde::to_vec(&packed)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
     let compressed = zstd::bulk::compress(&raw, 1)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
@@ -1656,10 +1791,94 @@ fn encode_typed_metadata<R: StructuralRecordView>(records: &[R]) -> TelemetryRes
 fn decode_typed_metadata(
     encoded: &[u8],
     record_count: usize,
+    timestamps: &[u64],
+    messages: &[Arc<str>],
+    fields: &[Arc<Vec<MetadataField>>],
 ) -> TelemetryResult<Vec<StructuralLogMetadata>> {
+    if timestamps.len() != record_count
+        || messages.len() != record_count
+        || fields.len() != record_count
+    {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "typed log metadata context count mismatch",
+        ));
+    }
     if encoded.is_empty() {
         return Ok(vec![StructuralLogMetadata::default(); record_count]);
     }
+    let packed = decode_packed_typed_metadata(encoded, record_count)?;
+    packed
+        .rows
+        .iter()
+        .zip(timestamps)
+        .zip(messages)
+        .zip(fields)
+        .map(|(((row, timestamp), message), fields)| {
+            unpack_typed_metadata(&packed, row.as_ref(), *timestamp, message, fields)
+        })
+        .collect()
+}
+
+fn decode_selected_typed_metadata(
+    encoded: &[u8],
+    record_count: usize,
+    selected: &[u32],
+    timestamps: &[u64],
+    messages: &[Arc<str>],
+    fields: &[Arc<Vec<MetadataField>>],
+) -> TelemetryResult<Vec<StructuralLogMetadata>> {
+    if messages.len() != selected.len()
+        || fields.len() != selected.len()
+        || timestamps.len() != record_count
+    {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "selected typed log metadata context count mismatch",
+        ));
+    }
+    if encoded.is_empty() {
+        return Ok(vec![StructuralLogMetadata::default(); selected.len()]);
+    }
+    let packed = decode_packed_typed_metadata(encoded, record_count)?;
+    selected
+        .iter()
+        .zip(messages)
+        .zip(fields)
+        .map(|((ordinal, message), fields)| {
+            let index = usize::try_from(*ordinal).map_err(|_| {
+                TelemetryError::InvalidBlockEncoding("typed metadata ordinal overflow")
+            })?;
+            let row = packed
+                .rows
+                .get(index)
+                .ok_or(TelemetryError::InvalidBlockEncoding(
+                    "typed metadata ordinal out of range",
+                ))?;
+            unpack_typed_metadata(&packed, row.as_ref(), timestamps[index], message, fields)
+        })
+        .collect()
+}
+
+fn intern_optional_string(
+    strings: &mut MetadataInterner<Arc<str>>,
+    value: &str,
+) -> TelemetryResult<u32> {
+    if value.is_empty() {
+        return Ok(EMPTY_STRING_ID);
+    }
+    strings
+        .intern(
+            value,
+            |candidate: &Arc<str>, value| candidate.as_ref() == value,
+            |value| Arc::from(value),
+        )?
+        .checked_add(STRING_DICTIONARY_ID_BASE)
+        .ok_or(TelemetryError::RecordTooLarge)
+}
+
+fn decode_packed_typed_metadata(
+    encoded: &[u8],
+    record_count: usize,
+) -> TelemetryResult<PackedLogMetadata> {
     if encoded.len() < 4 {
         return Err(TelemetryError::InvalidBlockEncoding(
             "truncated typed log metadata lane",
@@ -1678,39 +1897,185 @@ fn decode_typed_metadata(
             "typed log metadata length mismatch",
         ));
     }
-    let metadata: Vec<Option<StructuralLogMetadata>> = rmp_serde::from_slice(&raw)
+    let packed: PackedLogMetadata = rmp_serde::from_slice(&raw)
         .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid typed log metadata"))?;
-    if metadata.len() != record_count {
+    if packed.rows.len() != record_count {
         return Err(TelemetryError::InvalidBlockEncoding(
             "typed log metadata count mismatch",
         ));
     }
-    Ok(metadata
-        .into_iter()
-        .map(Option::unwrap_or_default)
-        .collect())
+    Ok(packed)
 }
 
-fn decode_selected_typed_metadata(
-    encoded: &[u8],
-    record_count: usize,
-    selected: &[u32],
-) -> TelemetryResult<Vec<StructuralLogMetadata>> {
-    let mut metadata = decode_typed_metadata(encoded, record_count)?;
-    selected
+fn unpack_typed_metadata(
+    packed: &PackedLogMetadata,
+    row: Option<&PackedLogMetadataRow>,
+    timestamp: u64,
+    message: &Arc<str>,
+    fields: &Arc<Vec<MetadataField>>,
+) -> TelemetryResult<StructuralLogMetadata> {
+    let Some(row) = row else {
+        return Ok(StructuralLogMetadata::default());
+    };
+    let body = match row.body_id {
+        ABSENT_LOG_BODY_ID => None,
+        MESSAGE_LOG_BODY_ID => Some(TelemetryValue::String(Arc::clone(message))),
+        id => Some(resolve_metadata_value(
+            &packed.bodies,
+            id.checked_sub(LOG_BODY_DICTIONARY_ID_BASE).ok_or(
+                TelemetryError::InvalidBlockEncoding("invalid typed log body ID"),
+            )?,
+            "typed log body",
+        )?),
+    };
+    if row.trace_id_from_fields && row.trace_id.is_some()
+        || row.span_id_from_fields && row.span_id.is_some()
+    {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "typed log ID has conflicting sources",
+        ));
+    }
+    let trace_id = if row.trace_id_from_fields {
+        Some(resolve_trace_id_field(fields, "otel.trace_id")?)
+    } else {
+        row.trace_id
+    };
+    let span_id = if row.span_id_from_fields {
+        Some(resolve_span_id_field(fields, "otel.span_id")?)
+    } else {
+        row.span_id
+    };
+    Ok(StructuralLogMetadata {
+        observed_timestamp_unix_nanos: timestamp.wrapping_add(row.observed_timestamp_delta as u64),
+        body,
+        attributes: resolve_metadata_value(
+            &packed.attribute_sets,
+            row.attributes_id,
+            "typed log attributes",
+        )?,
+        resource: resolve_metadata_value(&packed.resources, row.resource_id, "typed log resource")?,
+        scope: resolve_metadata_value(&packed.scopes, row.scope_id, "typed log scope")?,
+        severity_number: row.severity_number,
+        severity_text: resolve_optional_string(
+            &packed.strings,
+            row.severity_text_id,
+            "severity text",
+        )?,
+        dropped_attributes_count: row.dropped_attributes_count,
+        flags: row.flags,
+        trace_id,
+        span_id,
+        event_name: resolve_optional_string(&packed.strings, row.event_name_id, "event name")?,
+    })
+}
+
+fn has_structural_hex_field<R: StructuralRecordView, const N: usize>(
+    record: &R,
+    key: &str,
+    expected: &[u8; N],
+) -> bool {
+    (0..record.structural_field_count()).any(|index| {
+        record
+            .structural_field(index)
+            .is_some_and(|(field_key, value)| {
+                field_key == key && lower_hex_matches(value.as_bytes(), expected)
+            })
+    })
+}
+
+fn lower_hex_matches<const N: usize>(encoded: &[u8], expected: &[u8; N]) -> bool {
+    encoded.len() == N * 2
+        && expected
+            .iter()
+            .zip(encoded.chunks_exact(2))
+            .all(|(byte, pair)| {
+                pair[0] == lower_hex_digit(byte >> 4) && pair[1] == lower_hex_digit(byte & 0x0f)
+            })
+}
+
+const fn lower_hex_digit(value: u8) -> u8 {
+    match value {
+        0..=9 => b'0' + value,
+        _ => b'a' + value - 10,
+    }
+}
+
+fn resolve_trace_id_field(fields: &[MetadataField], key: &'static str) -> TelemetryResult<TraceId> {
+    let bytes = resolve_hex_field::<16>(fields, key)?;
+    TraceId::from_bytes(bytes)
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid typed log trace ID field"))
+}
+
+fn resolve_span_id_field(fields: &[MetadataField], key: &'static str) -> TelemetryResult<SpanId> {
+    let bytes = resolve_hex_field::<8>(fields, key)?;
+    SpanId::from_bytes(bytes)
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid typed log span ID field"))
+}
+
+fn resolve_hex_field<const N: usize>(
+    fields: &[MetadataField],
+    key: &'static str,
+) -> TelemetryResult<[u8; N]> {
+    for value in fields
         .iter()
-        .map(|ordinal| {
-            let index = usize::try_from(*ordinal).map_err(|_| {
-                TelemetryError::InvalidBlockEncoding("typed metadata ordinal overflow")
-            })?;
-            metadata
-                .get_mut(index)
-                .map(std::mem::take)
-                .ok_or(TelemetryError::InvalidBlockEncoding(
-                    "typed metadata ordinal out of range",
-                ))
-        })
-        .collect()
+        .filter(|field| field.key.as_ref() == key && field.value.len() == N * 2)
+    {
+        let mut decoded = [0; N];
+        let valid = decoded
+            .iter_mut()
+            .zip(value.value.as_bytes().chunks_exact(2))
+            .all(|(byte, pair)| {
+                let Some(high) = decode_lower_hex_digit(pair[0]) else {
+                    return false;
+                };
+                let Some(low) = decode_lower_hex_digit(pair[1]) else {
+                    return false;
+                };
+                *byte = high * 16 + low;
+                true
+            });
+        if valid {
+            return Ok(decoded);
+        }
+    }
+    Err(TelemetryError::InvalidBlockEncoding(
+        "missing or invalid typed log ID field",
+    ))
+}
+
+const fn decode_lower_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn resolve_metadata_value<T: Clone>(
+    values: &[T],
+    id: u32,
+    label: &'static str,
+) -> TelemetryResult<T> {
+    values
+        .get(usize::try_from(id).map_err(|_| TelemetryError::InvalidBlockEncoding(label))?)
+        .cloned()
+        .ok_or(TelemetryError::InvalidBlockEncoding(label))
+}
+
+fn resolve_optional_string(
+    strings: &[Arc<str>],
+    id: u32,
+    label: &'static str,
+) -> TelemetryResult<Arc<str>> {
+    if id == EMPTY_STRING_ID {
+        return Ok(Arc::from(""));
+    }
+    resolve_metadata_value(
+        strings,
+        id.checked_sub(STRING_DICTIONARY_ID_BASE)
+            .ok_or(TelemetryError::InvalidBlockEncoding(label))?,
+        label,
+    )
 }
 
 fn hash_field_id_pairs(pairs: &[(u32, u32)]) -> u64 {
@@ -3207,32 +3572,8 @@ mod tests {
         encode_timestamps(&records).expect("timestamps encode")
     }
 
-    fn encode_owned_typed_metadata(records: &[DurableLog]) -> Vec<u8> {
-        let metadata = records
-            .iter()
-            .map(|record| {
-                record
-                    .structural_log_metadata()
-                    .map(StructuralLogMetadata::from)
-            })
-            .collect::<Vec<_>>();
-        if metadata.iter().all(Option::is_none) {
-            return Vec::new();
-        }
-        let raw = rmp_serde::to_vec(&metadata).expect("owned metadata serializes");
-        let compressed = zstd::bulk::compress(&raw, 1).expect("owned metadata compresses");
-        let mut encoded = Vec::with_capacity(4 + compressed.len());
-        encoded.extend_from_slice(
-            &u32::try_from(raw.len())
-                .expect("test metadata length fits")
-                .to_le_bytes(),
-        );
-        encoded.extend_from_slice(&compressed);
-        encoded
-    }
-
     #[test]
-    fn borrowed_typed_metadata_encoding_is_byte_identical_to_owned_encoding() {
+    fn typed_metadata_dictionaries_round_trip_exact_values() {
         let mut typed = record(4, "typed body");
         typed.observed_timestamp_unix_nanos = 99;
         typed.body = Some(TelemetryValue::Map(Arc::new(vec![
@@ -3270,11 +3611,44 @@ mod tests {
         typed.span_id = Some(SpanId::from_bytes([2; 8]).expect("span ID is valid"));
         typed.event_name = Arc::from("payment.failed");
 
-        let records = vec![record(3, "plain body"), typed, record(5, "plain again")];
-        assert_eq!(
-            encode_typed_metadata(&records).expect("borrowed metadata encodes"),
-            encode_owned_typed_metadata(&records)
-        );
+        let mut repeated = typed.clone();
+        repeated.record_ref.offset = LogicalOffset::new(5);
+        repeated.timestamp_unix_nanos = u64::MAX - 4;
+        repeated.observed_timestamp_unix_nanos = 3;
+        repeated.message = Arc::from("message-backed body");
+        repeated.body = Some(TelemetryValue::String(Arc::clone(&repeated.message)));
+        let trace_id = repeated
+            .trace_id
+            .expect("trace ID is populated")
+            .to_string();
+        let span_id = repeated.span_id.expect("span ID is populated").to_string();
+        repeated = repeated
+            .with_field("otel.trace_id", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+            .with_field("otel.trace_id", trace_id)
+            .with_field("otel.span_id", span_id);
+        let records = vec![record(3, "plain body"), typed, repeated];
+        let encoded = encode_structural_block(&records).expect("typed block encodes");
+        let decoded = decode_structural_block(&encoded).expect("typed block decodes");
+        for (decoded, record) in decoded.iter().zip(&records) {
+            assert_eq!(
+                decoded.observed_timestamp_unix_nanos,
+                record.observed_timestamp_unix_nanos
+            );
+            assert_eq!(decoded.body, record.body);
+            assert_eq!(decoded.attributes, record.attributes);
+            assert_eq!(decoded.resource, record.resource);
+            assert_eq!(decoded.scope, record.scope);
+            assert_eq!(decoded.severity_number, record.severity_number);
+            assert_eq!(decoded.severity_text, record.severity_text);
+            assert_eq!(
+                decoded.dropped_attributes_count,
+                record.dropped_attributes_count
+            );
+            assert_eq!(decoded.flags, record.flags);
+            assert_eq!(decoded.trace_id, record.trace_id);
+            assert_eq!(decoded.span_id, record.span_id);
+            assert_eq!(decoded.event_name, record.event_name);
+        }
     }
 
     #[test]
