@@ -26,28 +26,13 @@ overwrite different adapter files. Build the resulting source with the normal
 ClickHouse release build process. The adapter source is included by
 ClickHouse's existing `Storages` source glob; no CMake patch is required.
 
-## Table definition
+## Relation definitions
 
-```sql
-CREATE TABLE logs
-(
-    tenant String,
-    timestamp DateTime64(9, 'UTC'),
-    partition UInt32,
-    offset UInt64,
-    message String,
-    labels Map(String, String),
-    metadata Map(String, String)
-)
-ENGINE = ShardTelemetry(
-    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan',
-    'ArrowStream',
-    headers(
-        'Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE',
-        'X-Scope-OrgID' = 'fake'
-    )
-);
-```
+`clickhouse/shard-telemetry-engine.sql` defines the complete v1 `logs`,
+`spans`, `span_events`, `span_links`, `metric_points`, and
+`metric_exemplars` external relations plus the derived `traces` view. Every
+relation uses the same authenticated endpoint and selects its schema with the
+fixed `relation` query parameter.
 
 Use loopback or mTLS and inject a short-lived token. ClickHouse stores engine
 arguments in table metadata, so a long-lived bearer credential in DDL is not a
@@ -61,13 +46,16 @@ The adapter automatically pushes:
 - `timestamp` `<`, `<=`, `=`, `>=`, and `>` bounds, normalized to the
   endpoint's inclusive-start/exclusive-end nanosecond range;
 - exact `labels['key'] = 'value'` constraints;
-- exact `metadata['key'] = 'value'` constraints; and
+- exact `metadata`, record-attribute, resource-attribute, and scope-attribute
+  string-map constraints;
+- exact `trace_id`, `span_id`, `series_id`, and signal-native `name`
+  constraints; and
 - a ClickHouse-classified trivial `LIMIT` only when an analyzed filter DAG is
   present and the complete filter is represented by the rules above.
 
 ClickHouse may rewrite constant String map lookup into dynamic inputs such as
 `labels.key_app`. The adapter parses that key with ClickHouse's own String text
-serialization and projects the parent `labels` or `metadata` map, so this
+serialization and projects the parent map, so this
 optimization remains exact for escaped keys as well as simple identifiers.
 
 Only top-level conjunctions are decomposed. Disjunctions, negation, message

@@ -450,6 +450,8 @@ impl PromqlEngine {
         self.store
             .query_metrics(&MetricQuery {
                 tenant: Arc::clone(&self.tenant),
+                partition: None,
+                start_offset: None,
                 series: None,
                 name: name.map(Arc::from),
                 exact_labels: Arc::new(exact_labels),

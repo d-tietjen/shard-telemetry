@@ -327,6 +327,13 @@ pub(crate) fn decode_indexed_ingest_records(
     frame: &IndexedIngestFrame,
     record_ordinals: &[u32],
 ) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
+    let structural = decompress_indexed_ingest_frame(frame)?;
+    decode_structural_records(&structural, record_ordinals)
+}
+
+pub(crate) fn decompress_indexed_ingest_frame(
+    frame: &IndexedIngestFrame,
+) -> TelemetryResult<Vec<u8>> {
     let structural = INGEST_DECOMPRESSOR.with_borrow_mut(|decompressor| {
         decompressor
             .decompress(&frame.compressed, frame.structural_bytes)
@@ -337,7 +344,7 @@ pub(crate) fn decode_indexed_ingest_records(
             "compressed ingest structural length mismatch",
         ));
     }
-    decode_structural_records(&structural, record_ordinals)
+    Ok(structural)
 }
 
 struct IngestGroup<'a> {

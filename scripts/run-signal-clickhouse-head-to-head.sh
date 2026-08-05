@@ -3,13 +3,21 @@ set -euo pipefail
 
 SHARD_TELEMETRY_REPOSITORY=${SHARD_TELEMETRY_REPOSITORY:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
 SHARD_TELEMETRY_BIN=${SHARD_TELEMETRY_BIN:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-signal-bench}
+SHARD_TELEMETRY_SERVER=${SHARD_TELEMETRY_SERVER:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-server}
 RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-signal-clickhouse-head-to-head}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 RECORDS=${RECORDS:-262144}
 LOOKUP_ITERATIONS=${LOOKUP_ITERATIONS:-2000}
 CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-sha256:770156c537ca9124046e138a3b5845c64ea58ce8722de7a2e05fd827f4976520}
+TENANT=${TENANT:-production-example}
+SHARD_HTTP_ADDRESS=${SHARD_HTTP_ADDRESS:-0.0.0.0:32200}
+SHARD_NATIVE_ADDRESS=${SHARD_NATIVE_ADDRESS:-127.0.0.1:32201}
+SHARD_OTLP_GRPC_ADDRESS=${SHARD_OTLP_GRPC_ADDRESS:-127.0.0.1:34417}
+SHARD_OTLP_HTTP_ADDRESS=${SHARD_OTLP_HTTP_ADDRESS:-127.0.0.1:34418}
+SHARD_HTTP_PORT=${SHARD_HTTP_ADDRESS##*:}
+CLICKHOUSE_TOKEN=${CLICKHOUSE_TOKEN:-shard-telemetry-signal-head-to-head-token}
 
-for command in awk cmp docker lscpu sha256sum stat taskset; do
+for command in awk cmp curl docker lscpu sha256sum stat taskset; do
     command -v "$command" >/dev/null || {
         echo "missing required command: $command" >&2
         exit 2
@@ -17,6 +25,10 @@ for command in awk cmp docker lscpu sha256sum stat taskset; do
 done
 [[ -x $SHARD_TELEMETRY_BIN ]] || {
     echo "ShardTelemetry benchmark binary is not executable: $SHARD_TELEMETRY_BIN" >&2
+    exit 2
+}
+[[ -x $SHARD_TELEMETRY_SERVER ]] || {
+    echo "ShardTelemetry server binary is not executable: $SHARD_TELEMETRY_SERVER" >&2
     exit 2
 }
 
@@ -59,6 +71,8 @@ echo "ShardTelemetry: generating equal-input corpus and running on CPU $CPU"
     --iterations "$LOOKUP_ITERATIONS" \
     --clickhouse-dir "$CORPUS_DIR" \
     --durable-output-dir "$RUN_DIR/shard-telemetry-storage" \
+    --server-data-directory "$RUN_DIR/shard-data" \
+    --server-shards 1 \
     >"$RUN_DIR/shard-telemetry-signal.txt"
 cat "$RUN_DIR/shard-telemetry-signal.txt"
 
@@ -73,6 +87,7 @@ METRIC_SOURCE_BYTES=$(manifest_value metric_source_bytes)
 TRACE_ID_HEX=$(manifest_value trace_id_hex)
 TRACE_LOOKUP_ROWS=$(manifest_value trace_lookup_rows)
 SERIES_ID=$(manifest_value series_id)
+SERIES_ID_HEX=$(manifest_value series_id_hex)
 METRIC_LOOKUP_ROWS=$(manifest_value metric_lookup_rows)
 RESOURCE_ID=$(manifest_value resource_id)
 SERVICE_NAME=$(manifest_value service_name)
@@ -89,11 +104,17 @@ sha256sum "$CORPUS_DIR"/* >"$RUN_DIR/corpus-sha256.txt"
     echo "product_status=$(git -C "$SHARD_TELEMETRY_REPOSITORY" status --porcelain | wc -l) modified entries"
     echo "binary=$SHARD_TELEMETRY_BIN"
     echo "binary_sha256=$(sha256sum "$SHARD_TELEMETRY_BIN" | awk '{ print $1 }')"
+    echo "server_binary=$SHARD_TELEMETRY_SERVER"
+    echo "server_binary_sha256=$(sha256sum "$SHARD_TELEMETRY_SERVER" | awk '{ print $1 }')"
+    echo "server_data_bytes=$(du -sb "$RUN_DIR/shard-data" | awk '{ print $1 }')"
     echo "clickhouse_image=$CLICKHOUSE_IMAGE"
     echo "clickhouse_image_id=$IMAGE_ID"
     echo "kernel=$(uname -srmo)"
     lscpu
 } >"$RUN_DIR/provenance.txt"
+
+printf '%s\n' "$CLICKHOUSE_TOKEN" >"$RUN_DIR/clickhouse-token"
+chmod 0600 "$RUN_DIR/clickhouse-token"
 
 CH_DATA=$RUN_DIR/clickhouse-data
 CH_LOGS=$RUN_DIR/clickhouse-logs
@@ -101,12 +122,14 @@ mkdir -p "$CH_DATA" "$CH_LOGS"
 echo "ClickHouse: starting isolated one-core container"
 docker run --detach \
     --name "$CH_CONTAINER" \
-    --network none \
     --cpuset-cpus "$CPU" \
+    --publish "127.0.0.1:$SHARD_HTTP_PORT:$SHARD_HTTP_PORT" \
     --ulimit nofile=262144:262144 \
     --env CLICKHOUSE_SKIP_USER_SETUP=1 \
     --volume "$CH_DATA:/var/lib/clickhouse" \
     --volume "$CH_LOGS:/var/log/clickhouse-server" \
+    --volume "$RUN_DIR:/benchmark-results" \
+    --volume "$SHARD_TELEMETRY_SERVER:/benchmark/shard-telemetry-server:ro" \
     "$CLICKHOUSE_IMAGE" >"$RUN_DIR/clickhouse-container-id.txt"
 CH_STARTED=1
 
@@ -118,6 +141,31 @@ for _ in $(seq 1 120); do
 done
 docker exec "$CH_CONTAINER" clickhouse-client --query 'SELECT version()' \
     >"$RUN_DIR/clickhouse-version.txt"
+
+echo "ShardTelemetry: restarting the durable store inside the pinned CPU namespace"
+docker exec --detach --user "$(id -u):$(id -g)" "$CH_CONTAINER" /bin/bash -c \
+    "exec /benchmark/shard-telemetry-server \
+        --insecure-development-mode \
+        --listen 0.0.0.0:$SHARD_HTTP_PORT \
+        --native-listen 0.0.0.0:${SHARD_NATIVE_ADDRESS##*:} \
+        --otlp-grpc-listen 0.0.0.0:${SHARD_OTLP_GRPC_ADDRESS##*:} \
+        --otlp-http-listen 0.0.0.0:${SHARD_OTLP_HTTP_ADDRESS##*:} \
+        --default-tenant '$TENANT' \
+        --data-directory /benchmark-results/shard-data \
+        --recovery-journal \
+        --shards 1 \
+        --tenant-partitions 256 \
+        --append-linger-micros 0 \
+        --clickhouse-token-file /benchmark-results/clickhouse-token \
+        >/benchmark-results/shard-server.log 2>&1"
+for _ in $(seq 1 120); do
+    if curl --fail --silent "http://127.0.0.1:$SHARD_HTTP_PORT/ready" >"$RUN_DIR/shard-ready.txt"; then
+        break
+    fi
+    sleep 0.25
+done
+curl --fail --silent "http://127.0.0.1:$SHARD_HTTP_PORT/ready" >/dev/null
+curl --fail --silent "http://127.0.0.1:$SHARD_HTTP_PORT/metrics" >"$RUN_DIR/shard-metrics.txt"
 
 docker exec "$CH_CONTAINER" clickhouse-client --multiquery --query "
 CREATE DATABASE benchmark;
@@ -175,6 +223,39 @@ ENGINE = MergeTree
 ORDER BY (tenant, series_id, timestamp_ns, durable_offset)
 SETTINGS index_granularity = 8192, min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0,
          fsync_after_insert = 1;
+
+CREATE TABLE benchmark.shard_trace_lookup
+(
+    timestamp DateTime64(9, 'UTC'),
+    name Nullable(String)
+)
+ENGINE = URL(
+    'http://127.0.0.1:$SHARD_HTTP_PORT/shardtelemetry/api/v1/clickhouse/scan?relation=spans&columns=timestamp%2Cname&trace_id=$TRACE_ID_HEX&limit=32',
+    ArrowStream,
+    headers('Authorization' = 'Bearer $CLICKHOUSE_TOKEN', 'X-Scope-OrgID' = '$TENANT')
+);
+
+CREATE TABLE benchmark.shard_metric_lookup
+(
+    timestamp DateTime64(9, 'UTC'),
+    scalar_double_bits Nullable(UInt64)
+)
+ENGINE = URL(
+    'http://127.0.0.1:$SHARD_HTTP_PORT/shardtelemetry/api/v1/clickhouse/scan?relation=metric_points&columns=timestamp%2Cscalar_double_bits&series_id=$SERIES_ID_HEX&limit=3000',
+    ArrowStream,
+    headers('Authorization' = 'Bearer $CLICKHOUSE_TOKEN', 'X-Scope-OrgID' = '$TENANT')
+);
+
+CREATE TABLE benchmark.shard_resource_lookup
+(
+    timestamp DateTime64(9, 'UTC'),
+    name Nullable(String)
+)
+ENGINE = URL(
+    'http://127.0.0.1:$SHARD_HTTP_PORT/shardtelemetry/api/v1/clickhouse/scan?relation=spans&columns=timestamp%2Cname&resource.service.name=$SERVICE_NAME&limit=1000',
+    ArrowStream,
+    headers('Authorization' = 'Bearer $CLICKHOUSE_TOKEN', 'X-Scope-OrgID' = '$TENANT')
+);
 "
 
 echo "ClickHouse: ingesting traces on CPU $CPU"
@@ -204,13 +285,13 @@ FORMAT TSVWithNames
 
 docker exec "$CH_CONTAINER" clickhouse-client --query "
 SELECT raw FROM benchmark.traces
-WHERE tenant = 'production-example' AND trace_id = unhex('$TRACE_ID_HEX')
+WHERE tenant = '$TENANT' AND trace_id = unhex('$TRACE_ID_HEX')
 ORDER BY start_ns, span_id
 FORMAT RowBinary
 " >"$RUN_DIR/trace-lookup-actual.rowbinary"
 docker exec "$CH_CONTAINER" clickhouse-client --query "
 SELECT raw FROM benchmark.metrics
-WHERE tenant = 'production-example' AND series_id = toUInt128('$SERIES_ID')
+WHERE tenant = '$TENANT' AND series_id = toUInt128('$SERIES_ID')
 ORDER BY timestamp_ns, durable_offset
 FORMAT RowBinary
 " >"$RUN_DIR/metric-lookup-actual.rowbinary"
@@ -219,10 +300,10 @@ cmp "$CORPUS_DIR/metric-lookup-expected.rowbinary" "$RUN_DIR/metric-lookup-actua
 
 TRACE_ROWS=$(docker exec "$CH_CONTAINER" clickhouse-client --query "
 SELECT count() FROM benchmark.traces
-WHERE tenant = 'production-example' AND trace_id = unhex('$TRACE_ID_HEX')")
+WHERE tenant = '$TENANT' AND trace_id = unhex('$TRACE_ID_HEX')")
 METRIC_ROWS=$(docker exec "$CH_CONTAINER" clickhouse-client --query "
 SELECT count() FROM benchmark.metrics
-WHERE tenant = 'production-example' AND series_id = toUInt128('$SERIES_ID')")
+WHERE tenant = '$TENANT' AND series_id = toUInt128('$SERIES_ID')")
 [[ $TRACE_ROWS -eq $TRACE_LOOKUP_ROWS ]] || {
     echo "trace lookup row mismatch: got $TRACE_ROWS, expected $TRACE_LOOKUP_ROWS" >&2
     exit 1
@@ -232,8 +313,8 @@ WHERE tenant = 'production-example' AND series_id = toUInt128('$SERIES_ID')")
     exit 1
 }
 
-TRACE_QUERY="SELECT raw FROM benchmark.traces WHERE tenant = 'production-example' AND trace_id = unhex('$TRACE_ID_HEX') LIMIT 32 FORMAT Null"
-METRIC_QUERY="SELECT raw FROM benchmark.metrics WHERE tenant = 'production-example' AND series_id = toUInt128('$SERIES_ID') LIMIT 100 FORMAT Null"
+TRACE_QUERY="SELECT raw FROM benchmark.traces WHERE tenant = '$TENANT' AND trace_id = unhex('$TRACE_ID_HEX') LIMIT 32 FORMAT Null"
+METRIC_QUERY="SELECT raw FROM benchmark.metrics WHERE tenant = '$TENANT' AND series_id = toUInt128('$SERIES_ID') LIMIT 100 FORMAT Null"
 CORRELATION_QUERY="SELECT raw FROM benchmark.traces WHERE resource_id = toUInt128('$RESOURCE_ID') AND service_name = '$SERVICE_NAME' LIMIT 1000 FORMAT Null"
 docker exec "$CH_CONTAINER" clickhouse-benchmark --concurrency 1 \
     --iterations "$LOOKUP_ITERATIONS" --query "$TRACE_QUERY" \
@@ -244,6 +325,47 @@ docker exec "$CH_CONTAINER" clickhouse-benchmark --concurrency 1 \
 docker exec "$CH_CONTAINER" clickhouse-benchmark --concurrency 1 \
     --iterations "$LOOKUP_ITERATIONS" --query "$CORRELATION_QUERY" \
     >"$RUN_DIR/clickhouse-correlation-lookup.txt" 2>&1
+
+run_server_pair() {
+    local name=$1
+    local shard_query=$2
+    local clickhouse_query=$3
+    echo "Server-facing query: $name"
+    docker exec "$CH_CONTAINER" clickhouse-client \
+        --query "$shard_query FORMAT TabSeparatedRaw" \
+        >"$RUN_DIR/shard-server-$name-results.tsv"
+    docker exec "$CH_CONTAINER" clickhouse-client \
+        --query "$clickhouse_query FORMAT TabSeparatedRaw" \
+        >"$RUN_DIR/clickhouse-server-$name-results.tsv"
+    cmp "$RUN_DIR/shard-server-$name-results.tsv" "$RUN_DIR/clickhouse-server-$name-results.tsv"
+    sha256sum \
+        "$RUN_DIR/shard-server-$name-results.tsv" \
+        "$RUN_DIR/clickhouse-server-$name-results.tsv" \
+        >"$RUN_DIR/server-$name-result-sha256.txt"
+
+    docker exec "$CH_CONTAINER" clickhouse-client \
+        --query "$shard_query SETTINGS use_query_cache=0 FORMAT Null" >/dev/null
+    docker exec "$CH_CONTAINER" clickhouse-benchmark --concurrency 1 \
+        --iterations "$LOOKUP_ITERATIONS" \
+        --query "$shard_query SETTINGS use_query_cache=0 FORMAT Null" \
+        >"$RUN_DIR/shard-server-$name-warm.txt" 2>&1
+    docker exec "$CH_CONTAINER" clickhouse-client \
+        --query "$clickhouse_query SETTINGS use_query_cache=0 FORMAT Null" >/dev/null
+    docker exec "$CH_CONTAINER" clickhouse-benchmark --concurrency 1 \
+        --iterations "$LOOKUP_ITERATIONS" \
+        --query "$clickhouse_query SETTINGS use_query_cache=0 FORMAT Null" \
+        >"$RUN_DIR/clickhouse-server-$name-warm.txt" 2>&1
+}
+
+run_server_pair trace \
+    "SELECT toUnixTimestamp64Nano(timestamp), assumeNotNull(name) FROM benchmark.shard_trace_lookup ORDER BY timestamp, name" \
+    "SELECT start_ns, name FROM benchmark.traces WHERE tenant = '$TENANT' AND trace_id = unhex('$TRACE_ID_HEX') ORDER BY start_ns, name"
+run_server_pair metric \
+    "SELECT toUnixTimestamp64Nano(timestamp), assumeNotNull(scalar_double_bits) FROM benchmark.shard_metric_lookup ORDER BY timestamp, scalar_double_bits" \
+    "SELECT timestamp_ns, reinterpretAsUInt64(value) FROM benchmark.metrics WHERE tenant = '$TENANT' AND series_id = toUInt128('$SERIES_ID') ORDER BY timestamp_ns, reinterpretAsUInt64(value)"
+run_server_pair resource \
+    "SELECT toUnixTimestamp64Nano(timestamp), assumeNotNull(name) FROM benchmark.shard_resource_lookup ORDER BY timestamp, name" \
+    "SELECT start_ns, name FROM benchmark.traces WHERE tenant = '$TENANT' AND service_name = '$SERVICE_NAME' ORDER BY start_ns, name LIMIT 1000"
 
 field_from_signal() {
     local signal=$1

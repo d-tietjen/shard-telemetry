@@ -19,7 +19,7 @@ use crate::ingest_pack::validate_ingest_pack;
 use crate::metric::metric_query_matches;
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
 use crate::tier::CachedObjectRange;
-use crate::trace::trace_query_matches;
+use crate::trace::decode_trace_block_matching;
 use crate::{
     CorrelationConfig, CorrelationIndex, CorrelationQuery, DictionaryCatalog, DurableMetricPoint,
     DurableSpan, LogMatch, LogPredicate, LogQuery, LogStripe, MetricApplyOutcome,
@@ -620,6 +620,11 @@ enum SinkCommand {
         queries: Vec<LogQuery>,
         response: SyncSender<TelemetryResult<Vec<LogMatch>>>,
     },
+    CountLogs {
+        tenant: Arc<str>,
+        partitions: Vec<TopicPartition>,
+        response: SyncSender<TelemetryResult<u64>>,
+    },
     QueryTraces {
         query: TraceQuery,
         response: SyncSender<TelemetryResult<Vec<DurableSpan>>>,
@@ -742,6 +747,13 @@ fn run_sink_worker(
                 let result = stripe.logs.query_partitions_checked(&queries);
                 let _ = response.send(result);
             }
+            SinkCommand::CountLogs {
+                tenant,
+                partitions,
+                response,
+            } => {
+                let _ = response.send(stripe.logs.count_tenant_records(&tenant, &partitions));
+            }
             SinkCommand::QueryTraces { query, response } => {
                 let _ = response.send(query_trace_stripe(&stripe, &query));
             }
@@ -821,13 +833,17 @@ impl TelemetryService {
                 ))
             })??);
         }
-        spans.sort_unstable_by_key(|span| {
-            (
-                span.trace_id,
-                span.start_time_unix_nanos,
-                span.record_ref.offset,
-            )
-        });
+        if query.partition.is_some() {
+            spans.sort_unstable_by_key(|span| span.record_ref.offset);
+        } else {
+            spans.sort_unstable_by_key(|span| {
+                (
+                    span.trace_id,
+                    span.start_time_unix_nanos,
+                    span.record_ref.offset,
+                )
+            });
+        }
         spans.truncate(query.limit.max(1));
         Ok(spans)
     }
@@ -858,7 +874,13 @@ impl TelemetryService {
                 ))
             })??);
         }
-        points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
+        if query.partition.is_some() {
+            points.sort_unstable_by_key(|point| point.record_ref.offset);
+        } else {
+            points.sort_unstable_by_key(|point| {
+                (point.timestamp_unix_nanos, point.record_ref.offset)
+            });
+        }
         points.truncate(query.limit.max(1));
         Ok(points)
     }
@@ -1020,6 +1042,44 @@ impl TelemetryService {
         }
         Ok(matches)
     }
+
+    /// Counts exact tenant-bound log appends across every owner stripe without
+    /// materializing compressed payloads.
+    pub(crate) fn count_log_records(
+        &self,
+        tenant: Arc<str>,
+        partitions: Vec<TopicPartition>,
+    ) -> TelemetryResult<u64> {
+        let workers = self.worker_senders()?;
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::CountLogs {
+                    tenant: Arc::clone(&tenant),
+                    partitions: partitions.clone(),
+                    response,
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a log count"
+                    ))
+                })?;
+            responses.push((shard_id, receiver));
+        }
+        responses
+            .into_iter()
+            .try_fold(0_u64, |total, (shard_id, receiver)| {
+                let count = receiver.recv().map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped while counting logs"
+                    ))
+                })??;
+                total
+                    .checked_add(count)
+                    .ok_or(TelemetryError::RecordTooLarge)
+            })
+    }
 }
 
 fn apply_durable_appends(
@@ -1139,11 +1199,11 @@ fn index_payload(
         TelemetrySignal::Logs => {
             validate_ingest_pack(&envelope.payload, envelope.item_count)?;
             stripe.logs.apply_checkpointed_ingest_pack(
+                Arc::clone(&envelope.tenant),
                 topic_partition,
                 first_offset,
                 envelope.item_count,
                 Bytes::copy_from_slice(&envelope.payload),
-                None,
                 checkpoints,
             )?;
         }
@@ -1487,18 +1547,24 @@ fn query_trace_stripe(
     stripe: &TelemetryStripeState,
     query: &TraceQuery,
 ) -> TelemetryResult<Vec<DurableSpan>> {
+    let mut storage_query = query.clone();
+    storage_query.start_offset = None;
     let mut winners = BTreeMap::new();
-    for span in stripe.traces.query(query)? {
+    for span in stripe.traces.query(&storage_query)? {
         winners.insert(
             (Arc::clone(&span.tenant), span.trace_id, span.span_id),
             span,
         );
     }
     if let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Traces) {
-        let partitions = query.trace_id.map_or_else(
-            || state.tiers.keys().copied().collect::<Vec<_>>(),
-            |trace_id| vec![stripe.router.trace(&query.tenant, trace_id)],
-        );
+        let partitions = if let Some(partition) = query.partition {
+            vec![partition]
+        } else {
+            query.trace_id.map_or_else(
+                || state.tiers.keys().copied().collect::<Vec<_>>(),
+                |trace_id| vec![stripe.router.trace(&query.tenant, trace_id)],
+            )
+        };
         let identity = query
             .trace_id
             .map(|trace_id| u128::from_be_bytes(*trace_id.as_bytes()));
@@ -1513,10 +1579,7 @@ fn query_trace_stripe(
             },
             None,
         )? {
-            for span in decode_trace_block(payload.as_ref())?
-                .into_iter()
-                .filter(|span| trace_query_matches(query, span))
-            {
+            for span in decode_trace_block_matching(payload.as_ref(), &storage_query)? {
                 let key = (Arc::clone(&span.tenant), span.trace_id, span.span_id);
                 if winners.get(&key).is_none_or(|existing: &DurableSpan| {
                     existing.record_ref.offset < span.record_ref.offset
@@ -1526,14 +1589,25 @@ fn query_trace_stripe(
             }
         }
     }
-    let mut spans = winners.into_values().collect::<Vec<_>>();
-    spans.sort_unstable_by_key(|span| {
-        (
-            span.trace_id,
-            span.start_time_unix_nanos,
-            span.record_ref.offset,
-        )
-    });
+    let mut spans = winners
+        .into_values()
+        .filter(|span| {
+            query
+                .start_offset
+                .is_none_or(|offset| span.record_ref.offset >= offset)
+        })
+        .collect::<Vec<_>>();
+    if query.partition.is_some() {
+        spans.sort_unstable_by_key(|span| span.record_ref.offset);
+    } else {
+        spans.sort_unstable_by_key(|span| {
+            (
+                span.trace_id,
+                span.start_time_unix_nanos,
+                span.record_ref.offset,
+            )
+        });
+    }
     spans.truncate(query.limit.max(1));
     Ok(spans)
 }
@@ -1542,18 +1616,24 @@ fn query_metric_stripe(
     stripe: &TelemetryStripeState,
     query: &MetricQuery,
 ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+    let mut storage_query = query.clone();
+    storage_query.start_offset = None;
     let mut winners = BTreeMap::new();
-    for point in stripe.metrics.query(query)? {
+    for point in stripe.metrics.query(&storage_query)? {
         winners.insert(
             (point.series_fingerprint(), point.timestamp_unix_nanos),
             point,
         );
     }
     if let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Metrics) {
-        let partitions = query.series.map_or_else(
-            || state.tiers.keys().copied().collect::<Vec<_>>(),
-            |series| vec![stripe.router.metric(&query.tenant, series)],
-        );
+        let partitions = if let Some(partition) = query.partition {
+            vec![partition]
+        } else {
+            query.series.map_or_else(
+                || state.tiers.keys().copied().collect::<Vec<_>>(),
+                |series| vec![stripe.router.metric(&query.tenant, series)],
+            )
+        };
         for payload in read_signal_tier_payloads(
             state,
             &partitions,
@@ -1567,7 +1647,7 @@ fn query_metric_stripe(
         )? {
             for point in decode_metric_chunk(payload.as_ref())?
                 .into_iter()
-                .filter(|point| metric_query_matches(query, point))
+                .filter(|point| metric_query_matches(&storage_query, point))
             {
                 let key = (point.series_fingerprint(), point.timestamp_unix_nanos);
                 if winners
@@ -1581,8 +1661,19 @@ fn query_metric_stripe(
             }
         }
     }
-    let mut points = winners.into_values().collect::<Vec<_>>();
-    points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
+    let mut points = winners
+        .into_values()
+        .filter(|point| {
+            query
+                .start_offset
+                .is_none_or(|offset| point.record_ref.offset >= offset)
+        })
+        .collect::<Vec<_>>();
+    if query.partition.is_some() {
+        points.sort_unstable_by_key(|point| point.record_ref.offset);
+    } else {
+        points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
+    }
     points.truncate(query.limit.max(1));
     Ok(points)
 }

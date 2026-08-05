@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::deletion::DeleteCatalog;
-use crate::{AnalyticsLogRow, AnalyticsScanRequest, DeleteRequest};
+use crate::{AnalyticsRow, AnalyticsScanRequest, DeleteRequest};
 use crate::{ProductionRuntime, ServiceState};
 
 const DEFAULT_TENANT: &str = "fake";
@@ -122,9 +122,22 @@ pub trait LokiStore: Send + Sync + std::fmt::Debug {
     fn scan_analytics(
         &self,
         request: &AnalyticsScanRequest,
-        emit: &mut dyn FnMut(&[AnalyticsLogRow]) -> Result<(), LokiApiError>,
+        emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
     ) -> Result<(), LokiApiError> {
         crate::analytics::scan_entries(self.entries(&request.tenant)?, request, emit)
+    }
+
+    /// Emits exact row counts for analytical scans that do not materialize a
+    /// physical column. Durable stores may answer this from append metadata;
+    /// reference stores retain exact behavior through the ordinary scan.
+    fn scan_analytics_cardinality(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(u64) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        self.scan_analytics(request, &mut |rows| {
+            emit(u64::try_from(rows.len()).unwrap_or(u64::MAX))
+        })
     }
 
     /// Returns a bounded health snapshot without scanning stored records.
@@ -5211,6 +5224,7 @@ mod tests {
             authorized.headers()[header::CONTENT_TYPE],
             "application/vnd.apache.arrow.stream"
         );
+        assert_eq!(authorized.headers()["x-shardtelemetry-relation"], "logs");
         let body = to_bytes(authorized.into_body(), usize::MAX)
             .await
             .expect("Arrow body");
@@ -5218,9 +5232,14 @@ mod tests {
             StreamReader::try_new(Cursor::new(body.to_vec()), None).expect("Arrow stream");
         let batch = reader.next().expect("one batch").expect("valid batch");
         assert_eq!(batch.num_rows(), 1);
+        let timestamp_index = batch
+            .schema()
+            .index_of("timestamp")
+            .expect("timestamp column");
+        let message_index = batch.schema().index_of("message").expect("message column");
         assert_eq!(
             batch
-                .column(1)
+                .column(timestamp_index)
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .expect("timestamp")
@@ -5229,7 +5248,7 @@ mod tests {
         );
         assert_eq!(
             batch
-                .column(4)
+                .column(message_index)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("message")

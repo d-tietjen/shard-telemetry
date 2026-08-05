@@ -29,6 +29,7 @@ pub(crate) struct TierIngestFrameSource {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TierIngestAppendSource {
+    pub(crate) tenant: String,
     pub(crate) first_offset: LogicalOffset,
     pub(crate) last_offset: LogicalOffset,
     pub(crate) record_count: u32,
@@ -51,6 +52,7 @@ pub(crate) struct DecodedTierIngestFrame {
 
 #[derive(Debug)]
 pub(crate) struct DecodedTierIngestAppend {
+    pub(crate) tenant: String,
     pub(crate) first_offset: LogicalOffset,
     pub(crate) last_offset: LogicalOffset,
     pub(crate) record_count: u32,
@@ -79,11 +81,15 @@ pub(crate) fn write_tier_ingest_group(
     let mut payload_offset = 0u64;
     let mut previous_frame_id = None;
     for append in appends {
-        if append.first_offset > append.last_offset || append.record_count == 0 {
+        if append.tenant.is_empty()
+            || append.first_offset > append.last_offset
+            || append.record_count == 0
+        {
             return Err(TelemetryError::CorruptTier(
                 "ingest tier append bounds are invalid".into(),
             ));
         }
+        append_bytes(&mut raw_index, append.tenant.as_bytes())?;
         append_u64(&mut raw_index, append.first_offset.get());
         append_u64(&mut raw_index, append.last_offset.get());
         append_u32(&mut raw_index, append.record_count);
@@ -214,11 +220,14 @@ pub(crate) fn decode_tier_ingest_group(
     let mut appends = Vec::with_capacity(append_count);
     let mut block_index = 0usize;
     for _ in 0..append_count {
+        let tenant = String::from_utf8(read_bytes(&raw, &mut cursor)?.to_vec()).map_err(|_| {
+            TelemetryError::CorruptTier("ingest query-index tenant is not UTF-8".into())
+        })?;
         let first_offset = LogicalOffset::new(read_u64(&raw, &mut cursor)?);
         let last_offset = LogicalOffset::new(read_u64(&raw, &mut cursor)?);
         let record_count = read_u32(&raw, &mut cursor)?;
         let frame_count = read_u32(&raw, &mut cursor)? as usize;
-        if first_offset > last_offset || record_count == 0 {
+        if tenant.is_empty() || first_offset > last_offset || record_count == 0 {
             return Err(TelemetryError::CorruptTier(
                 "ingest query-index append metadata is invalid".into(),
             ));
@@ -280,6 +289,7 @@ pub(crate) fn decode_tier_ingest_group(
             ));
         }
         appends.push(DecodedTierIngestAppend {
+            tenant,
             first_offset,
             last_offset,
             record_count,

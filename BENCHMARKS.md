@@ -1,5 +1,141 @@
 # Compression benchmark results
 
+## Current release-candidate evidence — 2026-08-04
+
+The current evidence root on Adam is:
+
+```text
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-adapter-20260804-v1
+```
+
+These are sequential native-Linux performance runs with pinned binaries,
+corpus hashes, CPU affinity, exact-result checksums, and retained failed
+attempts. They are not deterministic-simulation replay claims.
+
+The custom ClickHouse query node was built from exact tag
+`v26.3.17.56-lts`, commit
+`c57540de480d8a501b601163471d3843674378cf`, using the official pinned
+builder. Its automatic `StorageShardTelemetry` path passes 30/30 exact-result
+cases: 18 log cases, nine signal-relation cases, and three cross-signal joins.
+
+### Authoritative full 80 GiB log head-to-head
+
+`benchmark-80g-final-attempt3` consumed the complete immutable corpus on
+2026-08-05 UTC. Both engines received exactly 85,899,345,920 source bytes and
+produced 607,363,459 rows after independently rejecting the same eight
+malformed JSON lines. They ran sequentially on physical CPUs 0–15 after the
+same prewarm. ClickHouse ingestion used newline-safe `LineAsString`,
+`isValidJSON`, and one tuple `JSONExtract`; this avoids allowing one malformed
+brace to unbalance ClickHouse's parallel `JSONEachRow` segmenter. Nanosecond
+timestamps were parsed explicitly at `DateTime64(9, 'UTC')` precision.
+
+| Engine | Stored bytes | Ratio | Ingest | Relative result |
+| --- | ---: | ---: | ---: | --- |
+| **ShardTelemetry** | **2,702,973,946** | **31.78x** | 148.60 MiB/s | 2.25x smaller |
+| ClickHouse MergeTree | 6,091,870,726 | 14.10x | **234.80 MiB/s** | 1.58x faster ingest |
+
+ShardTelemetry used 55.63% fewer durable bytes. Its directory measurement
+includes the complete durable store; ClickHouse's comparison measurement is
+`bytes_on_disk` across all active table parts and therefore includes its text
+index. ClickHouse reported 1,172,206,269 compressed column bytes, but total
+active-part storage was 6,091,870,726 bytes once indexes, marks, checksums, and
+part metadata were included. The ShardTelemetry retained-payload metric was
+2,700,065,308 bytes; its total directory was 2,702,973,946 bytes.
+
+Twenty warm, single-client iterations were run through the same pinned
+ClickHouse query process after one unmeasured warmup. Every 100-row ordered
+result was byte-identical between the automatic ShardTelemetry adapter and the
+native MergeTree table.
+
+| Query | ShardTelemetry p50 / p99 | ClickHouse p50 / p99 | Winner at p50 |
+| --- | ---: | ---: | ---: |
+| Latest 100 records | **70 / 82 ms** | 767 / 807 ms | ShardTelemetry, 10.96x |
+| Exact `docker_stream=stderr` | 69 / 76 ms | **6 / 6 ms** | ClickHouse, 11.50x |
+| Case-insensitive token `cannot` | **100 / 123 ms** | 1,715 / 1,833 ms | ShardTelemetry, 17.15x |
+
+The exact-stream loss is the clearest remaining query-index priority:
+ClickHouse's `(stream, time)` ordering makes that top-k lookup nearly direct,
+while the current adapter still pays metadata-posting and merge overhead.
+ShardTelemetry's timestamp directory and compressed-domain term index win the
+latest and token cases. The full live ingestion path remains far below the
+separate 1 GiB/s-per-core objective; that objective is not claimed here.
+
+Retained evidence:
+
+```text
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-adapter-20260804-v1/benchmark-80g-final-attempt3
+```
+
+### Real-log controlled 1 GiB run
+
+`benchmark-1g-attempt13` consumed exactly 1,073,741,933 accepted source bytes
+and 7,592,023 valid Docker JSON log records from the immutable 80 GiB corpus.
+Both engines used CPUs 0–15 sequentially and returned byte-identical results
+for latest, stream-filtered, and case-insensitive token queries.
+
+| Engine | Stored bytes | Ratio | Ingest | Relative result |
+| --- | ---: | ---: | ---: | --- |
+| **ShardTelemetry** | **33,958,025** | **31.62x** | **123.20 MiB/s** | 2.25x smaller, 1.78x faster |
+| ClickHouse MergeTree | 76,288,534 | 14.07x | 69.14 MiB/s | baseline |
+
+The direct ShardTelemetry HTTP p50 values were approximately 25 ms for latest
+and stream lookups and 38 ms for a case-insensitive token lookup. Through the
+ClickHouse adapter/query node, ShardTelemetry p50 values were 51, 49, and
+74 ms respectively versus ClickHouse MergeTree's 16, 4, and 32 ms. The live
+protocol path therefore does **not** yet satisfy the 1 GiB/s-per-core target;
+123.20 MiB/s is the measured aggregate result for this run.
+
+### Traces and metrics, one core
+
+`signals-server-1core-attempt4` used 262,144 deterministic correlated records
+per signal on CPU 0. The same trace and metric rows were inserted into an
+isolated ClickHouse 26.5.1.882 container pinned by image digest. The per-signal
+rows below measure the signal-native durable payload and auxiliary bytes; the
+complete restarted ShardTelemetry server directory was 6,612,008 bytes for
+both signals, versus 9,636,264 bytes across the two ClickHouse table parts.
+
+| Signal | Engine | Canonical bytes | Stored bytes | Ratio | Encode |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Traces | **ShardTelemetry** | 107,609,736 | **902,077** | **119.29x** | **263.29 MiB/s** |
+| Traces | ClickHouse | 107,609,736 | 5,753,460 | 18.70x | 105.80 MiB/s |
+| Metrics | **ShardTelemetry** | 126,451,328 | **1,966,452** | **64.30x** | **591.01 MiB/s** |
+| Metrics | ClickHouse | 126,451,328 | 3,882,804 | 32.57x | 108.64 MiB/s |
+
+Server-facing queries were executed through the same pinned ClickHouse client
+and evaluator process. Exact trace lookup returned eight rows at 2/6 ms
+ShardTelemetry p50/p99 versus 3/7 ms for MergeTree. Exact metric-series lookup
+returned 2,048 rows at 77/121 ms versus 3/3 ms. A 1,000-row resource-attribute
+scan took 828/1,118 ms versus 4/11 ms. Every result file was byte-identical.
+This isolates the current query priority: direct identities are competitive,
+while broad trace metadata requires a persisted record-level posting/top-k
+index rather than block Bloom filters alone.
+
+### Current cold-tier microbenchmark
+
+`cold-tier-1core-attempt1` used one 64 MiB local immutable object, 64 adjacent
+64 KiB ranges, a 4 MiB verified cache chunk, and 100 one-core iterations.
+
+| Path | Result |
+| --- | ---: |
+| Batched first cold read | 18,958.367 us |
+| Batched warm query | **1.760 us** |
+| Independent warm query | 6,888.821 us |
+| Parsed catalog control lookup | **0.687 us** |
+| Raw cached catalog decode | 11.149 us |
+| Absent correlation pruned at catalog root | **0.033 us** |
+
+Both cold implementations fetched exactly 4 MiB from the source and verified
+the immutable bytes. The root-pruned correlation performed no payload read.
+This is a local object-store/cache ablation, not an S3 network-latency claim.
+
+The smaller run is retained as a controlled startup-sensitive comparison; the
+full result above is authoritative for capacity planning. A retained failed
+80 GiB attempt exposed a 1,024 soft descriptor limit after opening 1,001
+shard-stream pack readers. The corrected harness records a 262,144 soft limit,
+and shard-stream's on-demand pack-reader patch has a passing 81-pack
+recovery/fetch test. ShardTelemetry must pin that dependency fix before a
+production release; the raised benchmark limit is not the production fix.
+
 ## Logs, traces, metrics, and correlation — local v1 storage run (2026-08-04)
 
 `shard-telemetry-signal-bench` generates one deterministic, correlated
@@ -2573,6 +2709,12 @@ missing-map empty-default equality, alias/subquery evaluation, and aggregate
 combinators. The expanded matrix passed locally on ClickHouse 26.6.1.1193 and
 on Adam with the pinned `26.3.17.56` image.
 
+On 2026-08-04, the full six-relation matrix also passed against a live,
+cross-signal fixture on the exact official `26.3.17.56` evaluator: 13 log
+cases plus 12 span/event/link/metric/exemplar and correlation cases produced
+byte-identical output against ClickHouse `Memory` snapshots. This is a
+functional compatibility result, not an 80 GiB throughput or latency result.
+
 `clickhouse/adapter` now contains the pinned `StorageShardTelemetry` implementation.
 It reuses `StorageURL` and adds automatic projection, timestamp, exact nonempty
 label/metadata equality, and safe filtered trivial-limit pushdown. The exact
@@ -2595,5 +2737,7 @@ passes. It must sequentially query the same loaded
 ShardTelemetry corpus through `StorageShardTelemetry` and the retained
 `benchmark.logs` MergeTree snapshot on CPUs 0-15, with equal `max_threads`,
 cache state, result checksums, and query ordering. Adam had only 56 GiB free at
-94% utilization when this adapter was added, so a full ClickHouse source build
-was deliberately not started there.
+94% utilization when this adapter was added. On 2026-08-04 it had recovered to
+186 GiB free at 79%, but still had no retained compiler, CMake, Ninja, source,
+or build cache. The custom image should be produced on a dedicated build worker
+so the preserved benchmark corpora are not put at risk.

@@ -50,8 +50,8 @@ mod traceql;
 mod types;
 
 pub use analytics::{
-    ANALYTICS_SCHEMA_VERSION, AnalyticsColumn, AnalyticsLogRow, AnalyticsScanRequest,
-    CLICKHOUSE_COMPATIBILITY_TARGET,
+    ANALYTICS_SCHEMA_VERSION, AnalyticsColumn, AnalyticsRelation, AnalyticsRow, AnalyticsScanOrder,
+    AnalyticsScanRequest, CLICKHOUSE_COMPATIBILITY_TARGET,
 };
 pub use block::{BlockCatalog, BlockDescriptor, BlockId, CompressionCodec};
 pub use correlation::{

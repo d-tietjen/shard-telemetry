@@ -10,6 +10,7 @@ use shard_stream_engine::DurableSinkCheckpoint;
 
 use crate::ingest_pack::{
     IndexedIngestFrame, decode_indexed_ingest_frames, decode_indexed_ingest_records,
+    decompress_indexed_ingest_frame,
 };
 use crate::tier_ingest::{
     TierIngestAppendSource, TierIngestFrameSource, decode_tier_ingest_group,
@@ -25,7 +26,10 @@ use crate::{
     RealtimeDictionaryTrainer, SharedTelemetryObjectStore, SsdObjectCache, TelemetryError,
     TelemetryObjectTier, TelemetryRecordRef, TelemetryResult, TierArtifactKind, TierArtifactSource,
     TierCheckpoint, TierGroupSource, TierQueryRange, fingerprint_message, scan_message_terms,
-    structural::{encode_structural_block, row_source_bytes},
+    structural::{
+        decode_structural_messages, decode_structural_positions, decode_structural_records,
+        encode_structural_block, row_source_bytes,
+    },
 };
 
 const MAX_REBALANCE_PASSES: u8 = 3;
@@ -313,6 +317,7 @@ struct PartitionIndex {
 
 #[derive(Debug)]
 struct IndexedFrameAppend {
+    tenant: Arc<str>,
     first_offset: LogicalOffset,
     last_offset: LogicalOffset,
     record_count: u32,
@@ -1042,25 +1047,24 @@ impl LogStripe {
         first_offset: LogicalOffset,
         record_count: u32,
         payload: Bytes,
-        transient_context: Option<&[u8]>,
     ) -> TelemetryResult<()> {
         self.apply_indexed_ingest_pack_inner(
+            Arc::from("test-tenant"),
             topic_partition,
             first_offset,
             record_count,
             payload,
-            transient_context,
             None,
         )
     }
 
     pub(crate) fn apply_checkpointed_ingest_pack(
         &mut self,
+        tenant: Arc<str>,
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         record_count: u32,
         payload: Bytes,
-        transient_context: Option<&[u8]>,
         checkpoints: (DurableSinkCheckpoint, DurableSinkCheckpoint),
     ) -> TelemetryResult<()> {
         let (expected_checkpoint, next_checkpoint) = checkpoints;
@@ -1072,27 +1076,27 @@ impl LogStripe {
             ));
         }
         self.apply_indexed_ingest_pack_inner(
+            tenant,
             topic_partition,
             first_offset,
             record_count,
             payload,
-            transient_context,
             Some(next_checkpoint),
         )
     }
 
     fn apply_indexed_ingest_pack_inner(
         &mut self,
+        tenant: Arc<str>,
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         record_count: u32,
         payload: Bytes,
-        transient_context: Option<&[u8]>,
         next_checkpoint: Option<DurableSinkCheckpoint>,
     ) -> TelemetryResult<()> {
-        if record_count == 0 {
+        if tenant.is_empty() || record_count == 0 {
             return Err(TelemetryError::InvalidConfig(
-                "compressed ingest append must contain records",
+                "compressed ingest append must have a tenant and contain records",
             ));
         }
         let last_offset = batch_offset(
@@ -1118,7 +1122,7 @@ impl LogStripe {
                 observed: first_offset,
             });
         }
-        let mut frames = decode_indexed_ingest_frames(payload, transient_context, record_count)?;
+        let mut frames = decode_indexed_ingest_frames(payload, None, record_count)?;
         for frame in &mut frames {
             frame.frame_id = self.next_frame_id;
             self.next_frame_id = self
@@ -1131,6 +1135,7 @@ impl LogStripe {
             .entry(topic_partition)
             .or_default();
         partition.appends.push(IndexedFrameAppend {
+            tenant,
             first_offset,
             last_offset,
             record_count,
@@ -1256,6 +1261,7 @@ impl LogStripe {
         let sources = resident.appends[..selected_appends]
             .iter()
             .map(|append| TierIngestAppendSource {
+                tenant: append.tenant.to_string(),
                 first_offset: append.first_offset,
                 last_offset: append.last_offset,
                 record_count: append.record_count,
@@ -1482,6 +1488,91 @@ impl LogStripe {
         Ok(matches)
     }
 
+    /// Counts one tenant's records without reading or reconstructing payloads.
+    ///
+    /// Tenant identity is exact append metadata for compressed and tiered
+    /// frames. The legacy hot-record path uses its exact (non-hashed) posting
+    /// table. Consequently fingerprint collisions can never change this count.
+    pub(crate) fn count_tenant_records(
+        &self,
+        tenant: &str,
+        partitions: &[TopicPartition],
+    ) -> TelemetryResult<u64> {
+        let mut total = 0_u64;
+        for topic_partition in partitions {
+            if let Some(partition) = self.partitions.get(topic_partition)
+                && let Some(posting) = partition
+                    .field_ids
+                    .get("resource.loki.tenant")
+                    .and_then(|values| values.get(tenant))
+                    .and_then(|field_id| partition.field_postings.get(*field_id))
+            {
+                total = total
+                    .checked_add(
+                        u64::try_from(posting.cardinality)
+                            .map_err(|_| TelemetryError::RecordTooLarge)?,
+                    )
+                    .ok_or(TelemetryError::RecordTooLarge)?;
+            }
+            if let Some(partition) = self.indexed_frame_partitions.get(topic_partition) {
+                for append in &partition.appends {
+                    if append.tenant.as_ref() == tenant {
+                        total = total
+                            .checked_add(u64::from(append.record_count))
+                            .ok_or(TelemetryError::RecordTooLarge)?;
+                    }
+                }
+            }
+            total = total
+                .checked_add(self.count_tiered_tenant_records(*topic_partition, tenant)?)
+                .ok_or(TelemetryError::RecordTooLarge)?;
+        }
+        Ok(total)
+    }
+
+    fn count_tiered_tenant_records(
+        &self,
+        topic_partition: TopicPartition,
+        tenant: &str,
+    ) -> TelemetryResult<u64> {
+        let Some(state) = &self.tier else {
+            return Ok(0);
+        };
+        let Some(tier) = state.tiers.get(&topic_partition) else {
+            return Ok(0);
+        };
+        let groups = tier.candidate_groups_cached(
+            TierQueryRange {
+                first_offset: None,
+                last_offset: None,
+                min_timestamp_unix_nanos: None,
+                max_timestamp_unix_nanos: None,
+                signal_identity: None,
+            },
+            &state.control_cache,
+        )?;
+        let mut total = 0_u64;
+        for group in groups {
+            let manifest = tier.load_group_cached(&group, &state.control_cache)?;
+            let query_artifact = manifest
+                .artifact(TierArtifactKind::QueryIndex)
+                .ok_or_else(|| TelemetryError::CorruptTier("group has no query index".into()))?;
+            let query_index = tier.read_artifact_cached(
+                query_artifact,
+                MAX_TIER_QUERY_INDEX_READ_BYTES,
+                &state.control_cache,
+            )?;
+            for append in decode_tier_ingest_group(&query_index, &manifest.blocks)? {
+                if append.tenant == tenant {
+                    total = total
+                        .checked_add(u64::from(append.record_count))
+                        .ok_or(TelemetryError::RecordTooLarge)?;
+                }
+            }
+        }
+        Ok(total)
+    }
+
     fn query_hot_matches(&self, query: &LogQuery) -> Vec<LogMatch> {
         self.partitions
             .get(&query.topic_partition)
@@ -1590,6 +1681,7 @@ impl LogStripe {
             let mut ranges = Vec::new();
             for append in appends {
                 let bounds = IndexedFrameAppend {
+                    tenant: Arc::from(append.tenant.as_str()),
                     first_offset: append.first_offset,
                     last_offset: append.last_offset,
                     record_count: append.record_count,
@@ -1617,6 +1709,7 @@ impl LogStripe {
                         .ok_or(TelemetryError::RecordTooLarge)?;
                     ranges.push(cold_frame.payload_offset..range_end);
                     selected.push((
+                        Arc::clone(&bounds.tenant),
                         bounds.first_offset,
                         bounds.last_offset,
                         bounds.record_count,
@@ -1631,8 +1724,10 @@ impl LogStripe {
                 &payload_metadata,
                 &ranges,
             )?;
-            for ((first_offset, last_offset, record_count, cold_frame, candidates), compressed) in
-                selected.into_iter().zip(payloads)
+            for (
+                (tenant, first_offset, last_offset, record_count, cold_frame, candidates),
+                compressed,
+            ) in selected.into_iter().zip(payloads)
             {
                 if blake3::hash(&compressed).to_hex().as_str() != cold_frame.payload_checksum {
                     return Err(TelemetryError::CorruptTier(format!(
@@ -1651,6 +1746,7 @@ impl LogStripe {
                     index: cold_frame.index,
                 };
                 let bounds = IndexedFrameAppend {
+                    tenant,
                     first_offset,
                     last_offset,
                     record_count,
@@ -1688,45 +1784,151 @@ impl LogStripe {
         frame: &IndexedIngestFrame,
         candidates: &[u32],
     ) -> TelemetryResult<Vec<LogMatch>> {
+        let message_filterable = query.message_candidate_matches("").is_some();
+        if query.sort == crate::QuerySort::Timestamp
+            && (!query.has_residual_predicate() || message_filterable)
+            && let Some(limit) = query.limit
+            && candidates.len() > limit.saturating_mul(2).max(256)
+        {
+            let structural = decompress_indexed_ingest_frame(frame)?;
+            let (offsets, timestamps) = decode_structural_positions(&structural)?;
+            let mut ranked = candidates.to_vec();
+            for ordinal in &ranked {
+                let index = usize::try_from(*ordinal).map_err(|_| {
+                    TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+                })?;
+                if index >= offsets.len() || index >= timestamps.len() {
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "compressed ingest candidate ordinal is out of range",
+                    ));
+                }
+            }
+            let compare_positions = |left: &u32, right: &u32| {
+                let left = usize::try_from(*left).expect("candidate ordinal was validated");
+                let right = usize::try_from(*right).expect("candidate ordinal was validated");
+                (timestamps[left], offsets[left]).cmp(&(timestamps[right], offsets[right]))
+            };
+            let already_ascending = ranked
+                .windows(2)
+                .all(|pair| compare_positions(&pair[0], &pair[1]).is_le());
+            if already_ascending {
+                if query.order == QueryOrder::NewestFirst {
+                    ranked.reverse();
+                }
+            } else {
+                ranked.sort_unstable_by(|left, right| {
+                    let ordering = compare_positions(left, right);
+                    match query.order {
+                        QueryOrder::OldestFirst => ordering,
+                        QueryOrder::NewestFirst => ordering.reverse(),
+                    }
+                });
+            }
+            let filter_messages_first = query.has_residual_predicate() && message_filterable;
+            let batch_len = if filter_messages_first {
+                limit.saturating_mul(4).max(1_024)
+            } else {
+                limit.saturating_mul(2).max(256)
+            };
+            let mut matches = Vec::new();
+            let mut consumed = 0usize;
+            while matches.len() < limit && consumed < ranked.len() {
+                let end = ranked.len().min(consumed.saturating_add(batch_len));
+                let mut batch = ranked[consumed..end].to_vec();
+                batch.sort_unstable();
+                if filter_messages_first {
+                    let messages = decode_structural_messages(&structural, &batch)?;
+                    batch = batch
+                        .into_iter()
+                        .zip(messages)
+                        .filter_map(|(ordinal, message)| {
+                            query
+                                .message_candidate_matches(&message)
+                                .unwrap_or(false)
+                                .then_some(ordinal)
+                        })
+                        .collect();
+                }
+                if !batch.is_empty() {
+                    matches.extend(self.decode_decompressed_frame_candidates(
+                        query,
+                        append,
+                        frame,
+                        &structural,
+                        &batch,
+                    )?);
+                }
+                consumed = end;
+            }
+            sort_and_limit_matches(&mut matches, query, limit);
+            return Ok(matches);
+        }
         let mut matches = Vec::new();
         for decoded in decode_indexed_ingest_records(frame, candidates)? {
-            let relative_offset = decoded.offset.get();
-            if relative_offset >= u64::from(append.record_count) {
-                return Err(TelemetryError::InvalidBlockEncoding(
-                    "compressed ingest record ordinal is out of range",
-                ));
-            }
-            let absolute_offset = append
-                .first_offset
-                .get()
-                .checked_add(relative_offset)
-                .map(LogicalOffset::new)
-                .ok_or(TelemetryError::OffsetExhausted(query.topic_partition))?;
-            let record = DurableLog {
-                stream_shard_id: self.stream_shard_id,
-                record_ref: TelemetryRecordRef::new(query.topic_partition, absolute_offset),
-                timestamp_unix_nanos: decoded.timestamp_unix_nanos,
-                observed_timestamp_unix_nanos: decoded.observed_timestamp_unix_nanos,
-                body: decoded.body,
-                message: decoded.message,
-                fields: decoded.fields,
-                attributes: decoded.attributes,
-                resource: decoded.resource,
-                scope: decoded.scope,
-                severity_number: decoded.severity_number,
-                severity_text: decoded.severity_text,
-                dropped_attributes_count: decoded.dropped_attributes_count,
-                flags: decoded.flags,
-                trace_id: decoded.trace_id,
-                span_id: decoded.span_id,
-                event_name: decoded.event_name,
-                compression_cohort: frame.cohort,
-            };
-            if query.matches(&record) {
-                matches.push(LogMatch { record });
-            }
+            self.push_decoded_frame_match(query, append, frame, decoded, &mut matches)?;
         }
         Ok(matches)
+    }
+
+    fn decode_decompressed_frame_candidates(
+        &self,
+        query: &LogQuery,
+        append: &IndexedFrameAppend,
+        frame: &IndexedIngestFrame,
+        structural: &[u8],
+        candidates: &[u32],
+    ) -> TelemetryResult<Vec<LogMatch>> {
+        let mut matches = Vec::new();
+        for decoded in decode_structural_records(structural, candidates)? {
+            self.push_decoded_frame_match(query, append, frame, decoded, &mut matches)?;
+        }
+        Ok(matches)
+    }
+
+    fn push_decoded_frame_match(
+        &self,
+        query: &LogQuery,
+        append: &IndexedFrameAppend,
+        frame: &IndexedIngestFrame,
+        decoded: crate::DecodedStructuralRecord,
+        matches: &mut Vec<LogMatch>,
+    ) -> TelemetryResult<()> {
+        let relative_offset = decoded.offset.get();
+        if relative_offset >= u64::from(append.record_count) {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "compressed ingest record ordinal is out of range",
+            ));
+        }
+        let absolute_offset = append
+            .first_offset
+            .get()
+            .checked_add(relative_offset)
+            .map(LogicalOffset::new)
+            .ok_or(TelemetryError::OffsetExhausted(query.topic_partition))?;
+        let record = DurableLog {
+            stream_shard_id: self.stream_shard_id,
+            record_ref: TelemetryRecordRef::new(query.topic_partition, absolute_offset),
+            timestamp_unix_nanos: decoded.timestamp_unix_nanos,
+            observed_timestamp_unix_nanos: decoded.observed_timestamp_unix_nanos,
+            body: decoded.body,
+            message: decoded.message,
+            fields: decoded.fields,
+            attributes: decoded.attributes,
+            resource: decoded.resource,
+            scope: decoded.scope,
+            severity_number: decoded.severity_number,
+            severity_text: decoded.severity_text,
+            dropped_attributes_count: decoded.dropped_attributes_count,
+            flags: decoded.flags,
+            trace_id: decoded.trace_id,
+            span_id: decoded.span_id,
+            event_name: decoded.event_name,
+            compression_cohort: frame.cohort,
+        };
+        if query.matches(&record) {
+            matches.push(LogMatch { record });
+        }
+        Ok(())
     }
 
     fn query_ordinals(&self, query: &LogQuery, partition: &PartitionIndex) -> Vec<u32> {
@@ -2758,7 +2960,10 @@ mod tests {
     use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
     use super::*;
-    use crate::{LocalityGranularity, MetadataField, ingest_pack::prepare_ingest_pack};
+    use crate::{
+        CaseSensitivity, LocalityGranularity, LogPredicate, MetadataField,
+        ingest_pack::prepare_ingest_pack,
+    };
 
     fn partition() -> TopicPartition {
         TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(3))
@@ -2876,19 +3081,22 @@ mod tests {
             first_offset,
             events.len() as u32,
             payload.clone(),
-            None,
         )
         .expect("live frame indexes install");
+        assert_eq!(
+            live.count_tenant_records("test-tenant", &[partition()])
+                .expect("resident count"),
+            events.len() as u64
+        );
+        assert_eq!(
+            live.count_tenant_records("another-tenant", &[partition()])
+                .expect("other tenant count"),
+            0
+        );
         let mut recovered = LogStripe::new(ShardId::new(7), StripeConfig::default())
             .expect("recovered stripe opens");
         recovered
-            .apply_indexed_ingest_pack(
-                partition(),
-                first_offset,
-                events.len() as u32,
-                payload,
-                None,
-            )
+            .apply_indexed_ingest_pack(partition(), first_offset, events.len() as u32, payload)
             .expect("durable frame indexes recover");
 
         let queries = [
@@ -2958,7 +3166,6 @@ mod tests {
                         LogicalOffset::new((batch * 2) as u64),
                         events.len() as u32,
                         Bytes::from(prepared.payload),
-                        None,
                     )
                     .expect("frame append indexes");
             }
@@ -2993,6 +3200,65 @@ mod tests {
                 .map(|matched| matched.record.timestamp_unix_nanos)
                 .collect::<Vec<_>>(),
             vec![100, 101, 200]
+        );
+    }
+
+    #[test]
+    fn compressed_frame_timestamp_top_k_selects_before_full_record_decode() {
+        let events = (0..1_024u64)
+            .map(|ordinal| OtlpLogEvent {
+                timestamp_unix_nanos: ordinal,
+                message: Arc::from(if matches!(ordinal, 10 | 20 | 30) {
+                    "prefix target suffix".to_owned()
+                } else {
+                    "prefix_target suffix".to_owned()
+                }),
+                compression_cohort: CompressionCohortId::new(1),
+                ..OtlpLogEvent::default()
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_ingest_pack(&events).expect("pack prepares");
+        let mut stripe =
+            LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe opens");
+        stripe
+            .apply_indexed_ingest_pack(
+                partition(),
+                LogicalOffset::new(0),
+                events.len() as u32,
+                Bytes::from(prepared.payload),
+            )
+            .expect("frame append indexes");
+
+        let latest = LogQuery::new(partition())
+            .sort_by_timestamp()
+            .newest_first()
+            .with_limit(3);
+        assert_eq!(
+            stripe
+                .query_checked(&latest)
+                .expect("latest query")
+                .into_iter()
+                .map(|matched| matched.record.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            vec![1_023, 1_022, 1_021]
+        );
+
+        let sparse_residual = LogQuery::new(partition())
+            .where_predicate(LogPredicate::message_token(
+                "target",
+                CaseSensitivity::Sensitive,
+            ))
+            .sort_by_timestamp()
+            .newest_first()
+            .with_limit(2);
+        assert_eq!(
+            stripe
+                .query_checked(&sparse_residual)
+                .expect("sparse residual query")
+                .into_iter()
+                .map(|matched| matched.record.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            vec![30, 20]
         );
     }
 

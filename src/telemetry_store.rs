@@ -21,9 +21,10 @@ use crate::ingest_pack::decode_ingest_pack;
 use crate::loki_api::{LogicalDeleteFilter, LokiApiError, apply_logical_deletes};
 use crate::storage_format::DataDirectoryLease;
 use crate::{
-    AnalyticsLogRow, AnalyticsScanRequest, DeleteRequest, LocalObjectStore, LogMatch, LogQuery,
-    LokiEntry, LokiStore, NativeQuery, NativeQueryDirection, ObjectTierConfig, OtlpSinkConfig,
-    QueryCursor, SinkObjectTierConfig, SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig,
+    AnalyticsRelation, AnalyticsRow, AnalyticsScanOrder, AnalyticsScanRequest, CaseSensitivity,
+    DeleteRequest, LocalObjectStore, LogMatch, LogPredicate, LogQuery, LokiEntry, LokiStore,
+    NativeQuery, NativeQueryDirection, ObjectTierConfig, OtlpSinkConfig, QueryCursor,
+    SinkObjectTierConfig, SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig,
     TelemetryService, TelemetrySinkFactory,
 };
 
@@ -546,6 +547,8 @@ impl DurableTelemetryStore {
                 }
                 let existing = self.query_metrics(&crate::MetricQuery {
                     tenant: Arc::clone(&point.identity.tenant),
+                    partition: None,
+                    start_offset: None,
                     series: Some(point.series_fingerprint()),
                     name: None,
                     exact_labels: Arc::new(Vec::new()),
@@ -856,14 +859,96 @@ impl LokiStore for DurableTelemetryStore {
     fn scan_analytics(
         &self,
         request: &AnalyticsScanRequest,
-        emit: &mut dyn FnMut(&[AnalyticsLogRow]) -> Result<(), LokiApiError>,
+        emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
     ) -> Result<(), LokiApiError> {
         request.validate()?;
+        match request.relation {
+            AnalyticsRelation::Logs => {}
+            AnalyticsRelation::Spans
+            | AnalyticsRelation::SpanEvents
+            | AnalyticsRelation::SpanLinks => {
+                return self.scan_trace_analytics(request, emit);
+            }
+            AnalyticsRelation::MetricPoints | AnalyticsRelation::MetricExemplars => {
+                return self.scan_metric_analytics(request, emit);
+            }
+        }
         let limit = request.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(());
         }
         let delete_filter = LogicalDeleteFilter::compile(&self.deletes.list(&request.tenant)?)?;
+        let index_complete_ordered_scan = request.order.is_some()
+            && delete_filter.is_empty()
+            && request.attributes.is_empty()
+            && request.resource_attributes.is_empty()
+            && request.scope_attributes.is_empty()
+            && request.trace_id.is_none()
+            && request.span_id.is_none()
+            && request.series_id.is_none()
+            && request.name.is_none();
+        if index_complete_ordered_scan {
+            let queries = self
+                .tenant_partitions(&request.tenant)
+                .map(|partition| {
+                    let mut query = LogQuery::new(partition)
+                        .sort_by_timestamp()
+                        .with_limit(limit)
+                        .with_field(TENANT_FIELD, request.tenant.as_ref());
+                    query.start_timestamp_unix_nanos =
+                        self.retained_query_start(request.start_timestamp_unix_nanos);
+                    query.end_timestamp_unix_nanos = request.end_timestamp_unix_nanos;
+                    if request.order == Some(AnalyticsScanOrder::TimestampDescending) {
+                        query = query.newest_first();
+                    }
+                    for term in &request.terms {
+                        query = query.with_term(Arc::clone(term));
+                    }
+                    for token in &request.message_tokens {
+                        query = query.with_predicate(LogPredicate::message_token(
+                            Arc::clone(token),
+                            CaseSensitivity::Sensitive,
+                        ));
+                    }
+                    for token in &request.case_insensitive_message_tokens {
+                        query = query.with_predicate(LogPredicate::message_token(
+                            Arc::clone(token),
+                            CaseSensitivity::Insensitive,
+                        ));
+                    }
+                    for field in &request.labels {
+                        query = query.with_field(
+                            format!("{LABEL_PREFIX}{}", field.key),
+                            Arc::clone(&field.value),
+                        );
+                    }
+                    for field in &request.metadata {
+                        query = query.with_field(
+                            format!("{METADATA_PREFIX}{}", field.key),
+                            Arc::clone(&field.value),
+                        );
+                    }
+                    query
+                })
+                .collect::<Vec<_>>();
+            let rows = self
+                .service
+                .query_partitions(&queries)
+                .map_err(|error| LokiApiError::internal(error.to_string()))?
+                .into_iter()
+                .map(|matched| analytics_row_and_entry(&request.tenant, matched))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter_map(|(row, entry)| {
+                    (!delete_filter.matches(&entry) && crate::analytics::row_matches(&row, request))
+                        .then_some(row)
+                })
+                .collect::<Vec<_>>();
+            if !rows.is_empty() {
+                emit(&rows)?;
+            }
+            return Ok(());
+        }
         let mut emitted = 0usize;
         for partition in self.tenant_partitions(&request.tenant) {
             let mut next_offset = None;
@@ -881,6 +966,18 @@ impl LokiStore for DurableTelemetryStore {
                 query.end_timestamp_unix_nanos = request.end_timestamp_unix_nanos;
                 for term in &request.terms {
                     query = query.with_term(Arc::clone(term));
+                }
+                for token in &request.message_tokens {
+                    query = query.with_predicate(LogPredicate::message_token(
+                        Arc::clone(token),
+                        CaseSensitivity::Sensitive,
+                    ));
+                }
+                for token in &request.case_insensitive_message_tokens {
+                    query = query.with_predicate(LogPredicate::message_token(
+                        Arc::clone(token),
+                        CaseSensitivity::Insensitive,
+                    ));
                 }
                 for field in &request.labels {
                     query = query.with_field(
@@ -914,7 +1011,11 @@ impl LokiStore for DurableTelemetryStore {
                     .map(|matched| analytics_row_and_entry(&request.tenant, matched))
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
-                    .filter_map(|(row, entry)| (!delete_filter.matches(&entry)).then_some(row))
+                    .filter_map(|(row, entry)| {
+                        (!delete_filter.matches(&entry)
+                            && crate::analytics::row_matches(&row, request))
+                        .then_some(row)
+                    })
                     .collect::<Vec<_>>();
                 if !rows.is_empty() {
                     emit(&rows)?;
@@ -930,6 +1031,49 @@ impl LokiStore for DurableTelemetryStore {
             }
         }
         Ok(())
+    }
+
+    fn scan_analytics_cardinality(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(u64) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        request.validate()?;
+        let unfiltered_log_count = request.relation == AnalyticsRelation::Logs
+            && request.start_timestamp_unix_nanos.is_none()
+            && request.end_timestamp_unix_nanos.is_none()
+            && request.terms.is_empty()
+            && request.message_tokens.is_empty()
+            && request.case_insensitive_message_tokens.is_empty()
+            && request.labels.is_empty()
+            && request.metadata.is_empty()
+            && request.attributes.is_empty()
+            && request.resource_attributes.is_empty()
+            && request.scope_attributes.is_empty()
+            && request.trace_id.is_none()
+            && request.span_id.is_none()
+            && request.series_id.is_none()
+            && request.name.is_none()
+            && self.retention.is_none()
+            && self.deletes.list(&request.tenant)?.is_empty();
+        if unfiltered_log_count {
+            let partitions = self.tenant_partitions(&request.tenant).collect::<Vec<_>>();
+            let mut count = self
+                .service
+                .count_log_records(Arc::clone(&request.tenant), partitions)
+                .map_err(|error| LokiApiError::internal(error.to_string()))?;
+            if let Some(limit) = request.limit {
+                count = count.min(u64::try_from(limit).unwrap_or(u64::MAX));
+            }
+            if count > 0 {
+                emit(count)?;
+            }
+            return Ok(());
+        }
+
+        self.scan_analytics(request, &mut |rows| {
+            emit(u64::try_from(rows.len()).unwrap_or(u64::MAX))
+        })
     }
 
     fn health(&self) -> Result<StoreHealth, LokiApiError> {
@@ -1027,10 +1171,242 @@ impl LokiStore for DurableTelemetryStore {
     }
 }
 
+impl DurableTelemetryStore {
+    fn signal_partitions(&self, topic_id: TopicId) -> impl Iterator<Item = TopicPartition> {
+        let count = self.tenant_partitions;
+        (0..count)
+            .map(move |partition| TopicPartition::new(topic_id, LogicalPartitionId::new(partition)))
+    }
+
+    fn scan_trace_analytics(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        let limit = request.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(());
+        }
+        let mut emitted = 0usize;
+        let router = crate::TelemetryRouter::new(
+            NonZeroU16::new(u16::try_from(self.tenant_partitions).map_err(|_| {
+                LokiApiError::internal("tenant partition count exceeds the routing space")
+            })?)
+            .ok_or_else(|| LokiApiError::internal("tenant partition count is zero"))?,
+        );
+        let bounded_span_scan = request.relation == AnalyticsRelation::Spans
+            && request.limit.is_some()
+            && request.trace_id.is_none();
+        let partitions = request.trace_id.map_or_else(
+            || {
+                if bounded_span_scan {
+                    vec![None]
+                } else {
+                    self.signal_partitions(crate::TRACES_TOPIC_ID)
+                        .map(Some)
+                        .collect::<Vec<_>>()
+                }
+            },
+            |trace_id| vec![Some(router.trace(&request.tenant, trace_id))],
+        );
+        let pairs = |fields: &[crate::MetadataField]| {
+            Arc::new(
+                fields
+                    .iter()
+                    .map(|field| (Arc::clone(&field.key), Arc::clone(&field.value)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let exact_attributes = if request.relation == AnalyticsRelation::Spans {
+            pairs(&request.attributes)
+        } else {
+            Arc::default()
+        };
+        let exact_resource_attributes = pairs(&request.resource_attributes);
+        let exact_scope_attributes = pairs(&request.scope_attributes);
+        for partition in partitions {
+            let mut next_offset = None;
+            loop {
+                if emitted == limit {
+                    return Ok(());
+                }
+                let page_limit =
+                    crate::analytics::DEFAULT_SCAN_BATCH_ROWS.min(limit.saturating_sub(emitted));
+                let event_relation = request.relation == AnalyticsRelation::SpanEvents;
+                let query = crate::TraceQuery {
+                    tenant: Arc::clone(&request.tenant),
+                    partition,
+                    start_offset: next_offset.map(LogicalOffset::new),
+                    trace_id: request.trace_id,
+                    span_id: request.span_id,
+                    name: (request.relation == AnalyticsRelation::Spans)
+                        .then(|| request.name.as_ref().map(Arc::clone))
+                        .flatten(),
+                    exact_attributes: Arc::clone(&exact_attributes),
+                    exact_resource_attributes: Arc::clone(&exact_resource_attributes),
+                    exact_scope_attributes: Arc::clone(&exact_scope_attributes),
+                    start_time_unix_nanos: (!event_relation)
+                        .then_some(request.start_timestamp_unix_nanos)
+                        .flatten(),
+                    end_time_unix_nanos: (!event_relation)
+                        .then_some(request.end_timestamp_unix_nanos)
+                        .flatten(),
+                    min_duration_nanos: None,
+                    limit: page_limit,
+                };
+                let spans = self.query_traces(&query)?;
+                if spans.is_empty() {
+                    break;
+                }
+                let returned = spans.len();
+                let final_offset = spans
+                    .last()
+                    .expect("non-empty trace page")
+                    .record_ref
+                    .offset
+                    .get();
+                let mut rows = Vec::with_capacity(page_limit.min(limit.saturating_sub(emitted)));
+                for span in spans {
+                    for row in crate::analytics::span_rows(&span, request.relation)? {
+                        if !crate::analytics::row_matches(&row, request) {
+                            continue;
+                        }
+                        rows.push(row);
+                        emitted = emitted.saturating_add(1);
+                        if rows.len() == crate::analytics::DEFAULT_SCAN_BATCH_ROWS {
+                            emit(&rows)?;
+                            rows.clear();
+                        }
+                        if emitted == limit {
+                            break;
+                        }
+                    }
+                    if emitted == limit {
+                        break;
+                    }
+                }
+                if !rows.is_empty() {
+                    emit(&rows)?;
+                }
+                if emitted == limit || returned < page_limit || partition.is_none() {
+                    break;
+                }
+                let Some(start) = final_offset.checked_add(1) else {
+                    break;
+                };
+                next_offset = Some(start);
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_metric_analytics(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        let limit = request.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(());
+        }
+        let mut emitted = 0usize;
+        let router = crate::TelemetryRouter::new(
+            NonZeroU16::new(u16::try_from(self.tenant_partitions).map_err(|_| {
+                LokiApiError::internal("tenant partition count exceeds the routing space")
+            })?)
+            .ok_or_else(|| LokiApiError::internal("tenant partition count is zero"))?,
+        );
+        let partitions = request.series_id.map_or_else(
+            || {
+                self.signal_partitions(crate::METRICS_TOPIC_ID)
+                    .collect::<Vec<_>>()
+            },
+            |series| vec![router.metric(&request.tenant, series)],
+        );
+        for partition in partitions {
+            let mut next_offset = None;
+            loop {
+                if emitted == limit {
+                    return Ok(());
+                }
+                let page_limit = crate::analytics::DEFAULT_SCAN_BATCH_ROWS;
+                let exemplar_relation = request.relation == AnalyticsRelation::MetricExemplars;
+                let query = crate::MetricQuery {
+                    tenant: Arc::clone(&request.tenant),
+                    partition: Some(partition),
+                    start_offset: next_offset.map(LogicalOffset::new),
+                    series: request.series_id,
+                    name: request.name.as_ref().map(Arc::clone),
+                    exact_labels: Arc::new(
+                        request
+                            .labels
+                            .iter()
+                            .map(|field| (Arc::clone(&field.key), Arc::clone(&field.value)))
+                            .collect(),
+                    ),
+                    start_time_unix_nanos: (!exemplar_relation)
+                        .then_some(request.start_timestamp_unix_nanos)
+                        .flatten(),
+                    end_time_unix_nanos: (!exemplar_relation)
+                        .then(|| {
+                            request
+                                .end_timestamp_unix_nanos
+                                .and_then(|end| end.checked_sub(1))
+                        })
+                        .flatten(),
+                    limit: page_limit,
+                };
+                let points = self.query_metrics(&query)?;
+                if points.is_empty() {
+                    break;
+                }
+                let returned = points.len();
+                let final_offset = points
+                    .last()
+                    .expect("non-empty metric page")
+                    .record_ref
+                    .offset
+                    .get();
+                let mut rows = Vec::with_capacity(page_limit.min(limit.saturating_sub(emitted)));
+                for point in points {
+                    for row in crate::analytics::metric_rows(&point, request.relation)? {
+                        if !crate::analytics::row_matches(&row, request) {
+                            continue;
+                        }
+                        rows.push(row);
+                        emitted = emitted.saturating_add(1);
+                        if rows.len() == crate::analytics::DEFAULT_SCAN_BATCH_ROWS {
+                            emit(&rows)?;
+                            rows.clear();
+                        }
+                        if emitted == limit {
+                            break;
+                        }
+                    }
+                    if emitted == limit {
+                        break;
+                    }
+                }
+                if !rows.is_empty() {
+                    emit(&rows)?;
+                }
+                if emitted == limit || returned < page_limit {
+                    break;
+                }
+                let Some(start) = final_offset.checked_add(1) else {
+                    break;
+                };
+                next_offset = Some(start);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn analytics_row_and_entry(
     tenant: &Arc<str>,
     matched: LogMatch,
-) -> Result<(AnalyticsLogRow, LokiEntry), LokiApiError> {
+) -> Result<(AnalyticsRow, LokiEntry), LokiApiError> {
     let mut labels = BTreeMap::new();
     let mut metadata = BTreeMap::new();
     for field in matched.record.fields.iter() {
@@ -1048,18 +1424,8 @@ fn analytics_row_and_entry(
         line: matched.record.message.to_string(),
         structured_metadata: metadata.clone(),
     };
-    Ok((
-        AnalyticsLogRow {
-            tenant: Arc::clone(tenant),
-            timestamp_unix_nanos,
-            partition: matched.record.record_ref.topic_partition.partition_id.get(),
-            offset: matched.record.record_ref.offset.get(),
-            message: matched.record.message,
-            labels,
-            metadata,
-        },
-        entry,
-    ))
+    let row = crate::analytics::log_row(tenant, &matched.record, labels, metadata)?;
+    Ok((row, entry))
 }
 
 fn log_match_to_entry(matched: LogMatch) -> Result<LokiEntry, LokiApiError> {
@@ -1102,7 +1468,7 @@ mod tests {
             Exemplar, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, exemplar,
             metric, number_data_point,
         },
-        trace::v1::{ResourceSpans, ScopeSpans, Span},
+        trace::v1::{ResourceSpans, ScopeSpans, Span, span},
     };
     use prost::Message;
     use shard_stream_protocol::{FetchMode, FetchRequest};
@@ -1164,6 +1530,16 @@ mod tests {
                         name: "checkout".into(),
                         start_time_unix_nano: 10,
                         end_time_unix_nano: 20,
+                        events: vec![span::Event {
+                            time_unix_nano: 15,
+                            name: "charged".into(),
+                            ..span::Event::default()
+                        }],
+                        links: vec![span::Link {
+                            trace_id: vec![3; 16],
+                            span_id: vec![4; 8],
+                            ..span::Link::default()
+                        }],
                         ..Span::default()
                     }],
                     ..ScopeSpans::default()
@@ -1289,6 +1665,84 @@ mod tests {
             .into_iter()
             .all(|signal| correlated.iter().any(|record| record.signal == signal))
         );
+        for (relation, expected) in [
+            (crate::AnalyticsRelation::Logs, 1),
+            (crate::AnalyticsRelation::Spans, 1),
+            (crate::AnalyticsRelation::SpanEvents, 1),
+            (crate::AnalyticsRelation::SpanLinks, 1),
+            (crate::AnalyticsRelation::MetricPoints, 1),
+            (crate::AnalyticsRelation::MetricExemplars, 1),
+        ] {
+            let request = crate::AnalyticsScanRequest::for_relation("tenant-a", relation);
+            let mut rows = Vec::new();
+            store
+                .scan_analytics(&request, &mut |batch| {
+                    rows.extend_from_slice(batch);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows.len(), expected, "{relation:?}");
+            assert_eq!(
+                rows.first().map(|row| row.signal.as_ref()),
+                Some(relation.signal())
+            );
+        }
+        let mut exact_trace =
+            crate::AnalyticsScanRequest::for_relation("tenant-a", crate::AnalyticsRelation::Spans);
+        exact_trace.trace_id = Some(trace_id);
+        exact_trace.span_id = Some(crate::SpanId::from_bytes([2; 8]).unwrap());
+        exact_trace.name = Some(Arc::from("checkout"));
+        let mut exact_trace_rows = Vec::new();
+        store
+            .scan_analytics(&exact_trace, &mut |batch| {
+                exact_trace_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(exact_trace_rows.len(), 1);
+
+        let mut exact_metric = crate::AnalyticsScanRequest::for_relation(
+            "tenant-a",
+            crate::AnalyticsRelation::MetricPoints,
+        );
+        exact_metric.series_id = Some(points[0].series_fingerprint());
+        exact_metric.name = Some(Arc::from("requests"));
+        let mut exact_metric_rows = Vec::new();
+        store
+            .scan_analytics(&exact_metric, &mut |batch| {
+                exact_metric_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(exact_metric_rows.len(), 1);
+
+        for (relation, start, end) in [
+            (crate::AnalyticsRelation::SpanEvents, 15, 16),
+            (crate::AnalyticsRelation::MetricExemplars, 30, 31),
+        ] {
+            let mut request = crate::AnalyticsScanRequest::for_relation("tenant-a", relation);
+            request.start_timestamp_unix_nanos = Some(start);
+            request.end_timestamp_unix_nanos = Some(end);
+            let mut rows = Vec::new();
+            store
+                .scan_analytics(&request, &mut |batch| {
+                    rows.extend_from_slice(batch);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows.len(), 1, "nested timestamp filter: {relation:?}");
+
+            request.start_timestamp_unix_nanos = Some(end);
+            request.end_timestamp_unix_nanos = Some(end + 1);
+            rows.clear();
+            store
+                .scan_analytics(&request, &mut |batch| {
+                    rows.extend_from_slice(batch);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(rows.is_empty(), "nested timestamp residual: {relation:?}");
+        }
         drop(store);
         fs::remove_dir_all(directory).expect("remove test store");
     }
@@ -1417,6 +1871,17 @@ mod tests {
             .expect("cold query");
         assert_eq!(cold.len(), 1);
         assert_eq!(cold[0].line, "cold request failed");
+        let mut count_request = AnalyticsScanRequest::new("tenant-a");
+        count_request.columns = vec![crate::AnalyticsColumn::Offset];
+        count_request.cardinality_only = true;
+        let mut count = 0_u64;
+        store
+            .scan_analytics_cardinality(&count_request, &mut |batch_count| {
+                count += batch_count;
+                Ok(())
+            })
+            .expect("cold cardinality scan");
+        assert_eq!(count, 2);
         assert!(object_directory.exists());
         drop(store);
 
@@ -1425,6 +1890,14 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].line, "cold request completed");
         assert_eq!(entries[1].structured_metadata["code"], "500");
+        let mut recovered_count = 0_u64;
+        recovered
+            .scan_analytics_cardinality(&count_request, &mut |batch_count| {
+                recovered_count += batch_count;
+                Ok(())
+            })
+            .expect("recovered cold cardinality scan");
+        assert_eq!(recovered_count, 2);
         drop(recovered);
         fs::remove_dir_all(directory).expect("remove test store");
     }
@@ -1506,7 +1979,11 @@ mod tests {
             })
             .expect("analytics scan");
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| !row.message.ends_with("101")));
+        assert!(rows.iter().all(|row| {
+            row.message
+                .as_deref()
+                .is_none_or(|message| !message.ends_with("101"))
+        }));
         drop(store);
 
         let recovered = DurableTelemetryStore::open(config).expect("recovered store");
@@ -1589,7 +2066,7 @@ mod tests {
             })
             .expect("analytics scan");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].message.as_ref(), "retained message");
+        assert_eq!(rows[0].message.as_deref(), Some("retained message"));
         let report = store.compact_retention().expect("retention compaction");
         assert_eq!(report.advanced_partitions, 1);
         assert_eq!(report.advanced_offsets, 1);
@@ -1706,6 +2183,17 @@ mod tests {
                 ],
             )
             .expect("push");
+        store
+            .push(
+                "tenant-a",
+                vec![LokiEntry {
+                    timestamp_unix_nanos: 300,
+                    labels: BTreeMap::from([("app".to_owned(), "worker".to_owned())]),
+                    line: "newest request".to_owned(),
+                    structured_metadata: BTreeMap::new(),
+                }],
+            )
+            .expect("second partition push");
         let mut request = AnalyticsScanRequest::new("tenant-a");
         request.start_timestamp_unix_nanos = Some(150);
         request.end_timestamp_unix_nanos = Some(250);
@@ -1723,9 +2211,51 @@ mod tests {
             .expect("scan");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].timestamp_unix_nanos, 200);
-        assert_eq!(rows[0].message.as_ref(), "request ERROR");
+        assert_eq!(rows[0].message.as_deref(), Some("request ERROR"));
         assert_eq!(rows[0].labels["app"], "api");
         assert_eq!(rows[0].metadata["code"], "500");
+        let mut newest = AnalyticsScanRequest::new("tenant-a");
+        newest.limit = Some(1);
+        newest.order = Some(AnalyticsScanOrder::TimestampDescending);
+        let mut newest_rows = Vec::new();
+        store
+            .scan_analytics(&newest, &mut |batch| {
+                newest_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .expect("newest scan");
+        assert_eq!(newest_rows.len(), 1);
+        assert_eq!(newest_rows[0].timestamp_unix_nanos, 300);
+        assert_eq!(newest_rows[0].message.as_deref(), Some("newest request"));
+        let mut newest_exact_token = AnalyticsScanRequest::new("tenant-a");
+        newest_exact_token.limit = Some(1);
+        newest_exact_token.order = Some(AnalyticsScanOrder::TimestampDescending);
+        newest_exact_token.message_tokens.push(Arc::from("ERROR"));
+        let mut exact_rows = Vec::new();
+        store
+            .scan_analytics(&newest_exact_token, &mut |batch| {
+                exact_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .expect("newest exact-token scan");
+        assert_eq!(exact_rows.len(), 1);
+        assert_eq!(exact_rows[0].timestamp_unix_nanos, 200);
+        assert_eq!(exact_rows[0].message.as_deref(), Some("request ERROR"));
+        let mut newest_folded_token = AnalyticsScanRequest::new("tenant-a");
+        newest_folded_token.limit = Some(1);
+        newest_folded_token.order = Some(AnalyticsScanOrder::TimestampDescending);
+        newest_folded_token
+            .case_insensitive_message_tokens
+            .push(Arc::from("error"));
+        let mut folded_rows = Vec::new();
+        store
+            .scan_analytics(&newest_folded_token, &mut |batch| {
+                folded_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .expect("newest case-insensitive token scan");
+        assert_eq!(folded_rows.len(), 1);
+        assert_eq!(folded_rows[0].timestamp_unix_nanos, 200);
         drop(store);
         fs::remove_dir_all(directory).expect("remove test store");
     }

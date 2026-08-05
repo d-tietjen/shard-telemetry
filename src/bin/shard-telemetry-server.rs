@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::serve::ListenerExt;
 use clap::Parser;
 use shard_telemetry::{
     DurableTelemetryConfig, DurableTelemetryStore, LokiApiConfig, NativeServerConfig,
@@ -331,6 +332,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    let listener = listener.tap_io(|stream| {
+        let _ = stream.set_nodelay(true);
+    });
     let http = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = http_shutdown.recv().await;
     });
@@ -346,6 +350,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = native_shutdown.recv().await;
         },
     );
+    let otlp_http_listener = otlp_http_listener.tap_io(|stream| {
+        let _ = stream.set_nodelay(true);
+    });
     let otlp_http = axum::serve(otlp_http_listener, otlp_app).with_graceful_shutdown(async move {
         let _ = otlp_http_shutdown.recv().await;
     });

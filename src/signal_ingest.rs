@@ -19,7 +19,31 @@ pub fn prepare_log_envelope(
     tenant: &str,
     events: &[OtlpLogEvent],
 ) -> TelemetryResult<TelemetryEnvelope> {
-    let prepared = prepare_ingest_pack(events)?;
+    if tenant.is_empty() {
+        return Err(TelemetryError::InvalidNativePayload(
+            "log tenant must not be empty".into(),
+        ));
+    }
+    let mut tenant_bound = Vec::with_capacity(events.len());
+    for event in events {
+        let mut event = event.clone();
+        let mut fields = event.fields.as_ref().clone();
+        match fields
+            .iter()
+            .find(|field| field.key.as_ref() == TENANT_FIELD)
+        {
+            Some(field) if field.value.as_ref() != tenant => {
+                return Err(TelemetryError::InvalidNativePayload(
+                    "log record tenant field conflicts with its envelope".into(),
+                ));
+            }
+            Some(_) => {}
+            None => fields.push(MetadataField::new(TENANT_FIELD, tenant)),
+        }
+        event.fields = Arc::new(fields);
+        tenant_bound.push(event);
+    }
+    let prepared = prepare_ingest_pack(&tenant_bound)?;
     TelemetryEnvelope::new(
         TelemetrySignal::Logs,
         tenant,
@@ -246,6 +270,24 @@ mod tests {
     use crate::{OtlpTelemetryDecoder, TelemetryRouter, decode_trace_block};
 
     use super::*;
+
+    #[test]
+    fn log_envelope_binds_every_record_to_its_authenticated_tenant() {
+        let event = OtlpLogEvent {
+            timestamp_unix_nanos: 1,
+            message: Arc::from("hello"),
+            ..OtlpLogEvent::default()
+        };
+        let envelope = prepare_log_envelope("tenant-a", std::slice::from_ref(&event)).unwrap();
+        let decoded = decode_log_envelope(&envelope).unwrap();
+        assert!(decoded[0].fields.iter().any(|field| {
+            field.key.as_ref() == TENANT_FIELD && field.value.as_ref() == "tenant-a"
+        }));
+
+        let mut conflicting = event;
+        conflicting.fields = Arc::new(vec![MetadataField::new(TENANT_FIELD, "tenant-b")]);
+        assert!(prepare_log_envelope("tenant-a", &[conflicting]).is_err());
+    }
 
     #[test]
     fn trace_partition_envelope_is_self_verifying_and_counted() {

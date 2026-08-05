@@ -238,6 +238,22 @@ pub fn encode_trace_block(records: &[DurableSpan]) -> TelemetryResult<Vec<u8>> {
 
 /// Decodes and verifies a signal-native trace block.
 pub fn decode_trace_block(encoded: &[u8]) -> TelemetryResult<Vec<DurableSpan>> {
+    decode_trace_block_filtered(encoded, None)
+}
+
+/// Decodes only spans which can satisfy a native trace query while preserving
+/// whole-block integrity validation and exact conflict resolution.
+pub(crate) fn decode_trace_block_matching(
+    encoded: &[u8],
+    query: &TraceQuery,
+) -> TelemetryResult<Vec<DurableSpan>> {
+    decode_trace_block_filtered(encoded, Some(query))
+}
+
+fn decode_trace_block_filtered(
+    encoded: &[u8],
+    query: Option<&TraceQuery>,
+) -> TelemetryResult<Vec<DurableSpan>> {
     const FIXED_HEADER: usize = 36;
     if encoded.len() < FIXED_HEADER + 32 || encoded[..4] != TRACE_BLOCK_MAGIC {
         return Err(TelemetryError::InvalidBlockEncoding(
@@ -292,56 +308,95 @@ pub fn decode_trace_block(encoded: &[u8]) -> TelemetryResult<Vec<DurableSpan>> {
             "trace sidecar count mismatch",
         ));
     }
-    offsets
-        .into_iter()
-        .zip(starts)
-        .zip(durations)
-        .zip(ids)
-        .zip(sidecars.spans)
-        .map(
-            |((((offset, start_time_unix_nanos), duration_nanos), ids), sidecar)| {
-                Ok(DurableSpan {
-                    stream_shard_id,
-                    record_ref: TelemetryRecordRef::for_signal(
-                        TelemetrySignal::Traces,
-                        topic_partition,
-                        LogicalOffset::new(offset),
-                    ),
-                    tenant: resolve_sidecar(&sidecars.tenants, sidecar.tenant_id, "tenant")?,
-                    resource: resolve_sidecar(
-                        &sidecars.resources,
-                        sidecar.resource_id,
-                        "resource",
-                    )?,
-                    scope: resolve_sidecar(&sidecars.scopes, sidecar.scope_id, "scope")?,
-                    trace_id: ids.0,
-                    span_id: ids.1,
-                    parent_span_id: ids.2,
-                    trace_state: resolve_sidecar(
-                        &sidecars.trace_states,
-                        sidecar.trace_state_id,
-                        "trace state",
-                    )?,
-                    flags: sidecar.flags,
-                    name: resolve_sidecar(&sidecars.names, sidecar.name_id, "name")?,
-                    kind: sidecar.kind,
-                    start_time_unix_nanos,
-                    duration_nanos,
-                    attributes: resolve_sidecar(
-                        &sidecars.attribute_sets,
-                        sidecar.attributes_id,
-                        "attributes",
-                    )?,
-                    dropped_attributes_count: sidecar.dropped_attributes_count,
-                    events: resolve_sidecar(&sidecars.event_sets, sidecar.events_id, "events")?,
-                    dropped_events_count: sidecar.dropped_events_count,
-                    links: resolve_sidecar(&sidecars.link_sets, sidecar.links_id, "links")?,
-                    dropped_links_count: sidecar.dropped_links_count,
-                    status: resolve_sidecar(&sidecars.statuses, sidecar.status_id, "status")?,
+    let mut decoded = Vec::with_capacity(query.map_or(count, |query| query.limit.min(count)));
+    for (ordinal, sidecar) in sidecars.spans.iter().enumerate() {
+        let tenant = trace_sidecar(&sidecars.tenants, sidecar.tenant_id, "tenant")?;
+        let resource = trace_sidecar(&sidecars.resources, sidecar.resource_id, "resource")?;
+        let scope = trace_sidecar(&sidecars.scopes, sidecar.scope_id, "scope")?;
+        let _ = trace_sidecar(
+            &sidecars.trace_states,
+            sidecar.trace_state_id,
+            "trace state",
+        )?;
+        let name = trace_sidecar(&sidecars.names, sidecar.name_id, "name")?;
+        let attributes = trace_sidecar(
+            &sidecars.attribute_sets,
+            sidecar.attributes_id,
+            "attributes",
+        )?;
+        let _ = trace_sidecar(&sidecars.event_sets, sidecar.events_id, "events")?;
+        let _ = trace_sidecar(&sidecars.link_sets, sidecar.links_id, "links")?;
+        let _ = trace_sidecar(&sidecars.statuses, sidecar.status_id, "status")?;
+        let (trace_id, span_id, _) = ids[ordinal];
+        let start_time_unix_nanos = starts[ordinal];
+        let duration_nanos = durations[ordinal];
+        if query.is_some_and(|query| {
+            tenant.as_ref() != query.tenant.as_ref()
+                || query
+                    .partition
+                    .is_some_and(|partition| partition != topic_partition)
+                || query.trace_id.is_some_and(|value| value != trace_id)
+                || query.span_id.is_some_and(|value| value != span_id)
+                || query
+                    .name
+                    .as_ref()
+                    .is_some_and(|value| value.as_ref() != name.as_ref())
+                || !rendered_attributes_match(attributes, &query.exact_attributes)
+                || !rendered_attributes_match(
+                    &resource.attributes,
+                    &query.exact_resource_attributes,
+                )
+                || !rendered_attributes_match(&scope.attributes, &query.exact_scope_attributes)
+                || query.start_time_unix_nanos.is_some_and(|start| {
+                    start_time_unix_nanos.saturating_add(duration_nanos) < start
                 })
-            },
-        )
-        .collect::<TelemetryResult<Vec<_>>>()
+                || query
+                    .end_time_unix_nanos
+                    .is_some_and(|end| start_time_unix_nanos >= end)
+                || query
+                    .min_duration_nanos
+                    .is_some_and(|minimum| duration_nanos < minimum)
+        }) {
+            continue;
+        }
+        let ids = ids[ordinal];
+        decoded.push(DurableSpan {
+            stream_shard_id,
+            record_ref: TelemetryRecordRef::for_signal(
+                TelemetrySignal::Traces,
+                topic_partition,
+                LogicalOffset::new(offsets[ordinal]),
+            ),
+            tenant: resolve_sidecar(&sidecars.tenants, sidecar.tenant_id, "tenant")?,
+            resource: resolve_sidecar(&sidecars.resources, sidecar.resource_id, "resource")?,
+            scope: resolve_sidecar(&sidecars.scopes, sidecar.scope_id, "scope")?,
+            trace_id: ids.0,
+            span_id: ids.1,
+            parent_span_id: ids.2,
+            trace_state: resolve_sidecar(
+                &sidecars.trace_states,
+                sidecar.trace_state_id,
+                "trace state",
+            )?,
+            flags: sidecar.flags,
+            name: resolve_sidecar(&sidecars.names, sidecar.name_id, "name")?,
+            kind: sidecar.kind,
+            start_time_unix_nanos,
+            duration_nanos,
+            attributes: resolve_sidecar(
+                &sidecars.attribute_sets,
+                sidecar.attributes_id,
+                "attributes",
+            )?,
+            dropped_attributes_count: sidecar.dropped_attributes_count,
+            events: resolve_sidecar(&sidecars.event_sets, sidecar.events_id, "events")?,
+            dropped_events_count: sidecar.dropped_events_count,
+            links: resolve_sidecar(&sidecars.link_sets, sidecar.links_id, "links")?,
+            dropped_links_count: sidecar.dropped_links_count,
+            status: resolve_sidecar(&sidecars.statuses, sidecar.status_id, "status")?,
+        });
+    }
+    Ok(decoded)
 }
 
 fn encode_trace_sidecars(records: &[&DurableSpan]) -> TelemetryResult<TraceBlockSidecars> {
@@ -446,9 +501,12 @@ impl<T: Clone + Eq + Hash> SidecarInterner<T> {
 }
 
 fn resolve_sidecar<T: Clone>(values: &[T], id: u32, lane: &'static str) -> TelemetryResult<T> {
+    trace_sidecar(values, id, lane).cloned()
+}
+
+fn trace_sidecar<'a, T>(values: &'a [T], id: u32, lane: &'static str) -> TelemetryResult<&'a T> {
     values
         .get(id as usize)
-        .cloned()
         .ok_or(TelemetryError::InvalidBlockEncoding(match lane {
             "tenant" => "trace tenant sidecar ID is out of range",
             "resource" => "trace resource sidecar ID is out of range",
@@ -762,8 +820,23 @@ pub struct TraceSummary {
 pub struct TraceQuery {
     /// Required tenant.
     pub tenant: Arc<str>,
+    /// Optional logical partition for bounded analytical scans.
+    pub partition: Option<TopicPartition>,
+    /// Optional inclusive durable-offset cursor. Applied after conflict
+    /// resolution so pagination never resurrects an obsolete span version.
+    pub start_offset: Option<LogicalOffset>,
     /// Exact trace ID for direct lookup.
     pub trace_id: Option<TraceId>,
+    /// Exact span ID for indexed analytical filtering.
+    pub span_id: Option<SpanId>,
+    /// Exact span operation name.
+    pub name: Option<Arc<str>>,
+    /// Exact rendered span attributes.
+    pub exact_attributes: Arc<Vec<(Arc<str>, Arc<str>)>>,
+    /// Exact rendered resource attributes.
+    pub exact_resource_attributes: Arc<Vec<(Arc<str>, Arc<str>)>>,
+    /// Exact rendered scope attributes.
+    pub exact_scope_attributes: Arc<Vec<(Arc<str>, Arc<str>)>>,
     /// Inclusive lower start-time bound.
     pub start_time_unix_nanos: Option<u64>,
     /// Exclusive upper start-time bound.
@@ -1304,10 +1377,8 @@ impl TraceStripe {
         }
         let mut winners = BTreeMap::<(Arc<str>, TraceId, SpanId), DurableSpan>::new();
         for payload in self.sealed_blocks.values() {
-            for span in decode_trace_block(payload)? {
-                if trace_query_matches(query, &span) {
-                    retain_newest_span(&mut winners, span);
-                }
+            for span in decode_trace_block_matching(payload, query)? {
+                retain_newest_span(&mut winners, span);
             }
         }
         for span in self
@@ -1320,33 +1391,26 @@ impl TraceStripe {
                         .is_none_or(|requested| requested == *trace_id)
             })
             .flat_map(|(_, trace)| trace.spans.values())
-            .filter(|span| {
-                query
-                    .start_time_unix_nanos
-                    .is_none_or(|start| span.end_time_unix_nanos().unwrap_or(u64::MAX) >= start)
-            })
-            .filter(|span| {
-                query
-                    .end_time_unix_nanos
-                    .is_none_or(|end| span.start_time_unix_nanos < end)
-            })
-            .filter(|span| {
-                query
-                    .min_duration_nanos
-                    .is_none_or(|duration| span.duration_nanos >= duration)
-            })
+            .filter(|span| trace_query_matches(query, span))
             .cloned()
         {
             retain_newest_span(&mut winners, span);
         }
-        let mut spans = winners.into_values().collect::<Vec<_>>();
-        spans.sort_unstable_by_key(|span| {
-            (
-                span.trace_id,
-                span.start_time_unix_nanos,
-                span.record_ref.offset,
-            )
-        });
+        let mut spans = winners
+            .into_values()
+            .filter(|span| trace_query_cursor_matches(query, span))
+            .collect::<Vec<_>>();
+        if query.partition.is_some() {
+            spans.sort_unstable_by_key(|span| span.record_ref.offset);
+        } else {
+            spans.sort_unstable_by_key(|span| {
+                (
+                    span.trace_id,
+                    span.start_time_unix_nanos,
+                    span.record_ref.offset,
+                )
+            });
+        }
         spans.truncate(limit);
         Ok(spans)
     }
@@ -1364,10 +1428,8 @@ impl TraceStripe {
                 let Some(payload) = self.sealed_blocks.get(block_id) else {
                     continue;
                 };
-                for span in decode_trace_block(payload)? {
-                    if trace_query_matches(query, &span) {
-                        retain_exact_trace_span(&mut winners, span);
-                    }
+                for span in decode_trace_block_matching(payload, query)? {
+                    retain_exact_trace_span(&mut winners, span);
                 }
             }
         }
@@ -1380,8 +1442,15 @@ impl TraceStripe {
                 retain_exact_trace_span(&mut winners, span.clone());
             }
         }
-        let mut spans = winners.into_values().collect::<Vec<_>>();
-        spans.sort_unstable_by_key(|span| (span.start_time_unix_nanos, span.record_ref.offset));
+        let mut spans = winners
+            .into_values()
+            .filter(|span| trace_query_cursor_matches(query, span))
+            .collect::<Vec<_>>();
+        if query.partition.is_some() {
+            spans.sort_unstable_by_key(|span| span.record_ref.offset);
+        } else {
+            spans.sort_unstable_by_key(|span| (span.start_time_unix_nanos, span.record_ref.offset));
+        }
         spans.truncate(limit);
         Ok(spans)
     }
@@ -1401,7 +1470,18 @@ impl TraceStripe {
 
 pub(crate) fn trace_query_matches(query: &TraceQuery, span: &DurableSpan) -> bool {
     span.tenant == query.tenant
+        && query
+            .partition
+            .is_none_or(|partition| partition == span.record_ref.topic_partition)
         && query.trace_id.is_none_or(|value| value == span.trace_id)
+        && query.span_id.is_none_or(|value| value == span.span_id)
+        && query
+            .name
+            .as_ref()
+            .is_none_or(|value| value.as_ref() == span.name.as_ref())
+        && rendered_attributes_match(&span.attributes, &query.exact_attributes)
+        && rendered_attributes_match(&span.resource.attributes, &query.exact_resource_attributes)
+        && rendered_attributes_match(&span.scope.attributes, &query.exact_scope_attributes)
         && query
             .start_time_unix_nanos
             .is_none_or(|start| span.end_time_unix_nanos().unwrap_or(u64::MAX) >= start)
@@ -1411,6 +1491,51 @@ pub(crate) fn trace_query_matches(query: &TraceQuery, span: &DurableSpan) -> boo
         && query
             .min_duration_nanos
             .is_none_or(|duration| span.duration_nanos >= duration)
+}
+
+fn rendered_attributes_match(
+    attributes: &[TelemetryAttribute],
+    expected: &[(Arc<str>, Arc<str>)],
+) -> bool {
+    expected.iter().all(|(key, expected_value)| {
+        attributes.iter().any(|attribute| {
+            attribute.key.as_ref() == key.as_ref()
+                && attribute.value.as_ref().is_some_and(|value| {
+                    telemetry_value_matches_rendered(value, expected_value.as_ref())
+                })
+        })
+    })
+}
+
+fn telemetry_value_matches_rendered(value: &crate::TelemetryValue, expected: &str) -> bool {
+    match value {
+        crate::TelemetryValue::Empty => expected.is_empty(),
+        crate::TelemetryValue::String(value) => value.as_ref() == expected,
+        crate::TelemetryValue::Boolean(value) => {
+            (*value && expected == "true") || (!*value && expected == "false")
+        }
+        crate::TelemetryValue::Integer(value) => expected.parse::<i64>() == Ok(*value),
+        crate::TelemetryValue::DoubleBits(bits) => f64::from_bits(*bits).to_string() == expected,
+        crate::TelemetryValue::Bytes(value) => {
+            value.len().saturating_mul(2) == expected.len()
+                && value
+                    .iter()
+                    .zip(expected.as_bytes().chunks_exact(2))
+                    .all(|(byte, pair)| {
+                        u8::from_str_radix(std::str::from_utf8(pair).unwrap_or(""), 16) == Ok(*byte)
+                    })
+        }
+        crate::TelemetryValue::StringTableIndex(value) => expected.parse::<i32>() == Ok(*value),
+        crate::TelemetryValue::Array(_) | crate::TelemetryValue::Map(_) => {
+            serde_json::to_string(value).is_ok_and(|rendered| rendered == expected)
+        }
+    }
+}
+
+fn trace_query_cursor_matches(query: &TraceQuery, span: &DurableSpan) -> bool {
+    query
+        .start_offset
+        .is_none_or(|offset| span.record_ref.offset >= offset)
 }
 
 fn same_span_payload(left: &DurableSpan, right: &DurableSpan) -> bool {
@@ -1523,6 +1648,71 @@ mod tests {
         assert_eq!(decoded[0], records[2]);
         assert_eq!(decoded[1], records[1]);
         assert_eq!(decoded[2], records[0]);
+    }
+
+    #[test]
+    fn analytical_trace_pushdown_matches_exact_ids_names_and_rendered_attributes() {
+        let mut record = span(1, 1, 2);
+        record.resource = Arc::new(ResourceContext {
+            attributes: Arc::new(vec![TelemetryAttribute::new(
+                "service.name",
+                crate::TelemetryValue::String(Arc::from("checkout-api")),
+            )]),
+            ..ResourceContext::default()
+        });
+        let query = TraceQuery {
+            tenant: Arc::from("tenant-a"),
+            trace_id: Some(record.trace_id),
+            span_id: Some(record.span_id),
+            name: Some(Arc::clone(&record.name)),
+            exact_attributes: Arc::new(vec![(Arc::from("http.status_code"), Arc::from("200"))]),
+            exact_resource_attributes: Arc::new(vec![(
+                Arc::from("service.name"),
+                Arc::from("checkout-api"),
+            )]),
+            limit: 1,
+            ..TraceQuery::default()
+        };
+        assert!(trace_query_matches(&query, &record));
+
+        let mut mismatch = query;
+        mismatch.exact_resource_attributes = Arc::new(vec![(
+            Arc::from("service.name"),
+            Arc::from("inventory-api"),
+        )]);
+        assert!(!trace_query_matches(&mismatch, &record));
+    }
+
+    #[test]
+    fn selective_trace_decode_materializes_only_matching_sidecars() {
+        let with_service = |offset, trace_byte, span_byte, service: &'static str| {
+            let mut record = span(offset, trace_byte, span_byte);
+            record.resource = Arc::new(ResourceContext {
+                attributes: Arc::new(vec![TelemetryAttribute::new(
+                    "service.name",
+                    crate::TelemetryValue::String(Arc::from(service)),
+                )]),
+                ..ResourceContext::default()
+            });
+            record
+        };
+        let expected = with_service(1, 1, 1, "checkout-api");
+        let other = with_service(2, 2, 2, "inventory-api");
+        let encoded = encode_trace_block(&[other, expected.clone()]).unwrap();
+        let decoded = decode_trace_block_matching(
+            &encoded,
+            &TraceQuery {
+                tenant: Arc::from("tenant-a"),
+                exact_resource_attributes: Arc::new(vec![(
+                    Arc::from("service.name"),
+                    Arc::from("checkout-api"),
+                )]),
+                limit: 10,
+                ..TraceQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded, vec![expected]);
     }
 
     #[test]
@@ -1677,6 +1867,26 @@ mod tests {
         let spans = stripe.query(&query).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name.as_ref(), "changed");
+
+        let paged = stripe
+            .query(&TraceQuery {
+                partition: Some(spans[0].record_ref.topic_partition),
+                start_offset: Some(LogicalOffset::new(3)),
+                ..query.clone()
+            })
+            .unwrap();
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].record_ref.offset, LogicalOffset::new(3));
+        assert!(
+            stripe
+                .query(&TraceQuery {
+                    partition: Some(spans[0].record_ref.topic_partition),
+                    start_offset: Some(LogicalOffset::new(4)),
+                    ..query
+                })
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

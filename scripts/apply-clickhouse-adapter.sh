@@ -28,9 +28,9 @@ for adapter_file in StorageShardTelemetry.h StorageShardTelemetry.cpp; do
     fi
 done
 
-if ! rg -q 'registerStorageShardTelemetry' "$CLICKHOUSE_SOURCE/src/Storages/registerStorages.cpp"; then
-    git -C "$CLICKHOUSE_SOURCE" apply --check "$ADAPTER_DIR/register-storage-shardtelemetry.patch"
-    git -C "$CLICKHOUSE_SOURCE" apply "$ADAPTER_DIR/register-storage-shardtelemetry.patch"
+if ! grep -q 'registerStorageShardTelemetry' "$CLICKHOUSE_SOURCE/src/Storages/registerStorages.cpp"; then
+    git -C "$CLICKHOUSE_SOURCE" apply --check "$ADAPTER_DIR/register-storage-shard-telemetry.patch"
+    git -C "$CLICKHOUSE_SOURCE" apply "$ADAPTER_DIR/register-storage-shard-telemetry.patch"
 fi
 
 install -m 0644 "$ADAPTER_DIR/StorageShardTelemetry.h" "$CLICKHOUSE_SOURCE/src/Storages/StorageShardTelemetry.h"

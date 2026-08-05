@@ -316,6 +316,14 @@ pub enum LogPredicate {
     MatchNone,
     /// Matches one case-insensitive token produced by ShardTelemetry's scanner.
     Term(Arc<str>),
+    /// Matches one message token with explicit case semantics and exact
+    /// ClickHouse-compatible ASCII token boundaries.
+    MessageToken {
+        /// Token bytes to match.
+        value: Arc<str>,
+        /// Whether ASCII letter case is significant.
+        case_sensitivity: CaseSensitivity,
+    },
     /// Matches the complete message with a literal text operation.
     Message(TextMatcher),
     /// Matches the complete message with a validated regular expression.
@@ -365,6 +373,16 @@ impl LogPredicate {
     #[must_use]
     pub fn term(term: impl Into<Arc<str>>) -> Self {
         Self::Term(term.into())
+    }
+
+    /// Creates an exact token predicate with ClickHouse-compatible ASCII
+    /// token boundaries.
+    #[must_use]
+    pub fn message_token(value: impl Into<Arc<str>>, case_sensitivity: CaseSensitivity) -> Self {
+        Self::MessageToken {
+            value: value.into(),
+            case_sensitivity,
+        }
     }
 
     /// Creates a literal message predicate.

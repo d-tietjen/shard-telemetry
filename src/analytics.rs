@@ -3,9 +3,10 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    MapBuilder, StringBuilder, TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
+    BooleanBuilder, Int32Builder, Int64Builder, MapBuilder, StringBuilder,
+    TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
 };
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use axum::body::{Body, Bytes};
@@ -15,124 +16,587 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::loki_api::LokiApiError;
-use crate::query::message_has_term;
-use crate::{LokiStore, MetadataField};
+use crate::query::{message_has_clickhouse_token, message_has_term};
+use crate::{
+    CaseSensitivity, DurableLog, DurableMetricPoint, DurableSpan, LokiStore, MetadataField,
+    MetricKind, MetricValue, NumberValue, SeriesFingerprint, SpanId, TelemetryAttribute,
+    TelemetryValue, TraceId,
+};
 
 /// Pinned ClickHouse release whose evaluator defines ShardTelemetry SQL semantics.
 pub const CLICKHOUSE_COMPATIBILITY_TARGET: &str = "26.3.17.56-lts";
 
-/// Version of the typed columnar boundary exposed to analytical engines.
+/// The only pre-release analytical schema and protocol version.
 pub const ANALYTICS_SCHEMA_VERSION: u16 = 1;
 
-const DEFAULT_SCAN_BATCH_ROWS: usize = 8_192;
+pub(crate) const DEFAULT_SCAN_BATCH_ROWS: usize = 8_192;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
-/// One stable column available from ShardTelemetry's analytical scan boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum AnalyticsColumn {
-    /// Loki tenant owning the record.
-    Tenant,
-    /// Event timestamp as a nanosecond Arrow timestamp in UTC.
-    Timestamp,
-    /// Logical shard-stream partition number.
-    Partition,
-    /// Durable logical offset inside the partition.
-    Offset,
-    /// Original log message.
-    Message,
-    /// Loki stream labels encoded as a native string map.
-    Labels,
-    /// Structured metadata encoded as a native string map.
-    Metadata,
+/// Exact timestamp order that the analytical storage layer may apply before
+/// a bounded log scan is returned to ClickHouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticsScanOrder {
+    /// Oldest timestamp first, with durable offset as the stable tie-breaker.
+    TimestampAscending,
+    /// Newest timestamp first, with durable offset as the stable tie-breaker.
+    TimestampDescending,
 }
 
-impl AnalyticsColumn {
-    /// All columns in stable wire order.
-    pub const ALL: [Self; 7] = [
-        Self::Tenant,
-        Self::Timestamp,
-        Self::Partition,
-        Self::Offset,
-        Self::Message,
-        Self::Labels,
-        Self::Metadata,
-    ];
+/// A stable telemetry relation exposed to ClickHouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AnalyticsRelation {
+    /// One row per log record.
+    Logs,
+    /// One row per winning span version.
+    Spans,
+    /// One row per nested span event.
+    SpanEvents,
+    /// One row per nested span link.
+    SpanLinks,
+    /// One row per winning raw metric point.
+    MetricPoints,
+    /// One row per nested metric exemplar.
+    MetricExemplars,
+}
 
-    /// Stable wire name used by Arrow and ClickHouse.
+impl AnalyticsRelation {
+    /// Stable v1 wire name.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Tenant => "tenant",
-            Self::Timestamp => "timestamp",
-            Self::Partition => "partition",
-            Self::Offset => "offset",
-            Self::Message => "message",
-            Self::Labels => "labels",
-            Self::Metadata => "metadata",
+            Self::Logs => "logs",
+            Self::Spans => "spans",
+            Self::SpanEvents => "span_events",
+            Self::SpanLinks => "span_links",
+            Self::MetricPoints => "metric_points",
+            Self::MetricExemplars => "metric_exemplars",
         }
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
-            "tenant" => Some(Self::Tenant),
-            "timestamp" => Some(Self::Timestamp),
-            "partition" => Some(Self::Partition),
-            "offset" => Some(Self::Offset),
-            "message" => Some(Self::Message),
-            "labels" => Some(Self::Labels),
-            "metadata" => Some(Self::Metadata),
+            "logs" => Some(Self::Logs),
+            "spans" => Some(Self::Spans),
+            "span_events" => Some(Self::SpanEvents),
+            "span_links" => Some(Self::SpanLinks),
+            "metric_points" | "metrics" => Some(Self::MetricPoints),
+            "metric_exemplars" => Some(Self::MetricExemplars),
             _ => None,
         }
     }
 
-    fn field(self) -> Field {
-        let data_type = match self {
-            Self::Tenant | Self::Message => DataType::Utf8,
-            Self::Labels | Self::Metadata => string_map_data_type(),
-            Self::Timestamp => {
-                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::<str>::from("UTC")))
-            }
-            Self::Partition => DataType::UInt32,
-            Self::Offset => DataType::UInt64,
-        };
-        Field::new(self.name(), data_type, false)
+    /// Columns available from this relation in stable wire order.
+    #[must_use]
+    pub const fn columns(self) -> &'static [AnalyticsColumn] {
+        match self {
+            Self::Logs => &LOG_COLUMNS,
+            Self::Spans => &SPAN_COLUMNS,
+            Self::SpanEvents => &SPAN_EVENT_COLUMNS,
+            Self::SpanLinks => &SPAN_LINK_COLUMNS,
+            Self::MetricPoints => &METRIC_COLUMNS,
+            Self::MetricExemplars => &METRIC_EXEMPLAR_COLUMNS,
+        }
+    }
+
+    #[must_use]
+    /// Parent telemetry signal containing this relation.
+    pub const fn signal(self) -> &'static str {
+        match self {
+            Self::Logs => "logs",
+            Self::Spans | Self::SpanEvents | Self::SpanLinks => "traces",
+            Self::MetricPoints | Self::MetricExemplars => "metrics",
+        }
     }
 }
 
-/// Bounded storage-level scan requested by an analytical query engine.
+/// One stable column available from at least one analytical relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[allow(missing_docs)]
+pub enum AnalyticsColumn {
+    Tenant,
+    Signal,
+    Timestamp,
+    ParentTimestamp,
+    ObservedTimestamp,
+    StartTimestamp,
+    EndTimestamp,
+    Partition,
+    Offset,
+    Ordinal,
+    ResourceId,
+    ScopeId,
+    TraceId,
+    SpanId,
+    ParentSpanId,
+    LinkedTraceId,
+    LinkedSpanId,
+    SeriesId,
+    Message,
+    BodyJson,
+    Name,
+    EventName,
+    SeverityNumber,
+    SeverityText,
+    Kind,
+    DurationNanos,
+    StatusCode,
+    StatusMessage,
+    TraceState,
+    Flags,
+    DroppedAttributesCount,
+    DroppedEventsCount,
+    DroppedLinksCount,
+    Labels,
+    Metadata,
+    Attributes,
+    ResourceAttributes,
+    ScopeAttributes,
+    AttributeIds,
+    ResourceAttributeIds,
+    ScopeAttributeIds,
+    AttributesJson,
+    ResourceAttributesJson,
+    ScopeAttributesJson,
+    EventsJson,
+    LinksJson,
+    Description,
+    Unit,
+    MetricKind,
+    Temporality,
+    Monotonic,
+    ValueType,
+    ScalarInteger,
+    ScalarDoubleBits,
+    ValueJson,
+    ExemplarsJson,
+}
+
+impl AnalyticsColumn {
+    /// Stable Arrow and ClickHouse column name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Tenant => "tenant",
+            Self::Signal => "signal",
+            Self::Timestamp => "timestamp",
+            Self::ParentTimestamp => "parent_timestamp",
+            Self::ObservedTimestamp => "observed_timestamp",
+            Self::StartTimestamp => "start_timestamp",
+            Self::EndTimestamp => "end_timestamp",
+            Self::Partition => "partition",
+            Self::Offset => "offset",
+            Self::Ordinal => "ordinal",
+            Self::ResourceId => "resource_id",
+            Self::ScopeId => "scope_id",
+            Self::TraceId => "trace_id",
+            Self::SpanId => "span_id",
+            Self::ParentSpanId => "parent_span_id",
+            Self::LinkedTraceId => "linked_trace_id",
+            Self::LinkedSpanId => "linked_span_id",
+            Self::SeriesId => "series_id",
+            Self::Message => "message",
+            Self::BodyJson => "body_json",
+            Self::Name => "name",
+            Self::EventName => "event_name",
+            Self::SeverityNumber => "severity_number",
+            Self::SeverityText => "severity_text",
+            Self::Kind => "kind",
+            Self::DurationNanos => "duration_nanos",
+            Self::StatusCode => "status_code",
+            Self::StatusMessage => "status_message",
+            Self::TraceState => "trace_state",
+            Self::Flags => "flags",
+            Self::DroppedAttributesCount => "dropped_attributes_count",
+            Self::DroppedEventsCount => "dropped_events_count",
+            Self::DroppedLinksCount => "dropped_links_count",
+            Self::Labels => "labels",
+            Self::Metadata => "metadata",
+            Self::Attributes => "attributes",
+            Self::ResourceAttributes => "resource_attributes",
+            Self::ScopeAttributes => "scope_attributes",
+            Self::AttributeIds => "attribute_ids",
+            Self::ResourceAttributeIds => "resource_attribute_ids",
+            Self::ScopeAttributeIds => "scope_attribute_ids",
+            Self::AttributesJson => "attributes_json",
+            Self::ResourceAttributesJson => "resource_attributes_json",
+            Self::ScopeAttributesJson => "scope_attributes_json",
+            Self::EventsJson => "events_json",
+            Self::LinksJson => "links_json",
+            Self::Description => "description",
+            Self::Unit => "unit",
+            Self::MetricKind => "metric_kind",
+            Self::Temporality => "temporality",
+            Self::Monotonic => "monotonic",
+            Self::ValueType => "value_type",
+            Self::ScalarInteger => "scalar_integer",
+            Self::ScalarDoubleBits => "scalar_double_bits",
+            Self::ValueJson => "value_json",
+            Self::ExemplarsJson => "exemplars_json",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        ALL_COLUMNS
+            .iter()
+            .copied()
+            .find(|column| column.name() == value)
+    }
+
+    fn nullable(self) -> bool {
+        !matches!(
+            self,
+            Self::Tenant
+                | Self::Signal
+                | Self::Timestamp
+                | Self::Partition
+                | Self::Offset
+                | Self::Labels
+                | Self::Metadata
+                | Self::Attributes
+                | Self::ResourceAttributes
+                | Self::ScopeAttributes
+                | Self::AttributeIds
+                | Self::ResourceAttributeIds
+                | Self::ScopeAttributeIds
+        )
+    }
+
+    fn field(self) -> Field {
+        let data_type = match self {
+            Self::Timestamp
+            | Self::ParentTimestamp
+            | Self::ObservedTimestamp
+            | Self::StartTimestamp
+            | Self::EndTimestamp => {
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::<str>::from("UTC")))
+            }
+            Self::Partition
+            | Self::Ordinal
+            | Self::Flags
+            | Self::DroppedAttributesCount
+            | Self::DroppedEventsCount
+            | Self::DroppedLinksCount => DataType::UInt32,
+            Self::Offset | Self::DurationNanos | Self::ScalarDoubleBits => DataType::UInt64,
+            Self::SeverityNumber | Self::Kind | Self::StatusCode | Self::Temporality => {
+                DataType::Int32
+            }
+            Self::ScalarInteger => DataType::Int64,
+            Self::Monotonic => DataType::Boolean,
+            Self::Labels
+            | Self::Metadata
+            | Self::Attributes
+            | Self::ResourceAttributes
+            | Self::ScopeAttributes
+            | Self::AttributeIds
+            | Self::ResourceAttributeIds
+            | Self::ScopeAttributeIds => string_map_data_type(),
+            _ => DataType::Utf8,
+        };
+        Field::new(self.name(), data_type, self.nullable())
+    }
+}
+
+const ALL_COLUMNS: [AnalyticsColumn; 56] = [
+    AnalyticsColumn::Tenant,
+    AnalyticsColumn::Signal,
+    AnalyticsColumn::Timestamp,
+    AnalyticsColumn::ParentTimestamp,
+    AnalyticsColumn::ObservedTimestamp,
+    AnalyticsColumn::StartTimestamp,
+    AnalyticsColumn::EndTimestamp,
+    AnalyticsColumn::Partition,
+    AnalyticsColumn::Offset,
+    AnalyticsColumn::Ordinal,
+    AnalyticsColumn::ResourceId,
+    AnalyticsColumn::ScopeId,
+    AnalyticsColumn::TraceId,
+    AnalyticsColumn::SpanId,
+    AnalyticsColumn::ParentSpanId,
+    AnalyticsColumn::LinkedTraceId,
+    AnalyticsColumn::LinkedSpanId,
+    AnalyticsColumn::SeriesId,
+    AnalyticsColumn::Message,
+    AnalyticsColumn::BodyJson,
+    AnalyticsColumn::Name,
+    AnalyticsColumn::EventName,
+    AnalyticsColumn::SeverityNumber,
+    AnalyticsColumn::SeverityText,
+    AnalyticsColumn::Kind,
+    AnalyticsColumn::DurationNanos,
+    AnalyticsColumn::StatusCode,
+    AnalyticsColumn::StatusMessage,
+    AnalyticsColumn::TraceState,
+    AnalyticsColumn::Flags,
+    AnalyticsColumn::DroppedAttributesCount,
+    AnalyticsColumn::DroppedEventsCount,
+    AnalyticsColumn::DroppedLinksCount,
+    AnalyticsColumn::Labels,
+    AnalyticsColumn::Metadata,
+    AnalyticsColumn::Attributes,
+    AnalyticsColumn::ResourceAttributes,
+    AnalyticsColumn::ScopeAttributes,
+    AnalyticsColumn::AttributeIds,
+    AnalyticsColumn::ResourceAttributeIds,
+    AnalyticsColumn::ScopeAttributeIds,
+    AnalyticsColumn::AttributesJson,
+    AnalyticsColumn::ResourceAttributesJson,
+    AnalyticsColumn::ScopeAttributesJson,
+    AnalyticsColumn::EventsJson,
+    AnalyticsColumn::LinksJson,
+    AnalyticsColumn::Description,
+    AnalyticsColumn::Unit,
+    AnalyticsColumn::MetricKind,
+    AnalyticsColumn::Temporality,
+    AnalyticsColumn::Monotonic,
+    AnalyticsColumn::ValueType,
+    AnalyticsColumn::ScalarInteger,
+    AnalyticsColumn::ScalarDoubleBits,
+    AnalyticsColumn::ValueJson,
+    AnalyticsColumn::ExemplarsJson,
+];
+
+const BASE: [AnalyticsColumn; 9] = [
+    AnalyticsColumn::Tenant,
+    AnalyticsColumn::Signal,
+    AnalyticsColumn::Timestamp,
+    AnalyticsColumn::Partition,
+    AnalyticsColumn::Offset,
+    AnalyticsColumn::ResourceId,
+    AnalyticsColumn::ScopeId,
+    AnalyticsColumn::TraceId,
+    AnalyticsColumn::SpanId,
+];
+
+const LOG_COLUMNS: [AnalyticsColumn; 28] = [
+    BASE[0],
+    BASE[1],
+    BASE[2],
+    AnalyticsColumn::ObservedTimestamp,
+    BASE[3],
+    BASE[4],
+    BASE[5],
+    BASE[6],
+    BASE[7],
+    BASE[8],
+    AnalyticsColumn::Message,
+    AnalyticsColumn::BodyJson,
+    AnalyticsColumn::SeverityNumber,
+    AnalyticsColumn::SeverityText,
+    AnalyticsColumn::EventName,
+    AnalyticsColumn::Flags,
+    AnalyticsColumn::DroppedAttributesCount,
+    AnalyticsColumn::Labels,
+    AnalyticsColumn::Metadata,
+    AnalyticsColumn::Attributes,
+    AnalyticsColumn::ResourceAttributes,
+    AnalyticsColumn::ScopeAttributes,
+    AnalyticsColumn::AttributeIds,
+    AnalyticsColumn::ResourceAttributeIds,
+    AnalyticsColumn::ScopeAttributeIds,
+    AnalyticsColumn::AttributesJson,
+    AnalyticsColumn::ResourceAttributesJson,
+    AnalyticsColumn::ScopeAttributesJson,
+];
+
+const SPAN_COLUMNS: [AnalyticsColumn; 32] = [
+    BASE[0],
+    BASE[1],
+    BASE[2],
+    AnalyticsColumn::EndTimestamp,
+    BASE[3],
+    BASE[4],
+    BASE[5],
+    BASE[6],
+    BASE[7],
+    BASE[8],
+    AnalyticsColumn::ParentSpanId,
+    AnalyticsColumn::Name,
+    AnalyticsColumn::Kind,
+    AnalyticsColumn::DurationNanos,
+    AnalyticsColumn::StatusCode,
+    AnalyticsColumn::StatusMessage,
+    AnalyticsColumn::TraceState,
+    AnalyticsColumn::Flags,
+    AnalyticsColumn::DroppedAttributesCount,
+    AnalyticsColumn::DroppedEventsCount,
+    AnalyticsColumn::DroppedLinksCount,
+    AnalyticsColumn::Attributes,
+    AnalyticsColumn::ResourceAttributes,
+    AnalyticsColumn::ScopeAttributes,
+    AnalyticsColumn::AttributeIds,
+    AnalyticsColumn::ResourceAttributeIds,
+    AnalyticsColumn::ScopeAttributeIds,
+    AnalyticsColumn::AttributesJson,
+    AnalyticsColumn::ResourceAttributesJson,
+    AnalyticsColumn::ScopeAttributesJson,
+    AnalyticsColumn::EventsJson,
+    AnalyticsColumn::LinksJson,
+];
+
+const SPAN_EVENT_COLUMNS: [AnalyticsColumn; 20] = [
+    BASE[0],
+    BASE[1],
+    BASE[2],
+    AnalyticsColumn::ParentTimestamp,
+    BASE[3],
+    BASE[4],
+    BASE[5],
+    BASE[6],
+    BASE[7],
+    BASE[8],
+    AnalyticsColumn::Ordinal,
+    AnalyticsColumn::Name,
+    AnalyticsColumn::DroppedAttributesCount,
+    AnalyticsColumn::Attributes,
+    AnalyticsColumn::ResourceAttributes,
+    AnalyticsColumn::ScopeAttributes,
+    AnalyticsColumn::AttributeIds,
+    AnalyticsColumn::AttributesJson,
+    AnalyticsColumn::ResourceAttributesJson,
+    AnalyticsColumn::ScopeAttributesJson,
+];
+
+const SPAN_LINK_COLUMNS: [AnalyticsColumn; 22] = [
+    BASE[0],
+    BASE[1],
+    BASE[2],
+    BASE[3],
+    BASE[4],
+    BASE[5],
+    BASE[6],
+    BASE[7],
+    BASE[8],
+    AnalyticsColumn::Ordinal,
+    AnalyticsColumn::LinkedTraceId,
+    AnalyticsColumn::LinkedSpanId,
+    AnalyticsColumn::TraceState,
+    AnalyticsColumn::Flags,
+    AnalyticsColumn::DroppedAttributesCount,
+    AnalyticsColumn::Attributes,
+    AnalyticsColumn::ResourceAttributes,
+    AnalyticsColumn::ScopeAttributes,
+    AnalyticsColumn::AttributeIds,
+    AnalyticsColumn::AttributesJson,
+    AnalyticsColumn::ResourceAttributesJson,
+    AnalyticsColumn::ScopeAttributesJson,
+];
+
+const METRIC_COLUMNS: [AnalyticsColumn; 32] = [
+    BASE[0],
+    BASE[1],
+    BASE[2],
+    AnalyticsColumn::StartTimestamp,
+    BASE[3],
+    BASE[4],
+    BASE[5],
+    BASE[6],
+    AnalyticsColumn::SeriesId,
+    AnalyticsColumn::Name,
+    AnalyticsColumn::Description,
+    AnalyticsColumn::Unit,
+    AnalyticsColumn::MetricKind,
+    AnalyticsColumn::Temporality,
+    AnalyticsColumn::Monotonic,
+    AnalyticsColumn::Flags,
+    AnalyticsColumn::ValueType,
+    AnalyticsColumn::ScalarInteger,
+    AnalyticsColumn::ScalarDoubleBits,
+    AnalyticsColumn::ValueJson,
+    AnalyticsColumn::Labels,
+    AnalyticsColumn::Metadata,
+    AnalyticsColumn::Attributes,
+    AnalyticsColumn::ResourceAttributes,
+    AnalyticsColumn::ScopeAttributes,
+    AnalyticsColumn::AttributeIds,
+    AnalyticsColumn::ResourceAttributeIds,
+    AnalyticsColumn::ScopeAttributeIds,
+    AnalyticsColumn::AttributesJson,
+    AnalyticsColumn::ResourceAttributesJson,
+    AnalyticsColumn::ScopeAttributesJson,
+    AnalyticsColumn::ExemplarsJson,
+];
+
+const METRIC_EXEMPLAR_COLUMNS: [AnalyticsColumn; 21] = [
+    BASE[0],
+    BASE[1],
+    BASE[2],
+    AnalyticsColumn::ParentTimestamp,
+    BASE[3],
+    BASE[4],
+    BASE[5],
+    BASE[6],
+    AnalyticsColumn::TraceId,
+    AnalyticsColumn::SpanId,
+    AnalyticsColumn::SeriesId,
+    AnalyticsColumn::Ordinal,
+    AnalyticsColumn::Name,
+    AnalyticsColumn::ValueType,
+    AnalyticsColumn::ScalarInteger,
+    AnalyticsColumn::ScalarDoubleBits,
+    AnalyticsColumn::Attributes,
+    AnalyticsColumn::AttributeIds,
+    AnalyticsColumn::AttributesJson,
+    AnalyticsColumn::Labels,
+    AnalyticsColumn::Metadata,
+];
+
+/// Bounded storage-level scan requested by ClickHouse.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)]
 pub struct AnalyticsScanRequest {
-    /// Tenant to scan.
     pub tenant: Arc<str>,
-    /// Inclusive event timestamp lower bound.
+    pub relation: AnalyticsRelation,
     pub start_timestamp_unix_nanos: Option<u64>,
-    /// Exclusive event timestamp upper bound.
     pub end_timestamp_unix_nanos: Option<u64>,
-    /// Case-insensitive indexed message terms combined with AND semantics.
     pub terms: Vec<Arc<str>>,
-    /// Exact Loki stream-label constraints combined with AND semantics.
+    pub message_tokens: Vec<Arc<str>>,
+    pub case_insensitive_message_tokens: Vec<Arc<str>>,
     pub labels: Vec<MetadataField>,
-    /// Exact structured-metadata constraints combined with AND semantics.
     pub metadata: Vec<MetadataField>,
-    /// Columns emitted in stable request order.
-    pub projection: Vec<AnalyticsColumn>,
-    /// Optional global row limit.
+    pub attributes: Vec<MetadataField>,
+    pub resource_attributes: Vec<MetadataField>,
+    pub scope_attributes: Vec<MetadataField>,
+    pub trace_id: Option<TraceId>,
+    pub span_id: Option<SpanId>,
+    pub series_id: Option<SeriesFingerprint>,
+    pub name: Option<Arc<str>>,
+    pub columns: Vec<AnalyticsColumn>,
     pub limit: Option<usize>,
+    pub cardinality_only: bool,
+    pub order: Option<AnalyticsScanOrder>,
 }
 
 impl AnalyticsScanRequest {
-    /// Creates an unbounded, full-column scan for one tenant.
+    /// Creates a full-column log scan for one tenant.
     #[must_use]
     pub fn new(tenant: impl Into<Arc<str>>) -> Self {
+        Self::for_relation(tenant, AnalyticsRelation::Logs)
+    }
+
+    /// Creates a full-column scan for one relation.
+    #[must_use]
+    pub fn for_relation(tenant: impl Into<Arc<str>>, relation: AnalyticsRelation) -> Self {
         Self {
             tenant: tenant.into(),
+            relation,
             start_timestamp_unix_nanos: None,
             end_timestamp_unix_nanos: None,
             terms: Vec::new(),
+            message_tokens: Vec::new(),
+            case_insensitive_message_tokens: Vec::new(),
             labels: Vec::new(),
             metadata: Vec::new(),
-            projection: AnalyticsColumn::ALL.to_vec(),
+            attributes: Vec::new(),
+            resource_attributes: Vec::new(),
+            scope_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            series_id: None,
+            name: None,
+            columns: relation.columns().to_vec(),
             limit: None,
+            cardinality_only: false,
+            order: None,
         }
     }
 
@@ -142,19 +606,40 @@ impl AnalyticsScanRequest {
                 "analytics tenant must not be empty",
             ));
         }
-        if self.projection.is_empty() {
+        if self.columns.is_empty() {
             return Err(LokiApiError::bad_request(
-                "analytics projection must contain at least one column",
+                "analytics columns must not be empty",
             ));
         }
-        let mut columns = BTreeSet::new();
-        if self
-            .projection
+        let allowed = self
+            .relation
+            .columns()
             .iter()
-            .any(|column| !columns.insert(*column))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut observed = BTreeSet::new();
+        if self
+            .columns
+            .iter()
+            .any(|column| !allowed.contains(column) || !observed.insert(*column))
         {
             return Err(LokiApiError::bad_request(
-                "analytics projection contains a duplicate column",
+                "analytics columns contain a duplicate or relation-incompatible column",
+            ));
+        }
+        if self.cardinality_only && self.columns != [AnalyticsColumn::Offset] {
+            return Err(LokiApiError::bad_request(
+                "cardinality_only requires the offset projection",
+            ));
+        }
+        if self.order.is_some() && self.relation != AnalyticsRelation::Logs {
+            return Err(LokiApiError::bad_request(
+                "ordered analytical scans are currently log-only",
+            ));
+        }
+        if self.order.is_some() && self.limit.is_none() {
+            return Err(LokiApiError::bad_request(
+                "ordered analytical scans require a bounded limit",
             ));
         }
         if self
@@ -166,43 +651,182 @@ impl AnalyticsScanRequest {
                 "analytics timestamp range must be non-empty",
             ));
         }
+        if self.relation != AnalyticsRelation::Logs
+            && (!self.terms.is_empty()
+                || !self.message_tokens.is_empty()
+                || !self.case_insensitive_message_tokens.is_empty())
+        {
+            return Err(LokiApiError::bad_request(
+                "term filtering is available only on the logs relation",
+            ));
+        }
         Ok(())
     }
 }
 
-/// One normalized row emitted by the analytical scan boundary.
+/// One normalized row shared by the relation-specific Arrow writers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnalyticsLogRow {
-    /// Tenant owning the record.
+#[allow(missing_docs)]
+pub struct AnalyticsRow {
     pub tenant: Arc<str>,
-    /// Event timestamp in Unix nanoseconds.
+    pub signal: Arc<str>,
     pub timestamp_unix_nanos: i64,
-    /// Logical partition number.
+    pub parent_timestamp_unix_nanos: Option<i64>,
+    pub observed_timestamp_unix_nanos: Option<i64>,
+    pub start_timestamp_unix_nanos: Option<i64>,
+    pub end_timestamp_unix_nanos: Option<i64>,
     pub partition: u32,
-    /// Durable logical offset.
     pub offset: u64,
-    /// Original message.
-    pub message: Arc<str>,
-    /// Loki stream labels.
+    pub ordinal: Option<u32>,
+    pub resource_id: Option<Arc<str>>,
+    pub scope_id: Option<Arc<str>>,
+    pub trace_id: Option<Arc<str>>,
+    pub span_id: Option<Arc<str>>,
+    pub parent_span_id: Option<Arc<str>>,
+    pub linked_trace_id: Option<Arc<str>>,
+    pub linked_span_id: Option<Arc<str>>,
+    pub series_id: Option<Arc<str>>,
+    pub message: Option<Arc<str>>,
+    pub body_json: Option<Arc<str>>,
+    pub name: Option<Arc<str>>,
+    pub event_name: Option<Arc<str>>,
+    pub severity_number: Option<i32>,
+    pub severity_text: Option<Arc<str>>,
+    pub kind: Option<i32>,
+    pub duration_nanos: Option<u64>,
+    pub status_code: Option<i32>,
+    pub status_message: Option<Arc<str>>,
+    pub trace_state: Option<Arc<str>>,
+    pub flags: Option<u32>,
+    pub dropped_attributes_count: Option<u32>,
+    pub dropped_events_count: Option<u32>,
+    pub dropped_links_count: Option<u32>,
     pub labels: BTreeMap<String, String>,
-    /// Structured metadata.
     pub metadata: BTreeMap<String, String>,
+    pub attributes: BTreeMap<String, String>,
+    pub resource_attributes: BTreeMap<String, String>,
+    pub scope_attributes: BTreeMap<String, String>,
+    pub attribute_ids: BTreeMap<String, String>,
+    pub resource_attribute_ids: BTreeMap<String, String>,
+    pub scope_attribute_ids: BTreeMap<String, String>,
+    pub attributes_json: Option<Arc<str>>,
+    pub resource_attributes_json: Option<Arc<str>>,
+    pub scope_attributes_json: Option<Arc<str>>,
+    pub events_json: Option<Arc<str>>,
+    pub links_json: Option<Arc<str>>,
+    pub description: Option<Arc<str>>,
+    pub unit: Option<Arc<str>>,
+    pub metric_kind: Option<Arc<str>>,
+    pub temporality: Option<i32>,
+    pub monotonic: Option<bool>,
+    pub value_type: Option<Arc<str>>,
+    pub scalar_integer: Option<i64>,
+    pub scalar_double_bits: Option<u64>,
+    pub value_json: Option<Arc<str>>,
+    pub exemplars_json: Option<Arc<str>>,
+}
+
+impl AnalyticsRow {
+    fn empty(
+        tenant: Arc<str>,
+        signal: &'static str,
+        timestamp_unix_nanos: u64,
+        partition: u32,
+        offset: u64,
+    ) -> Result<Self, LokiApiError> {
+        Ok(Self {
+            tenant,
+            signal: Arc::from(signal),
+            timestamp_unix_nanos: timestamp_i64(timestamp_unix_nanos)?,
+            parent_timestamp_unix_nanos: None,
+            observed_timestamp_unix_nanos: None,
+            start_timestamp_unix_nanos: None,
+            end_timestamp_unix_nanos: None,
+            partition,
+            offset,
+            ordinal: None,
+            resource_id: None,
+            scope_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            linked_trace_id: None,
+            linked_span_id: None,
+            series_id: None,
+            message: None,
+            body_json: None,
+            name: None,
+            event_name: None,
+            severity_number: None,
+            severity_text: None,
+            kind: None,
+            duration_nanos: None,
+            status_code: None,
+            status_message: None,
+            trace_state: None,
+            flags: None,
+            dropped_attributes_count: None,
+            dropped_events_count: None,
+            dropped_links_count: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            attributes: BTreeMap::new(),
+            resource_attributes: BTreeMap::new(),
+            scope_attributes: BTreeMap::new(),
+            attribute_ids: BTreeMap::new(),
+            resource_attribute_ids: BTreeMap::new(),
+            scope_attribute_ids: BTreeMap::new(),
+            attributes_json: None,
+            resource_attributes_json: None,
+            scope_attributes_json: None,
+            events_json: None,
+            links_json: None,
+            description: None,
+            unit: None,
+            metric_kind: None,
+            temporality: None,
+            monotonic: None,
+            value_type: None,
+            scalar_integer: None,
+            scalar_double_bits: None,
+            value_json: None,
+            exemplars_json: None,
+        })
+    }
 }
 
 pub(crate) fn parse_scan_request(
     tenant: String,
     raw_query: Option<&str>,
 ) -> Result<AnalyticsScanRequest, LokiApiError> {
-    let mut request = AnalyticsScanRequest::new(tenant);
-    let mut projection_seen = false;
-    for (key, value) in form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
-        match key.as_ref() {
-            "start_ns" => {
-                request.start_timestamp_unix_nanos = Some(parse_u64("start_ns", &value)?);
-            }
-            "end_ns" => {
-                request.end_timestamp_unix_nanos = Some(parse_u64("end_ns", &value)?);
-            }
+    let pairs = form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let relations = pairs
+        .iter()
+        .filter(|(key, _)| key == "relation")
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    if relations.len() > 1 {
+        return Err(LokiApiError::bad_request(
+            "relation may be specified only once",
+        ));
+    }
+    let relation = relations
+        .first()
+        .map_or(Some(AnalyticsRelation::Logs), |value| {
+            AnalyticsRelation::parse(value)
+        })
+        .ok_or_else(|| LokiApiError::bad_request("unknown analytics relation"))?;
+    let mut request = AnalyticsScanRequest::for_relation(tenant, relation);
+    let mut columns_seen = false;
+    let mut cardinality_seen = false;
+    let mut order_seen = false;
+    for (key, value) in pairs {
+        match key.as_str() {
+            "relation" => {}
+            "start_ns" => request.start_timestamp_unix_nanos = Some(parse_u64("start_ns", &value)?),
+            "end_ns" => request.end_timestamp_unix_nanos = Some(parse_u64("end_ns", &value)?),
             "limit" => {
                 request.limit = Some(
                     value
@@ -210,42 +834,75 @@ pub(crate) fn parse_scan_request(
                         .map_err(|_| LokiApiError::bad_request("limit is not a usize"))?,
                 );
             }
-            "term" => request.terms.push(Arc::from(value.as_ref())),
+            "cardinality_only" => {
+                if cardinality_seen {
+                    return Err(LokiApiError::bad_request(
+                        "cardinality_only may be specified only once",
+                    ));
+                }
+                cardinality_seen = true;
+                request.cardinality_only = match value.as_str() {
+                    "1" | "true" => true,
+                    "0" | "false" => false,
+                    _ => {
+                        return Err(LokiApiError::bad_request(
+                            "cardinality_only is not a boolean",
+                        ));
+                    }
+                };
+            }
+            "order" => {
+                if order_seen {
+                    return Err(LokiApiError::bad_request(
+                        "order may be specified only once",
+                    ));
+                }
+                order_seen = true;
+                request.order = Some(match value.as_str() {
+                    "timestamp_asc" => AnalyticsScanOrder::TimestampAscending,
+                    "timestamp_desc" => AnalyticsScanOrder::TimestampDescending,
+                    _ => return Err(LokiApiError::bad_request("unknown analytics order")),
+                });
+            }
+            "term" => request.terms.push(Arc::from(value)),
+            "message_token" => request.message_tokens.push(Arc::from(value)),
+            "message_token_ci" => request
+                .case_insensitive_message_tokens
+                .push(Arc::from(value)),
+            "trace_id" => request.trace_id = Some(parse_trace_id(&value)?),
+            "span_id" => request.span_id = Some(parse_span_id(&value)?),
+            "series_id" => request.series_id = Some(parse_series_id(&value)?),
+            "name" => request.name = Some(Arc::from(value)),
             "columns" => {
-                if projection_seen {
+                if columns_seen {
                     return Err(LokiApiError::bad_request(
                         "columns may be specified only once",
                     ));
                 }
-                projection_seen = true;
-                request.projection = value
+                columns_seen = true;
+                request.columns = value
                     .split(',')
-                    .map(|column| {
-                        AnalyticsColumn::parse(column).ok_or_else(|| {
-                            LokiApiError::bad_request(format!(
-                                "unknown analytics column {column:?}"
-                            ))
+                    .map(|name| {
+                        AnalyticsColumn::parse(name).ok_or_else(|| {
+                            LokiApiError::bad_request(format!("unknown analytics column {name:?}"))
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
             }
             key if key.starts_with("label.") => {
-                let name = &key["label.".len()..];
-                if name.is_empty() {
-                    return Err(LokiApiError::bad_request("label name must not be empty"));
-                }
-                request
-                    .labels
-                    .push(MetadataField::new(name, value.as_ref()));
+                push_field(&mut request.labels, key, "label.", &value)?;
             }
             key if key.starts_with("metadata.") => {
-                let name = &key["metadata.".len()..];
-                if name.is_empty() {
-                    return Err(LokiApiError::bad_request("metadata name must not be empty"));
-                }
-                request
-                    .metadata
-                    .push(MetadataField::new(name, value.as_ref()));
+                push_field(&mut request.metadata, key, "metadata.", &value)?;
+            }
+            key if key.starts_with("attribute.") => {
+                push_field(&mut request.attributes, key, "attribute.", &value)?;
+            }
+            key if key.starts_with("resource.") => {
+                push_field(&mut request.resource_attributes, key, "resource.", &value)?;
+            }
+            key if key.starts_with("scope.") => {
+                push_field(&mut request.scope_attributes, key, "scope.", &value)?;
             }
             unknown => {
                 return Err(LokiApiError::bad_request(format!(
@@ -258,20 +915,109 @@ pub(crate) fn parse_scan_request(
     Ok(request)
 }
 
+fn push_field(
+    fields: &mut Vec<MetadataField>,
+    key: &str,
+    prefix: &str,
+    value: &str,
+) -> Result<(), LokiApiError> {
+    let name = &key[prefix.len()..];
+    if name.is_empty() {
+        return Err(LokiApiError::bad_request(
+            "attribute name must not be empty",
+        ));
+    }
+    fields.push(MetadataField::new(name, value));
+    Ok(())
+}
+
 fn parse_u64(name: &str, value: &str) -> Result<u64, LokiApiError> {
     value
         .parse::<u64>()
         .map_err(|_| LokiApiError::bad_request(format!("{name} is not a u64")))
 }
 
+fn parse_trace_id(value: &str) -> Result<TraceId, LokiApiError> {
+    TraceId::from_bytes(decode_hex(value)?)
+        .map_err(|_| LokiApiError::bad_request("trace_id is not a valid nonzero 128-bit hex ID"))
+}
+
+fn parse_span_id(value: &str) -> Result<SpanId, LokiApiError> {
+    SpanId::from_bytes(decode_hex(value)?)
+        .map_err(|_| LokiApiError::bad_request("span_id is not a valid nonzero 64-bit hex ID"))
+}
+
+fn parse_series_id(value: &str) -> Result<SeriesFingerprint, LokiApiError> {
+    let bytes: [u8; 16] = decode_hex(value)?;
+    Ok(SeriesFingerprint::from_raw(u128::from_be_bytes(bytes)))
+}
+
+fn decode_hex<const N: usize>(value: &str) -> Result<[u8; N], LokiApiError> {
+    if value.len() != N * 2 {
+        return Err(LokiApiError::bad_request(
+            "hex identifier has the wrong length",
+        ));
+    }
+    let mut output = [0; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        output[index] = (high << 4) | low;
+    }
+    Ok(output)
+}
+
+fn hex_nibble(value: u8) -> Result<u8, LokiApiError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(LokiApiError::bad_request(
+            "identifier contains non-hex bytes",
+        )),
+    }
+}
+
 pub(crate) fn scan_entries(
     entries: Vec<crate::LokiEntry>,
     request: &AnalyticsScanRequest,
-    emit: &mut dyn FnMut(&[AnalyticsLogRow]) -> Result<(), LokiApiError>,
+    emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
 ) -> Result<(), LokiApiError> {
     request.validate()?;
+    if request.relation != AnalyticsRelation::Logs {
+        return Err(LokiApiError::bad_request(
+            "the in-memory Loki store exposes only the logs analytical relation",
+        ));
+    }
     let limit = request.limit.unwrap_or(usize::MAX);
-    if limit == 0 {
+    if let Some(order) = request.order {
+        let mut rows = entries
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, entry)| {
+                let mut row = AnalyticsRow::empty(
+                    Arc::clone(&request.tenant),
+                    "logs",
+                    u64::try_from(entry.timestamp_unix_nanos)
+                        .map_err(|_| LokiApiError::internal("pre-epoch log timestamp"))?,
+                    0,
+                    u64::try_from(ordinal).unwrap_or(u64::MAX),
+                )?;
+                row.message = Some(Arc::from(entry.line));
+                row.labels = entry.labels;
+                row.metadata = entry.structured_metadata;
+                Ok(row)
+            })
+            .collect::<Result<Vec<_>, LokiApiError>>()?;
+        rows.retain(|row| row_matches(row, request));
+        rows.sort_unstable_by_key(|row| (row.timestamp_unix_nanos, row.offset));
+        if order == AnalyticsScanOrder::TimestampDescending {
+            rows.reverse();
+        }
+        rows.truncate(limit);
+        for batch in rows.chunks(DEFAULT_SCAN_BATCH_ROWS) {
+            emit(batch)?;
+        }
         return Ok(());
     }
     let mut rows = Vec::with_capacity(DEFAULT_SCAN_BATCH_ROWS.min(limit));
@@ -280,18 +1026,21 @@ pub(crate) fn scan_entries(
         if emitted == limit {
             break;
         }
-        if !entry_matches(&entry, request) {
+        let mut row = AnalyticsRow::empty(
+            Arc::clone(&request.tenant),
+            "logs",
+            u64::try_from(entry.timestamp_unix_nanos)
+                .map_err(|_| LokiApiError::internal("pre-epoch log timestamp"))?,
+            0,
+            u64::try_from(ordinal).unwrap_or(u64::MAX),
+        )?;
+        row.message = Some(Arc::from(entry.line));
+        row.labels = entry.labels;
+        row.metadata = entry.structured_metadata;
+        if !row_matches(&row, request) {
             continue;
         }
-        rows.push(AnalyticsLogRow {
-            tenant: Arc::clone(&request.tenant),
-            timestamp_unix_nanos: entry.timestamp_unix_nanos,
-            partition: 0,
-            offset: u64::try_from(ordinal).unwrap_or(u64::MAX),
-            message: Arc::from(entry.line),
-            labels: entry.labels,
-            metadata: entry.structured_metadata,
-        });
+        rows.push(row);
         emitted += 1;
         if rows.len() == DEFAULT_SCAN_BATCH_ROWS {
             emit(&rows)?;
@@ -304,38 +1053,378 @@ pub(crate) fn scan_entries(
     Ok(())
 }
 
-fn entry_matches(entry: &crate::LokiEntry, request: &AnalyticsScanRequest) -> bool {
-    let timestamp = u64::try_from(entry.timestamp_unix_nanos).ok();
+pub(crate) fn log_row(
+    tenant: &Arc<str>,
+    record: &DurableLog,
+    labels: BTreeMap<String, String>,
+    metadata: BTreeMap<String, String>,
+) -> Result<AnalyticsRow, LokiApiError> {
+    let mut row = AnalyticsRow::empty(
+        Arc::clone(tenant),
+        "logs",
+        record.timestamp_unix_nanos,
+        record.record_ref.topic_partition.partition_id.get(),
+        record.record_ref.offset.get(),
+    )?;
+    row.observed_timestamp_unix_nanos = nonzero_timestamp(record.observed_timestamp_unix_nanos)?;
+    row.resource_id = Some(Arc::from(record.resource_id().to_string()));
+    row.scope_id = Some(Arc::from(record.scope_id().to_string()));
+    row.trace_id = record.trace_id.map(|value| Arc::from(value.to_string()));
+    row.span_id = record.span_id.map(|value| Arc::from(value.to_string()));
+    row.message = Some(Arc::clone(&record.message));
+    row.body_json = json(&record.body)?;
+    row.event_name = Some(Arc::clone(&record.event_name));
+    row.severity_number = Some(record.severity_number);
+    row.severity_text = Some(Arc::clone(&record.severity_text));
+    row.flags = Some(record.flags);
+    row.dropped_attributes_count = Some(record.dropped_attributes_count);
+    row.labels = labels;
+    row.metadata = metadata;
+    populate_attributes(
+        &mut row,
+        &record.attributes,
+        &record.resource.attributes,
+        &record.scope.attributes,
+    )?;
+    Ok(row)
+}
+
+pub(crate) fn span_rows(
+    span: &DurableSpan,
+    relation: AnalyticsRelation,
+) -> Result<Vec<AnalyticsRow>, LokiApiError> {
+    match relation {
+        AnalyticsRelation::Spans => Ok(vec![span_row(span)?]),
+        AnalyticsRelation::SpanEvents => span
+            .events
+            .iter()
+            .enumerate()
+            .map(|(ordinal, event)| {
+                let mut row = span_base_row(span, event.timestamp_unix_nanos)?;
+                row.parent_timestamp_unix_nanos = Some(timestamp_i64(span.start_time_unix_nanos)?);
+                row.ordinal = Some(u32::try_from(ordinal).unwrap_or(u32::MAX));
+                row.name = Some(Arc::clone(&event.name));
+                row.dropped_attributes_count = Some(event.dropped_attributes_count);
+                set_record_attributes(&mut row, &event.attributes)?;
+                Ok(row)
+            })
+            .collect(),
+        AnalyticsRelation::SpanLinks => span
+            .links
+            .iter()
+            .enumerate()
+            .map(|(ordinal, link)| {
+                let mut row = span_base_row(span, span.start_time_unix_nanos)?;
+                row.ordinal = Some(u32::try_from(ordinal).unwrap_or(u32::MAX));
+                row.linked_trace_id = Some(Arc::from(link.trace_id.to_string()));
+                row.linked_span_id = Some(Arc::from(link.span_id.to_string()));
+                row.trace_state = Some(Arc::clone(&link.trace_state));
+                row.flags = Some(link.flags);
+                row.dropped_attributes_count = Some(link.dropped_attributes_count);
+                set_record_attributes(&mut row, &link.attributes)?;
+                Ok(row)
+            })
+            .collect(),
+        _ => Err(LokiApiError::internal(
+            "span scanner received a non-trace relation",
+        )),
+    }
+}
+
+fn span_base_row(span: &DurableSpan, timestamp: u64) -> Result<AnalyticsRow, LokiApiError> {
+    let mut row = AnalyticsRow::empty(
+        Arc::clone(&span.tenant),
+        "traces",
+        timestamp,
+        span.record_ref.topic_partition.partition_id.get(),
+        span.record_ref.offset.get(),
+    )?;
+    row.resource_id = Some(Arc::from(span.resource_id().to_string()));
+    row.scope_id = Some(Arc::from(span.scope_id().to_string()));
+    row.trace_id = Some(Arc::from(span.trace_id.to_string()));
+    row.span_id = Some(Arc::from(span.span_id.to_string()));
+    row.resource_attributes = attribute_map(&span.resource.attributes);
+    row.scope_attributes = attribute_map(&span.scope.attributes);
+    row.resource_attribute_ids = attribute_ids(&span.resource.attributes);
+    row.scope_attribute_ids = attribute_ids(&span.scope.attributes);
+    row.resource_attributes_json = json(span.resource.attributes.as_ref())?;
+    row.scope_attributes_json = json(span.scope.attributes.as_ref())?;
+    Ok(row)
+}
+
+fn span_row(span: &DurableSpan) -> Result<AnalyticsRow, LokiApiError> {
+    let mut row = span_base_row(span, span.start_time_unix_nanos)?;
+    row.end_timestamp_unix_nanos = span.end_time_unix_nanos().map(timestamp_i64).transpose()?;
+    row.parent_span_id = span
+        .parent_span_id
+        .map(|value| Arc::from(value.to_string()));
+    row.name = Some(Arc::clone(&span.name));
+    row.kind = Some(span.kind);
+    row.duration_nanos = Some(span.duration_nanos);
+    row.status_code = span.status.as_ref().map(|status| status.code);
+    row.status_message = span
+        .status
+        .as_ref()
+        .map(|status| Arc::clone(&status.message));
+    row.trace_state = Some(Arc::clone(&span.trace_state));
+    row.flags = Some(span.flags);
+    row.dropped_attributes_count = Some(span.dropped_attributes_count);
+    row.dropped_events_count = Some(span.dropped_events_count);
+    row.dropped_links_count = Some(span.dropped_links_count);
+    set_record_attributes(&mut row, &span.attributes)?;
+    row.events_json = json(span.events.as_ref())?;
+    row.links_json = json(span.links.as_ref())?;
+    Ok(row)
+}
+
+pub(crate) fn metric_rows(
+    point: &DurableMetricPoint,
+    relation: AnalyticsRelation,
+) -> Result<Vec<AnalyticsRow>, LokiApiError> {
+    match relation {
+        AnalyticsRelation::MetricPoints => Ok(vec![metric_row(point)?]),
+        AnalyticsRelation::MetricExemplars => point
+            .exemplars
+            .iter()
+            .enumerate()
+            .map(|(ordinal, exemplar)| {
+                let mut row = metric_base_row(point, exemplar.timestamp_unix_nanos)?;
+                row.parent_timestamp_unix_nanos = Some(timestamp_i64(point.timestamp_unix_nanos)?);
+                row.ordinal = Some(u32::try_from(ordinal).unwrap_or(u32::MAX));
+                row.trace_id = exemplar.trace_id.map(|value| Arc::from(value.to_string()));
+                row.span_id = exemplar.span_id.map(|value| Arc::from(value.to_string()));
+                set_number(&mut row, exemplar.value);
+                set_record_attributes(&mut row, &exemplar.filtered_attributes)?;
+                Ok(row)
+            })
+            .collect(),
+        _ => Err(LokiApiError::internal(
+            "metric scanner received a non-metric relation",
+        )),
+    }
+}
+
+fn metric_base_row(
+    point: &DurableMetricPoint,
+    timestamp: u64,
+) -> Result<AnalyticsRow, LokiApiError> {
+    let identity = &point.identity;
+    let mut row = AnalyticsRow::empty(
+        Arc::clone(&identity.tenant),
+        "metrics",
+        timestamp,
+        point.record_ref.topic_partition.partition_id.get(),
+        point.record_ref.offset.get(),
+    )?;
+    row.resource_id = Some(Arc::from(identity.resource_id().to_string()));
+    row.scope_id = Some(Arc::from(identity.scope_id().to_string()));
+    row.series_id = Some(Arc::from(format!(
+        "{:032x}",
+        point.series_fingerprint().get()
+    )));
+    row.name = Some(Arc::clone(&identity.name));
+    row.labels = crate::prometheus_string_labels(identity)
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    row.resource_attributes = attribute_map(&identity.resource.attributes);
+    row.scope_attributes = attribute_map(&identity.scope.attributes);
+    row.resource_attribute_ids = attribute_ids(&identity.resource.attributes);
+    row.scope_attribute_ids = attribute_ids(&identity.scope.attributes);
+    row.resource_attributes_json = json(identity.resource.attributes.as_ref())?;
+    row.scope_attributes_json = json(identity.scope.attributes.as_ref())?;
+    Ok(row)
+}
+
+fn metric_row(point: &DurableMetricPoint) -> Result<AnalyticsRow, LokiApiError> {
+    let identity = &point.identity;
+    let mut row = metric_base_row(point, point.timestamp_unix_nanos)?;
+    row.start_timestamp_unix_nanos = nonzero_timestamp(point.start_time_unix_nanos)?;
+    row.description = Some(Arc::clone(&point.description));
+    row.unit = Some(Arc::clone(&identity.unit));
+    let (kind, temporality, monotonic) = match identity.kind {
+        MetricKind::Gauge => ("gauge", None, None),
+        MetricKind::Sum {
+            temporality,
+            monotonic,
+        } => ("sum", Some(temporality), Some(monotonic)),
+        MetricKind::ExplicitHistogram { temporality } => {
+            ("explicit_histogram", Some(temporality), None)
+        }
+        MetricKind::ExponentialHistogram { temporality } => {
+            ("exponential_histogram", Some(temporality), None)
+        }
+        MetricKind::Summary => ("summary", None, None),
+    };
+    row.metric_kind = Some(Arc::from(kind));
+    row.temporality = temporality;
+    row.monotonic = monotonic;
+    row.flags = Some(point.flags);
+    row.metadata = attribute_map(&point.metadata);
+    set_record_attributes(&mut row, &identity.point_attributes)?;
+    match &point.value {
+        MetricValue::Gauge(value) | MetricValue::Sum(value) => set_number(&mut row, *value),
+        MetricValue::ExplicitHistogram(_) => row.value_type = Some(Arc::from("explicit_histogram")),
+        MetricValue::ExponentialHistogram(_) => {
+            row.value_type = Some(Arc::from("exponential_histogram"));
+        }
+        MetricValue::Summary(_) => row.value_type = Some(Arc::from("summary")),
+    }
+    row.value_json = json(&point.value)?;
+    row.exemplars_json = json(point.exemplars.as_ref())?;
+    Ok(row)
+}
+
+fn set_number(row: &mut AnalyticsRow, value: NumberValue) {
+    match value {
+        NumberValue::Integer(value) => {
+            row.value_type = Some(Arc::from("integer"));
+            row.scalar_integer = Some(value);
+        }
+        NumberValue::DoubleBits(bits) => {
+            row.value_type = Some(Arc::from("double"));
+            row.scalar_double_bits = Some(bits);
+        }
+    }
+}
+
+fn populate_attributes(
+    row: &mut AnalyticsRow,
+    attributes: &[TelemetryAttribute],
+    resource: &[TelemetryAttribute],
+    scope: &[TelemetryAttribute],
+) -> Result<(), LokiApiError> {
+    set_record_attributes(row, attributes)?;
+    row.resource_attributes = attribute_map(resource);
+    row.scope_attributes = attribute_map(scope);
+    row.resource_attribute_ids = attribute_ids(resource);
+    row.scope_attribute_ids = attribute_ids(scope);
+    row.resource_attributes_json = json(resource)?;
+    row.scope_attributes_json = json(scope)?;
+    Ok(())
+}
+
+fn set_record_attributes(
+    row: &mut AnalyticsRow,
+    attributes: &[TelemetryAttribute],
+) -> Result<(), LokiApiError> {
+    row.attributes = attribute_map(attributes);
+    row.attribute_ids = attribute_ids(attributes);
+    row.attributes_json = json(attributes)?;
+    Ok(())
+}
+
+fn attribute_map(attributes: &[TelemetryAttribute]) -> BTreeMap<String, String> {
+    attributes
+        .iter()
+        .filter_map(|attribute| {
+            attribute
+                .value
+                .as_ref()
+                .map(|value| (attribute.key.to_string(), render_value(value)))
+        })
+        .collect()
+}
+
+fn attribute_ids(attributes: &[TelemetryAttribute]) -> BTreeMap<String, String> {
+    attributes
+        .iter()
+        .map(|attribute| {
+            (
+                attribute.key.to_string(),
+                attribute.fingerprint().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn render_value(value: &TelemetryValue) -> String {
+    match value {
+        TelemetryValue::Empty => String::new(),
+        TelemetryValue::String(value) => value.to_string(),
+        TelemetryValue::Boolean(value) => value.to_string(),
+        TelemetryValue::Integer(value) => value.to_string(),
+        TelemetryValue::DoubleBits(bits) => f64::from_bits(*bits).to_string(),
+        TelemetryValue::Bytes(value) => value.iter().map(|byte| format!("{byte:02x}")).collect(),
+        TelemetryValue::StringTableIndex(value) => value.to_string(),
+        TelemetryValue::Array(_) | TelemetryValue::Map(_) => {
+            serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
+        }
+    }
+}
+
+fn json<T: serde::Serialize + ?Sized>(value: &T) -> Result<Option<Arc<str>>, LokiApiError> {
+    serde_json::to_string(value)
+        .map(|value| Some(Arc::from(value)))
+        .map_err(|error| LokiApiError::internal(error.to_string()))
+}
+
+fn timestamp_i64(value: u64) -> Result<i64, LokiApiError> {
+    i64::try_from(value)
+        .map_err(|_| LokiApiError::internal("timestamp exceeds ClickHouse i64 range"))
+}
+
+fn nonzero_timestamp(value: u64) -> Result<Option<i64>, LokiApiError> {
+    (value != 0).then(|| timestamp_i64(value)).transpose()
+}
+
+pub(crate) fn row_matches(row: &AnalyticsRow, request: &AnalyticsScanRequest) -> bool {
+    let timestamp = u64::try_from(row.timestamp_unix_nanos).ok();
     if request
         .start_timestamp_unix_nanos
-        .is_some_and(|start| timestamp.is_none_or(|observed| observed < start))
+        .is_some_and(|start| timestamp.is_none_or(|value| value < start))
         || request
             .end_timestamp_unix_nanos
-            .is_some_and(|end| timestamp.is_none_or(|observed| observed >= end))
+            .is_some_and(|end| timestamp.is_none_or(|value| value >= end))
+        || request
+            .trace_id
+            .is_some_and(|value| row.trace_id.as_deref() != Some(value.to_string().as_str()))
+        || request
+            .span_id
+            .is_some_and(|value| row.span_id.as_deref() != Some(value.to_string().as_str()))
+        || request.series_id.is_some_and(|value| {
+            row.series_id.as_deref() != Some(format!("{:032x}", value.get()).as_str())
+        })
+        || request
+            .name
+            .as_ref()
+            .is_some_and(|value| row.name.as_deref() != Some(value.as_ref()))
     {
         return false;
     }
-    if request.labels.iter().any(|field| {
-        entry.labels.get(field.key.as_ref()).map(String::as_str) != Some(field.value.as_ref())
-    }) || request.metadata.iter().any(|field| {
-        entry
-            .structured_metadata
-            .get(field.key.as_ref())
-            .map(String::as_str)
-            != Some(field.value.as_ref())
-    }) {
-        return false;
-    }
-    request
-        .terms
-        .iter()
-        .all(|expected| message_has_term(&entry.line, expected))
+    fields_match(&row.labels, &request.labels)
+        && fields_match(&row.metadata, &request.metadata)
+        && fields_match(&row.attributes, &request.attributes)
+        && fields_match(&row.resource_attributes, &request.resource_attributes)
+        && fields_match(&row.scope_attributes, &request.scope_attributes)
+        && request.terms.iter().all(|term| {
+            row.message
+                .as_deref()
+                .is_some_and(|message| message_has_term(message, term))
+        })
+        && request.message_tokens.iter().all(|term| {
+            row.message.as_deref().is_some_and(|message| {
+                message_has_clickhouse_token(message, term, CaseSensitivity::Sensitive)
+            })
+        })
+        && request.case_insensitive_message_tokens.iter().all(|term| {
+            row.message.as_deref().is_some_and(|message| {
+                message_has_clickhouse_token(message, term, CaseSensitivity::Insensitive)
+            })
+        })
+}
+
+fn fields_match(values: &BTreeMap<String, String>, expected: &[MetadataField]) -> bool {
+    expected.iter().all(|field| {
+        values.get(field.key.as_ref()).map(String::as_str) == Some(field.value.as_ref())
+    })
 }
 
 pub(crate) fn arrow_stream_response(
     store: Arc<dyn LokiStore>,
     request: AnalyticsScanRequest,
 ) -> Response {
+    let relation = request.relation.name();
     let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(8);
     tokio::task::spawn_blocking(move || {
         if let Err(error) = write_arrow_stream(store, &request, sender.clone()) {
@@ -352,6 +1441,10 @@ pub(crate) fn arrow_stream_response(
         HeaderValue::from_static("1"),
     );
     response.headers_mut().insert(
+        HeaderName::from_static("x-shardtelemetry-relation"),
+        HeaderValue::from_static(relation),
+    );
+    response.headers_mut().insert(
         HeaderName::from_static("x-shardtelemetry-clickhouse-target"),
         HeaderValue::from_static(CLICKHOUSE_COMPATIBILITY_TARGET),
     );
@@ -363,17 +1456,36 @@ fn write_arrow_stream(
     request: &AnalyticsScanRequest,
     sender: mpsc::Sender<Result<Bytes, io::Error>>,
 ) -> Result<(), LokiApiError> {
-    let schema = projection_schema(&request.projection);
+    let schema = projection_schema(&request.columns);
     let mut sink = ChannelWriter::new(sender, STREAM_CHUNK_BYTES);
     {
         let mut writer = StreamWriter::try_new(&mut sink, &schema)
             .map_err(|error| LokiApiError::internal(error.to_string()))?;
-        store.scan_analytics(request, &mut |rows| {
-            let batch = record_batch(rows, &request.projection, Arc::clone(&schema))?;
-            writer
-                .write(&batch)
-                .map_err(|error| LokiApiError::internal(error.to_string()))
-        })?;
+        if request.cardinality_only {
+            store.scan_analytics_cardinality(request, &mut |count| {
+                let mut remaining = count;
+                while remaining > 0 {
+                    let rows = remaining.min(DEFAULT_SCAN_BATCH_ROWS as u64) as usize;
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(UInt64Array::from(vec![0_u64; rows])) as ArrayRef],
+                    )
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                    writer
+                        .write(&batch)
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                    remaining -= rows as u64;
+                }
+                Ok(())
+            })?;
+        } else {
+            store.scan_analytics(request, &mut |rows| {
+                let batch = record_batch(rows, &request.columns, Arc::clone(&schema))?;
+                writer
+                    .write(&batch)
+                    .map_err(|error| LokiApiError::internal(error.to_string()))
+            })?;
+        }
         writer
             .finish()
             .map_err(|error| LokiApiError::internal(error.to_string()))?;
@@ -382,9 +1494,9 @@ fn write_arrow_stream(
         .map_err(|error| LokiApiError::internal(error.to_string()))
 }
 
-fn projection_schema(projection: &[AnalyticsColumn]) -> SchemaRef {
+fn projection_schema(columns: &[AnalyticsColumn]) -> SchemaRef {
     Arc::new(Schema::new(
-        projection
+        columns
             .iter()
             .copied()
             .map(AnalyticsColumn::field)
@@ -393,58 +1505,193 @@ fn projection_schema(projection: &[AnalyticsColumn]) -> SchemaRef {
 }
 
 fn record_batch(
-    rows: &[AnalyticsLogRow],
-    projection: &[AnalyticsColumn],
+    rows: &[AnalyticsRow],
+    columns: &[AnalyticsColumn],
     schema: SchemaRef,
 ) -> Result<RecordBatch, LokiApiError> {
-    let mut arrays = Vec::<ArrayRef>::with_capacity(projection.len());
-    for column in projection {
-        let array: ArrayRef = match column {
-            AnalyticsColumn::Tenant => {
-                let mut builder = StringBuilder::new();
-                for row in rows {
-                    builder.append_value(&row.tenant);
-                }
-                Arc::new(builder.finish())
-            }
-            AnalyticsColumn::Timestamp => {
-                let mut builder = TimestampNanosecondBuilder::with_capacity(rows.len());
-                for row in rows {
-                    builder.append_value(row.timestamp_unix_nanos);
-                }
-                Arc::new(builder.finish().with_timezone("UTC"))
-            }
-            AnalyticsColumn::Partition => {
-                let mut builder = UInt32Builder::with_capacity(rows.len());
-                for row in rows {
-                    builder.append_value(row.partition);
-                }
-                Arc::new(builder.finish())
-            }
-            AnalyticsColumn::Offset => {
-                let mut builder = UInt64Builder::with_capacity(rows.len());
-                for row in rows {
-                    builder.append_value(row.offset);
-                }
-                Arc::new(builder.finish())
-            }
-            AnalyticsColumn::Message => {
-                let mut builder = StringBuilder::new();
-                for row in rows {
-                    builder.append_value(&row.message);
-                }
-                Arc::new(builder.finish())
-            }
-            AnalyticsColumn::Labels => {
-                Arc::new(string_map_array(rows.iter().map(|row| &row.labels))?)
-            }
-            AnalyticsColumn::Metadata => {
-                Arc::new(string_map_array(rows.iter().map(|row| &row.metadata))?)
-            }
-        };
-        arrays.push(array);
-    }
+    let arrays = columns
+        .iter()
+        .copied()
+        .map(|column| column_array(rows, column))
+        .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new(schema, arrays).map_err(|error| LokiApiError::internal(error.to_string()))
+}
+
+fn column_array(rows: &[AnalyticsRow], column: AnalyticsColumn) -> Result<ArrayRef, LokiApiError> {
+    let array: ArrayRef = match column.field().data_type() {
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for row in rows {
+                if let Some(value) = string_value(row, column) {
+                    builder.append_value(value);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let mut builder = TimestampNanosecondBuilder::with_capacity(rows.len());
+            for row in rows {
+                if let Some(value) = timestamp_value(row, column) {
+                    builder.append_value(value);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish().with_timezone("UTC"))
+        }
+        DataType::UInt32 => {
+            let mut builder = UInt32Builder::with_capacity(rows.len());
+            for row in rows {
+                if let Some(value) = u32_value(row, column) {
+                    builder.append_value(value);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::UInt64 => {
+            let mut builder = UInt64Builder::with_capacity(rows.len());
+            for row in rows {
+                if let Some(value) = u64_value(row, column) {
+                    builder.append_value(value);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Int32 => {
+            let mut builder = Int32Builder::with_capacity(rows.len());
+            for row in rows {
+                if let Some(value) = i32_value(row, column) {
+                    builder.append_value(value);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Int64 => {
+            let mut builder = Int64Builder::with_capacity(rows.len());
+            for row in rows {
+                if let Some(value) = row.scalar_integer {
+                    builder.append_value(value);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(rows.len());
+            for row in rows {
+                if let Some(value) = row.monotonic {
+                    builder.append_value(value);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Map(_, _) => Arc::new(string_map_array(
+            rows.iter().map(|row| map_value(row, column)),
+        )?),
+        _ => return Err(LokiApiError::internal("unsupported analytics Arrow type")),
+    };
+    Ok(array)
+}
+
+fn string_value(row: &AnalyticsRow, column: AnalyticsColumn) -> Option<&str> {
+    match column {
+        AnalyticsColumn::Tenant => Some(&row.tenant),
+        AnalyticsColumn::Signal => Some(&row.signal),
+        AnalyticsColumn::ResourceId => row.resource_id.as_deref(),
+        AnalyticsColumn::ScopeId => row.scope_id.as_deref(),
+        AnalyticsColumn::TraceId => row.trace_id.as_deref(),
+        AnalyticsColumn::SpanId => row.span_id.as_deref(),
+        AnalyticsColumn::ParentSpanId => row.parent_span_id.as_deref(),
+        AnalyticsColumn::LinkedTraceId => row.linked_trace_id.as_deref(),
+        AnalyticsColumn::LinkedSpanId => row.linked_span_id.as_deref(),
+        AnalyticsColumn::SeriesId => row.series_id.as_deref(),
+        AnalyticsColumn::Message => row.message.as_deref(),
+        AnalyticsColumn::BodyJson => row.body_json.as_deref(),
+        AnalyticsColumn::Name => row.name.as_deref(),
+        AnalyticsColumn::EventName => row.event_name.as_deref(),
+        AnalyticsColumn::SeverityText => row.severity_text.as_deref(),
+        AnalyticsColumn::StatusMessage => row.status_message.as_deref(),
+        AnalyticsColumn::TraceState => row.trace_state.as_deref(),
+        AnalyticsColumn::AttributesJson => row.attributes_json.as_deref(),
+        AnalyticsColumn::ResourceAttributesJson => row.resource_attributes_json.as_deref(),
+        AnalyticsColumn::ScopeAttributesJson => row.scope_attributes_json.as_deref(),
+        AnalyticsColumn::EventsJson => row.events_json.as_deref(),
+        AnalyticsColumn::LinksJson => row.links_json.as_deref(),
+        AnalyticsColumn::Description => row.description.as_deref(),
+        AnalyticsColumn::Unit => row.unit.as_deref(),
+        AnalyticsColumn::MetricKind => row.metric_kind.as_deref(),
+        AnalyticsColumn::ValueType => row.value_type.as_deref(),
+        AnalyticsColumn::ValueJson => row.value_json.as_deref(),
+        AnalyticsColumn::ExemplarsJson => row.exemplars_json.as_deref(),
+        _ => None,
+    }
+}
+
+fn timestamp_value(row: &AnalyticsRow, column: AnalyticsColumn) -> Option<i64> {
+    match column {
+        AnalyticsColumn::Timestamp => Some(row.timestamp_unix_nanos),
+        AnalyticsColumn::ParentTimestamp => row.parent_timestamp_unix_nanos,
+        AnalyticsColumn::ObservedTimestamp => row.observed_timestamp_unix_nanos,
+        AnalyticsColumn::StartTimestamp => row.start_timestamp_unix_nanos,
+        AnalyticsColumn::EndTimestamp => row.end_timestamp_unix_nanos,
+        _ => None,
+    }
+}
+
+fn u32_value(row: &AnalyticsRow, column: AnalyticsColumn) -> Option<u32> {
+    match column {
+        AnalyticsColumn::Partition => Some(row.partition),
+        AnalyticsColumn::Ordinal => row.ordinal,
+        AnalyticsColumn::Flags => row.flags,
+        AnalyticsColumn::DroppedAttributesCount => row.dropped_attributes_count,
+        AnalyticsColumn::DroppedEventsCount => row.dropped_events_count,
+        AnalyticsColumn::DroppedLinksCount => row.dropped_links_count,
+        _ => None,
+    }
+}
+
+fn u64_value(row: &AnalyticsRow, column: AnalyticsColumn) -> Option<u64> {
+    match column {
+        AnalyticsColumn::Offset => Some(row.offset),
+        AnalyticsColumn::DurationNanos => row.duration_nanos,
+        AnalyticsColumn::ScalarDoubleBits => row.scalar_double_bits,
+        _ => None,
+    }
+}
+
+fn i32_value(row: &AnalyticsRow, column: AnalyticsColumn) -> Option<i32> {
+    match column {
+        AnalyticsColumn::SeverityNumber => row.severity_number,
+        AnalyticsColumn::Kind => row.kind,
+        AnalyticsColumn::StatusCode => row.status_code,
+        AnalyticsColumn::Temporality => row.temporality,
+        _ => None,
+    }
+}
+
+fn map_value(row: &AnalyticsRow, column: AnalyticsColumn) -> &BTreeMap<String, String> {
+    match column {
+        AnalyticsColumn::Labels => &row.labels,
+        AnalyticsColumn::Metadata => &row.metadata,
+        AnalyticsColumn::Attributes => &row.attributes,
+        AnalyticsColumn::ResourceAttributes => &row.resource_attributes,
+        AnalyticsColumn::ScopeAttributes => &row.scope_attributes,
+        AnalyticsColumn::AttributeIds => &row.attribute_ids,
+        AnalyticsColumn::ResourceAttributeIds => &row.resource_attribute_ids,
+        AnalyticsColumn::ScopeAttributeIds => &row.scope_attribute_ids,
+        _ => unreachable!("column type checked before map lookup"),
+    }
 }
 
 fn string_map_data_type() -> DataType {
@@ -521,7 +1768,12 @@ impl Write for ChannelWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.emit()
+        // Arrow's stream writer flushes after the schema and every IPC message.
+        // Emitting each flush as its own HTTP body chunk creates a small schema
+        // packet followed by a data packet, which can hit the TCP delayed-ACK
+        // timer. The size threshold and explicit `finish` retain bounded
+        // streaming while coalescing adjacent IPC messages.
+        Ok(())
     }
 }
 
@@ -536,45 +1788,116 @@ mod tests {
     use crate::LokiEntry;
 
     #[test]
-    fn scan_query_parses_projection_and_pushdown_constraints() {
+    fn channel_writer_coalesces_arrow_flushes_until_size_or_finish() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut writer = ChannelWriter::new(sender, 64);
+        writer.write_all(b"schema").unwrap();
+        writer.flush().unwrap();
+        assert!(receiver.try_recv().is_err());
+        writer.write_all(b"batch").unwrap();
+        writer.finish().unwrap();
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap().as_ref(),
+            b"schemabatch"
+        );
+    }
+
+    #[test]
+    fn request_parses_relation_columns_ids_and_pushdown_constraints() {
         let request = parse_scan_request(
             "tenant-a".to_owned(),
-            Some("start_ns=10&end_ns=20&term=error&label.app=api&metadata.code=500&columns=timestamp,message&limit=7"),
+            Some("relation=spans&start_ns=10&end_ns=20&trace_id=01010101010101010101010101010101&resource.service.name=api&columns=timestamp,trace_id,name&limit=7"),
         )
         .expect("valid scan");
-        assert_eq!(request.tenant.as_ref(), "tenant-a");
+        assert_eq!(request.relation, AnalyticsRelation::Spans);
         assert_eq!(request.start_timestamp_unix_nanos, Some(10));
         assert_eq!(request.end_timestamp_unix_nanos, Some(20));
-        assert_eq!(request.terms[0].as_ref(), "error");
-        assert_eq!(request.labels[0], MetadataField::new("app", "api"));
-        assert_eq!(request.metadata[0], MetadataField::new("code", "500"));
         assert_eq!(
-            request.projection,
-            vec![AnalyticsColumn::Timestamp, AnalyticsColumn::Message]
+            request.trace_id.expect("trace").to_string(),
+            "01010101010101010101010101010101"
+        );
+        assert_eq!(
+            request.resource_attributes[0],
+            MetadataField::new("service.name", "api")
+        );
+        assert_eq!(
+            request.columns,
+            vec![
+                AnalyticsColumn::Timestamp,
+                AnalyticsColumn::TraceId,
+                AnalyticsColumn::Name
+            ]
         );
         assert_eq!(request.limit, Some(7));
     }
 
     #[test]
-    fn scan_query_rejects_ambiguous_or_unknown_contract_inputs() {
+    fn request_rejects_ambiguous_or_relation_incompatible_inputs() {
         for query in [
             "unknown=value",
+            "relation=logs&relation=spans",
+            "relation=unknown",
+            "relation=spans&columns=message",
             "columns=timestamp&columns=message",
             "columns=timestamp,timestamp",
-            "columns=timestamp,unknown",
             "columns=",
             "start_ns=20&end_ns=20",
-            "start_ns=21&end_ns=20",
             "start_ns=-1",
             "limit=-1",
             "label.=value",
-            "metadata.=value",
+            "relation=spans&term=error",
+            "relation=spans&message_token=error",
+            "relation=spans&message_token_ci=error",
+            "trace_id=00",
+            "columns=offset&cardinality_only=maybe",
+            "columns=offset&cardinality_only=1&cardinality_only=1",
+            "columns=message&cardinality_only=1",
+            "order=timestamp_desc",
+            "limit=1&order=unknown",
+            "limit=1&order=timestamp_desc&order=timestamp_asc",
+            "relation=spans&limit=1&order=timestamp_desc",
         ] {
             assert!(
                 parse_scan_request("tenant-a".to_owned(), Some(query)).is_err(),
                 "query must fail closed: {query}"
             );
         }
+    }
+
+    #[test]
+    fn cardinality_request_is_explicit_and_uses_one_fixed_width_lane() {
+        let request = parse_scan_request(
+            "tenant-a".to_owned(),
+            Some("columns=offset&cardinality_only=1"),
+        )
+        .expect("cardinality request");
+        assert!(request.cardinality_only);
+        assert_eq!(request.columns, [AnalyticsColumn::Offset]);
+    }
+
+    #[test]
+    fn bounded_timestamp_order_is_parsed_explicitly() {
+        let request = parse_scan_request(
+            "tenant-a".to_owned(),
+            Some("columns=timestamp,message&limit=100&order=timestamp_desc"),
+        )
+        .expect("ordered request");
+        assert_eq!(request.order, Some(AnalyticsScanOrder::TimestampDescending));
+        assert_eq!(request.limit, Some(100));
+    }
+
+    #[test]
+    fn exact_message_token_is_parsed_for_log_scans() {
+        let request = parse_scan_request(
+            "tenant-a".to_owned(),
+            Some("message_token=Cannot&message_token_ci=cannot&limit=10&order=timestamp_desc"),
+        )
+        .expect("exact token scan");
+        assert_eq!(request.message_tokens, [Arc::<str>::from("Cannot")]);
+        assert_eq!(
+            request.case_insensitive_message_tokens,
+            [Arc::<str>::from("cannot")]
+        );
     }
 
     #[test]
@@ -598,18 +1921,17 @@ mod tests {
 
     #[test]
     fn projected_arrow_batch_preserves_timestamp_message_and_maps() {
-        let rows = vec![AnalyticsLogRow {
-            tenant: Arc::from("tenant-a"),
-            timestamp_unix_nanos: 123,
-            partition: 4,
-            offset: 9,
-            message: Arc::from("request failed"),
-            labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
-            metadata: BTreeMap::from([("code".to_owned(), "500".to_owned())]),
-        }];
-        let projection = AnalyticsColumn::ALL.to_vec();
-        let schema = projection_schema(&projection);
-        let batch = record_batch(&rows, &projection, Arc::clone(&schema)).expect("batch");
+        let mut row = AnalyticsRow::empty(Arc::from("tenant-a"), "logs", 123, 4, 9).expect("row");
+        row.message = Some(Arc::from("request failed"));
+        row.labels.insert("app".to_owned(), "api".to_owned());
+        row.metadata.insert("code".to_owned(), "500".to_owned());
+        let columns = vec![
+            AnalyticsColumn::Timestamp,
+            AnalyticsColumn::Message,
+            AnalyticsColumn::Labels,
+        ];
+        let schema = projection_schema(&columns);
+        let batch = record_batch(&[row], &columns, Arc::clone(&schema)).expect("batch");
         let mut bytes = Vec::new();
         {
             let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("writer");
@@ -618,28 +1940,104 @@ mod tests {
         }
         let mut reader = StreamReader::try_new(Cursor::new(bytes), None).expect("reader");
         let decoded = reader.next().expect("one batch").expect("valid batch");
-        let timestamp = decoded
-            .column(1)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .expect("timestamp");
-        let message = decoded
-            .column(4)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("message");
-        let labels = decoded
-            .column(5)
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .expect("labels");
-        assert_eq!(timestamp.value(0), 123);
-        assert_eq!(message.value(0), "request failed");
-        assert_eq!(labels.value_length(0), 1);
+        assert_eq!(
+            decoded
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .value(0),
+            123
+        );
+        assert_eq!(
+            decoded
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "request failed"
+        );
+        assert_eq!(
+            decoded
+                .column(2)
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap()
+                .value_length(0),
+            1
+        );
     }
 
     #[test]
-    fn in_memory_scan_applies_all_storage_constraints() {
+    fn every_relation_builds_its_complete_declared_arrow_schema() {
+        for relation in [
+            AnalyticsRelation::Logs,
+            AnalyticsRelation::Spans,
+            AnalyticsRelation::SpanEvents,
+            AnalyticsRelation::SpanLinks,
+            AnalyticsRelation::MetricPoints,
+            AnalyticsRelation::MetricExemplars,
+        ] {
+            let row = AnalyticsRow::empty(Arc::from("tenant-a"), relation.signal(), 123, 4, 9)
+                .expect("row");
+            let schema = projection_schema(relation.columns());
+            let batch = record_batch(&[row], relation.columns(), Arc::clone(&schema))
+                .expect("relation batch");
+            assert_eq!(batch.num_rows(), 1, "{relation:?}");
+            assert_eq!(
+                batch.num_columns(),
+                relation.columns().len(),
+                "{relation:?}"
+            );
+            assert_eq!(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>(),
+                relation
+                    .columns()
+                    .iter()
+                    .map(|column| column.name())
+                    .collect::<Vec<_>>(),
+                "{relation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relation_columns_are_unique_and_drawn_from_the_public_catalog() {
+        let catalog = ALL_COLUMNS.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(catalog.len(), ALL_COLUMNS.len());
+        for relation in [
+            AnalyticsRelation::Logs,
+            AnalyticsRelation::Spans,
+            AnalyticsRelation::SpanEvents,
+            AnalyticsRelation::SpanLinks,
+            AnalyticsRelation::MetricPoints,
+            AnalyticsRelation::MetricExemplars,
+        ] {
+            let columns = relation.columns().iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(columns.len(), relation.columns().len(), "{relation:?}");
+            assert!(columns.is_subset(&catalog), "{relation:?}");
+        }
+    }
+
+    #[test]
+    fn typed_attribute_fingerprints_disambiguate_equal_renderings() {
+        let string = TelemetryAttribute::new("code", TelemetryValue::String(Arc::from("1")));
+        let integer = TelemetryAttribute::new("code", TelemetryValue::Integer(1));
+        assert_eq!(
+            attribute_map(std::slice::from_ref(&string)),
+            attribute_map(std::slice::from_ref(&integer))
+        );
+        assert_ne!(attribute_ids(&[string]), attribute_ids(&[integer]));
+    }
+
+    #[test]
+    fn in_memory_scan_applies_log_constraints() {
         let entries = vec![
             LokiEntry {
                 timestamp_unix_nanos: 11,
@@ -658,6 +2056,7 @@ mod tests {
         request.start_timestamp_unix_nanos = Some(10);
         request.end_timestamp_unix_nanos = Some(20);
         request.terms.push(Arc::from("error"));
+        request.message_tokens.push(Arc::from("ERROR"));
         request.labels.push(MetadataField::new("app", "api"));
         request.metadata.push(MetadataField::new("code", "500"));
         let mut observed = Vec::new();
@@ -667,6 +2066,6 @@ mod tests {
         })
         .expect("scan");
         assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].message.as_ref(), "request ERROR");
+        assert_eq!(observed[0].message.as_deref(), Some("request ERROR"));
     }
 }

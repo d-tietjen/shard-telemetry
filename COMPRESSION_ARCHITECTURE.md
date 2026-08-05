@@ -83,6 +83,23 @@ impossible on normalized OTLP traffic.
 
 ## Current baseline
 
+The current authoritative live log result is the full 80 GiB Adam run
+`benchmark-80g-final-attempt3`. The complete ShardTelemetry durable directory
+was 2,702,973,946 bytes for 85,899,345,920 source bytes, or 31.78x. The pinned
+ClickHouse MergeTree used 6,091,870,726 active-part bytes, or 14.10x, with its
+text index enabled. ShardTelemetry therefore used 55.63% fewer bytes, but its
+live native path ingested at only 148.60 MiB/s across 16 physical cores versus
+ClickHouse's 234.80 MiB/s. The representation is effective; request parsing,
+native packing, durable append, and indexing—not Zstandard alone—now dominate
+the unmet throughput objective.
+
+On the current deterministic 262,144-record-per-signal corpus,
+ShardTelemetry's signal-native trace payload stored 902,077 bytes from
+107,609,736 canonical bytes (119.29x), and metrics stored 1,966,452 bytes from
+126,451,328 canonical bytes (64.30x). Those are synthetic storage results;
+publishable trace and metric capacity claims remain gated on retained,
+sanitized production corpora.
+
 The original row-oriented representation wrote, for every record, a fixed-width
 logical offset, a fixed-width timestamp, a length-prefixed message, and repeated
 length-prefixed metadata keys and values. `LogStripe` now collects durable

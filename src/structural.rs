@@ -1308,6 +1308,81 @@ pub fn decode_structural_records(
     Ok(decoded)
 }
 
+/// Decodes only the durable offset and timestamp lanes used to rank selective
+/// candidates before reconstructing message and metadata lanes.
+pub(crate) fn decode_structural_positions(
+    encoded: &[u8],
+) -> TelemetryResult<(Vec<LogicalOffset>, Vec<u64>)> {
+    if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "missing structural block magic",
+        ));
+    }
+    let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+    let record_count = read_usize(encoded, &mut cursor)?;
+    ensure_count_within(
+        record_count,
+        encoded.len().saturating_sub(cursor),
+        "record count",
+    )?;
+    let offsets_section = read_section(encoded, &mut cursor)?;
+    let timestamps_section = read_section(encoded, &mut cursor)?;
+    for _ in 0..6 {
+        let _ = read_section(encoded, &mut cursor)?;
+    }
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    Ok((
+        decode_offsets(offsets_section, record_count)?,
+        decode_timestamps(timestamps_section, record_count)?,
+    ))
+}
+
+/// Decodes only selected message bodies, leaving typed metadata and field
+/// values compressed until a message predicate has been verified.
+pub(crate) fn decode_structural_messages(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+) -> TelemetryResult<Vec<Arc<str>>> {
+    if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "missing structural block magic",
+        ));
+    }
+    let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+    let record_count = read_usize(encoded, &mut cursor)?;
+    ensure_count_within(
+        record_count,
+        encoded.len().saturating_sub(cursor),
+        "record count",
+    )?;
+    validate_selected_ordinals(record_ordinals, record_count)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let templates_section = read_section(encoded, &mut cursor)?;
+    let bodies_section = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let embedded_index_section = read_section(encoded, &mut cursor)?;
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    let embedded_index = EmbeddedFrameIndex::decode(
+        embedded_index_section,
+        u32::try_from(record_count).map_err(|_| TelemetryError::RecordTooLarge)?,
+    )?;
+    let templates = decode_templates(templates_section)?;
+    decode_selected_bodies(
+        bodies_section,
+        &templates,
+        &embedded_index,
+        record_count,
+        record_ordinals,
+    )
+}
+
 /// Returns the structural lanes whose byte vocabulary can benefit from a
 /// reusable Zstandard dictionary.
 ///
@@ -3910,9 +3985,30 @@ mod tests {
             .collect::<Vec<_>>();
         let encoded = encode_structural_block(&records).expect("block encodes");
         let full = decode_structural_block(&encoded).expect("full block decodes");
+        let (offsets, timestamps) =
+            decode_structural_positions(&encoded).expect("position lanes decode");
+        assert_eq!(
+            offsets,
+            full.iter().map(|record| record.offset).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            timestamps,
+            full.iter()
+                .map(|record| record.timestamp_unix_nanos)
+                .collect::<Vec<_>>()
+        );
         let selected_ordinals = [0, 7, 500, 999];
         let selected =
             decode_structural_records(&encoded, &selected_ordinals).expect("selection decodes");
+        let messages =
+            decode_structural_messages(&encoded, &selected_ordinals).expect("messages decode");
+        assert_eq!(
+            messages,
+            selected
+                .iter()
+                .map(|record| Arc::clone(&record.message))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             selected,
             selected_ordinals

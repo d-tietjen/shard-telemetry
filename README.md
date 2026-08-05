@@ -142,12 +142,14 @@ correctness boundary, persistent format, and measured lookup costs.
 
 ## ClickHouse analytical compatibility
 
-ShardTelemetry exposes an opt-in authenticated Arrow IPC scan boundary for the
-pinned ClickHouse 26.3.17.56 LTS query evaluator. A stock ClickHouse binary can
-use the generic URL source with explicit constraints. The narrow
-`StorageShardTelemetry` adapter in `clickhouse/adapter` additionally converts
-analyzed projections, timestamp ranges, and exact map predicates into
-automatic storage pushdown. ShardTelemetry streams bounded columnar batches while
+ShardTelemetry exposes opt-in authenticated Arrow IPC relations for logs,
+spans, span events, span links, raw metric points, and metric exemplars to the
+pinned ClickHouse 26.3.17.56 LTS evaluator. A derived `traces` view summarizes
+the winning spans of each trace. Stable trace/span IDs, series IDs,
+resource/scope IDs, and typed-attribute fingerprints make cross-signal joins
+exact. A stock ClickHouse binary can use generic URL sources; the narrow
+`StorageShardTelemetry` adapter adds automatic column, timestamp, ID, name,
+and map-equality pushdown. ShardTelemetry streams bounded columnar batches while
 ClickHouse remains responsible for expressions, aggregates, joins, windows,
 JSON functions, subqueries, materialized views, protocols, and formats.
 
@@ -388,23 +390,26 @@ is against accepted Docker source bytes, so it includes the gain from replacing
 JSON syntax with typed log fields; it is not a transparent byte-for-byte JSON
 archive metric.
 
-On Adam, the sequential head-to-head harness gives the one current
-ShardTelemetry binary and a typed ClickHouse `MergeTree` the same immutable
-corpus, 16 physical cores, and source prewarm. It runs the production-default
-locality-disabled path before ClickHouse:
+On Adam, the sequential live head-to-head harness gives the current
+ShardTelemetry server/loader and a typed ClickHouse `MergeTree` the same
+immutable corpus, 16 physical cores, and source prewarm. It runs the
+production-default locality-disabled path before ClickHouse:
 
 ```text
-scripts/run-head-to-head.sh
+scripts/run-clickhouse-adapter-head-to-head.sh
 ```
 
 It verifies the 80 GiB source checksum, pins both engines to CPUs `0-15`,
 persists each engine into an isolated new result directory, requires equal
-accepted row counts, and records provenance plus a TSV summary.
-The current [80 GiB acceptance result](BENCHMARKS.md) measured the sole
-Pco/zstd format at 3,622.67 MiB/s and 138.34x versus 915.72 MiB/s and 73.07x
-for ClickHouse. It stored 620,912,446 bytes, including its embedded
-compression-derived lookup index. The homogeneous corpus remains in base
-placement, so locality routing stays opt-in.
+accepted row counts and exact query results, and records pinned provenance.
+The current [80 GiB acceptance result](BENCHMARKS.md) produced 607,363,459
+rows in both engines. ShardTelemetry stored 2,702,973,946 bytes at 31.78x
+versus ClickHouse's 6,091,870,726 active-part bytes at 14.10x, a 55.63%
+reduction. ClickHouse ingested faster—234.80 versus 148.60 MiB/s—so the live
+path does not yet meet the 1 GiB/s-per-core objective. ShardTelemetry won warm
+latest and indexed-token p50 by 10.96x and 17.15x, while ClickHouse won exact
+stream p50 by 11.50x. The homogeneous corpus remains in base placement, so
+locality routing stays opt-in.
 
 Run component-level fingerprint, tentative-shard probe, block
 score/split/assignment, handoff, throughput, and seal-latency measurements

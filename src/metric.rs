@@ -1900,8 +1900,17 @@ impl MetricStripe {
                 }
             }
         }
-        let mut points = winners.into_values().collect::<Vec<_>>();
-        points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
+        let mut points = winners
+            .into_values()
+            .filter(|point| metric_query_cursor_matches(query, point))
+            .collect::<Vec<_>>();
+        if query.partition.is_some() {
+            points.sort_unstable_by_key(|point| point.record_ref.offset);
+        } else {
+            points.sort_unstable_by_key(|point| {
+                (point.timestamp_unix_nanos, point.record_ref.offset)
+            });
+        }
         points.truncate(limit);
         Ok(points)
     }
@@ -1917,6 +1926,9 @@ impl MetricStripe {
         };
         if !metric_identity_matches(query, &head.identity) {
             return Ok(Vec::new());
+        }
+        if query.partition.is_some() || query.start_offset.is_some() {
+            return self.query_exact_series_by_offset(query, series, head, limit);
         }
         if self.exact_series_sources_are_disjoint(series, head) {
             return self.query_disjoint_exact_series(query, series, head, limit);
@@ -1962,7 +1974,7 @@ impl MetricStripe {
                     for point in head
                         .points
                         .values()
-                        .filter(|point| metric_point_time_matches(query, point))
+                        .filter(|point| metric_query_matches(query, point))
                     {
                         retain_exact_metric_winner(&mut winners, point.clone());
                     }
@@ -1971,14 +1983,55 @@ impl MetricStripe {
                     let decoded = self.decode_chunk(chunk)?;
                     for point in decoded
                         .iter()
-                        .filter(|point| metric_point_time_matches(query, point))
+                        .filter(|point| metric_query_matches(query, point))
                     {
                         retain_exact_metric_winner(&mut winners, point.clone());
                     }
                 }
             }
         }
-        Ok(winners.into_values().take(limit).collect())
+        let mut points = winners
+            .into_values()
+            .filter(|point| metric_query_cursor_matches(query, point))
+            .collect::<Vec<_>>();
+        if query.partition.is_some() {
+            points.sort_unstable_by_key(|point| point.record_ref.offset);
+        }
+        points.truncate(limit);
+        Ok(points)
+    }
+
+    fn query_exact_series_by_offset(
+        &self,
+        query: &MetricQuery,
+        series: SeriesFingerprint,
+        head: &SeriesHead,
+        limit: usize,
+    ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        let mut winners = BTreeMap::<u64, DurableMetricPoint>::new();
+        for chunk in self.chunks.get(&series).into_iter().flatten() {
+            let decoded = self.decode_chunk(chunk)?;
+            for point in decoded
+                .iter()
+                .filter(|point| metric_query_matches(query, point))
+            {
+                retain_exact_metric_winner(&mut winners, point.clone());
+            }
+        }
+        for point in head
+            .points
+            .values()
+            .filter(|point| metric_query_matches(query, point))
+        {
+            retain_exact_metric_winner(&mut winners, point.clone());
+        }
+        let mut points = winners
+            .into_values()
+            .filter(|point| metric_query_cursor_matches(query, point))
+            .collect::<Vec<_>>();
+        points.sort_unstable_by_key(|point| point.record_ref.offset);
+        points.truncate(limit);
+        Ok(points)
     }
 
     fn exact_series_sources_are_disjoint(
@@ -2026,7 +2079,7 @@ impl MetricStripe {
             let decoded = self.decode_chunk(chunk)?;
             for point in decoded
                 .iter()
-                .filter(|point| metric_point_time_matches(query, point))
+                .filter(|point| metric_query_matches(query, point))
             {
                 selected.push(point.clone());
                 if selected.len() == limit {
@@ -2037,7 +2090,7 @@ impl MetricStripe {
         for point in head
             .points
             .values()
-            .filter(|point| metric_point_time_matches(query, point))
+            .filter(|point| metric_query_matches(query, point))
         {
             selected.push(point.clone());
             if selected.len() == limit {
@@ -2314,6 +2367,11 @@ fn metric_point_time_matches(query: &MetricQuery, point: &DurableMetricPoint) ->
 pub struct MetricQuery {
     /// Required tenant.
     pub tenant: Arc<str>,
+    /// Optional logical partition for bounded analytical scans.
+    pub partition: Option<TopicPartition>,
+    /// Optional inclusive durable-offset cursor. Applied after same-timestamp
+    /// conflict resolution so pagination cannot expose an obsolete point.
+    pub start_offset: Option<LogicalOffset>,
     /// Optional exact series fingerprint.
     pub series: Option<SeriesFingerprint>,
     /// Optional exact metric name.
@@ -2329,7 +2387,17 @@ pub struct MetricQuery {
 }
 
 pub(crate) fn metric_query_matches(query: &MetricQuery, point: &DurableMetricPoint) -> bool {
-    metric_identity_matches(query, &point.identity) && metric_point_time_matches(query, point)
+    query
+        .partition
+        .is_none_or(|partition| partition == point.record_ref.topic_partition)
+        && metric_identity_matches(query, &point.identity)
+        && metric_point_time_matches(query, point)
+}
+
+fn metric_query_cursor_matches(query: &MetricQuery, point: &DurableMetricPoint) -> bool {
+    query
+        .start_offset
+        .is_none_or(|offset| point.record_ref.offset >= offset)
 }
 
 /// Returns Prometheus-visible string labels for one canonical series.
@@ -2606,6 +2674,57 @@ mod tests {
         assert!(cache.hits > 0);
         assert!(cache.misses > 0);
         assert!(cache.used_bytes <= cache.max_bytes);
+    }
+
+    #[test]
+    fn exact_series_offset_cursor_orders_pages_after_conflict_resolution() {
+        let mut stripe = MetricStripe::new(1024 * 1024).unwrap();
+        stripe.chunk_points = 2;
+        let first = point(1, 300, NumberValue::Integer(1));
+        let series = first.series_fingerprint();
+        for value in [
+            first,
+            point(2, 100, NumberValue::Integer(2)),
+            point(3, 200, NumberValue::Integer(3)),
+        ] {
+            stripe.apply(value, MetricIngestProtocol::Otlp).unwrap();
+        }
+        let replacement = point(4, 300, NumberValue::Integer(9));
+        assert_eq!(
+            stripe
+                .apply(replacement.clone(), MetricIngestProtocol::Otlp)
+                .unwrap(),
+            MetricApplyOutcome::Replaced
+        );
+
+        let partition = replacement.record_ref.topic_partition;
+        let first_page = stripe
+            .query(&MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                partition: Some(partition),
+                series: Some(series),
+                limit: 2,
+                ..MetricQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|point| point.record_ref.offset.get())
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let second_page = stripe
+            .query(&MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                partition: Some(partition),
+                start_offset: Some(LogicalOffset::new(4)),
+                series: Some(series),
+                limit: 2,
+                ..MetricQuery::default()
+            })
+            .unwrap();
+        assert_eq!(second_page, vec![replacement]);
     }
 
     #[test]

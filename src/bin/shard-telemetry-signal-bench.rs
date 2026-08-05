@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::hint::black_box;
 use std::io::{BufWriter, Write};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,13 +10,14 @@ use std::time::{Duration, Instant};
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicPartition};
 use shard_telemetry::{
     CompressionCohortId, CorrelationBlockFilter, CorrelationConfig, CorrelationIndex,
-    CorrelationQuery, DurableLog, DurableMetricPoint, DurableSpan, LOGS_TOPIC_ID, LogQuery,
-    LogStripe, METRICS_TOPIC_ID, MetadataField, MetricIdentity, MetricIngestProtocol, MetricKind,
-    MetricQuery, MetricStripe, MetricValue, NumberValue, OtlpLogEvent, ResourceContext,
+    CorrelationQuery, DurableLog, DurableMetricPoint, DurableSpan, DurableTelemetryConfig,
+    DurableTelemetryStore, LOGS_TOPIC_ID, LogQuery, LogStripe, METRICS_TOPIC_ID, MetadataField,
+    MetricIdentity, MetricIngestProtocol, MetricKind, MetricQuery, MetricStripe, MetricValue,
+    NativePartitionAppend, NativeTelemetryBatch, NumberValue, OtlpLogEvent, ResourceContext,
     ScopeContext, SeriesFingerprint, SpanId, SpanStatus, StripeConfig, TRACES_TOPIC_ID,
-    TelemetryAttribute, TelemetryRecordRef, TelemetrySignal, TelemetryValue, TraceId, TraceQuery,
-    TraceStripe, decode_metric_chunk, decode_structural_block, decode_trace_block,
-    encode_metric_chunk, encode_trace_block,
+    TelemetryAttribute, TelemetryEnvelope, TelemetryRecordRef, TelemetryRouter, TelemetrySignal,
+    TelemetryValue, TraceId, TraceQuery, TraceStripe, decode_metric_chunk, decode_structural_block,
+    decode_trace_block, encode_metric_chunk, encode_trace_block,
 };
 
 const TENANT: &str = "production-example";
@@ -26,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut iterations = 2_000usize;
     let mut clickhouse_dir = None::<PathBuf>;
     let mut durable_output_dir = None::<PathBuf>;
+    let mut server_data_directory = None::<PathBuf>;
+    let mut server_shards = 1usize;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -42,11 +46,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .ok_or("missing value for --durable-output-dir")?,
                 ));
             }
+            "--server-data-directory" => {
+                server_data_directory = Some(PathBuf::from(
+                    args.next()
+                        .ok_or("missing value for --server-data-directory")?,
+                ));
+            }
+            "--server-shards" => server_shards = parse_usize(args.next(), "--server-shards")?,
             _ => return Err(format!("unknown argument {argument}").into()),
         }
     }
-    if records < 128 || iterations == 0 {
-        return Err("--records must be at least 128 and --iterations must be nonzero".into());
+    if records < 128 || iterations == 0 || server_shards == 0 || server_shards > 256 {
+        return Err(
+            "--records must be at least 128, --iterations must be nonzero, and --server-shards must be in 1..=256"
+                .into(),
+        );
     }
 
     let corpus = Corpus::generate(records)?;
@@ -55,6 +69,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(output_dir) = durable_output_dir.as_deref() {
         fs::create_dir_all(output_dir)?;
+    }
+    if let Some(data_directory) = server_data_directory.as_deref() {
+        let started = Instant::now();
+        persist_server_store(&corpus, data_directory, server_shards)?;
+        println!(
+            "server_store records={} shards={} elapsed_seconds={:.6}",
+            corpus.spans.len().saturating_add(corpus.points.len()),
+            server_shards,
+            started.elapsed().as_secs_f64()
+        );
     }
     println!("ShardTelemetry signal benchmark (v1)");
     println!("records_per_signal={records} lookup_iterations={iterations}");
@@ -129,6 +153,7 @@ fn export_clickhouse_corpus(
             "trace_id_hex={}\n",
             "trace_lookup_rows={}\n",
             "series_id={}\n",
+            "series_id_hex={:032x}\n",
             "metric_lookup_rows={}\n",
             "resource_id={}\n",
             "service_name=checkout-api\n"
@@ -139,10 +164,118 @@ fn export_clickhouse_corpus(
         selected_trace,
         trace_expected_rows,
         selected_series.get(),
+        selected_series.get(),
         metric_expected_rows,
         resource.get(),
     );
     fs::write(output_dir.join("manifest.env"), manifest)?;
+    Ok(())
+}
+
+fn persist_server_store(
+    corpus: &Corpus,
+    data_directory: &Path,
+    shard_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if data_directory.exists() {
+        return Err(format!(
+            "server data directory already exists: {}",
+            data_directory.display()
+        )
+        .into());
+    }
+    let shard_count = u32::try_from(shard_count)?;
+    let store = DurableTelemetryStore::open(DurableTelemetryConfig {
+        data_directory: data_directory.to_path_buf(),
+        object_store_directory: None,
+        recovery_journal: true,
+        retention: None,
+        shard_count,
+        tenant_partitions: 256,
+        append_linger: Duration::ZERO,
+        stripe: StripeConfig::default(),
+        indexed_ack_timeout: Duration::from_secs(300),
+    })?;
+
+    let router = TelemetryRouter::new(NonZeroU16::new(256).expect("constant is nonzero"));
+    let mut trace_partitions = BTreeMap::<TopicPartition, Vec<DurableSpan>>::new();
+    for span in &corpus.spans {
+        trace_partitions
+            .entry(router.trace(TENANT, span.trace_id))
+            .or_default()
+            .push(span.clone());
+    }
+    for (trace_partition, partition_records) in trace_partitions {
+        for chunk in partition_records.chunks(32_768) {
+            let mut records = chunk.to_vec();
+            for (ordinal, record) in records.iter_mut().enumerate() {
+                record.stream_shard_id = ShardId::new(0);
+                record.record_ref = TelemetryRecordRef::for_signal(
+                    TelemetrySignal::Traces,
+                    trace_partition,
+                    LogicalOffset::new(u64::try_from(ordinal)?),
+                );
+            }
+            let payload = encode_trace_block(&records)?;
+            let envelope = TelemetryEnvelope::new(
+                TelemetrySignal::Traces,
+                TENANT,
+                u32::try_from(records.len())?,
+                trace_partition.partition_id.get().to_le_bytes().as_slice(),
+                Arc::<[u8]>::from(payload),
+            )?;
+            store.append_telemetry_batch(
+                &NativeTelemetryBatch {
+                    partitions: vec![NativePartitionAppend {
+                        topic_partition: trace_partition,
+                        envelope,
+                    }],
+                },
+                true,
+            )?;
+        }
+    }
+
+    let mut series =
+        BTreeMap::<(TopicPartition, SeriesFingerprint), Vec<DurableMetricPoint>>::new();
+    for point in &corpus.points {
+        let fingerprint = point.series_fingerprint();
+        series
+            .entry((router.metric(TENANT, fingerprint), fingerprint))
+            .or_default()
+            .push(point.clone());
+    }
+    for ((metric_partition, _), mut records) in series {
+        for (ordinal, record) in records.iter_mut().enumerate() {
+            record.stream_shard_id = ShardId::new(0);
+            record.record_ref = TelemetryRecordRef::for_signal(
+                TelemetrySignal::Metrics,
+                metric_partition,
+                LogicalOffset::new(u64::try_from(ordinal)?),
+            );
+        }
+        let payload = encode_metric_chunk(&records)?;
+        let mut routing_metadata = [0_u8; 5];
+        routing_metadata[..4].copy_from_slice(&metric_partition.partition_id.get().to_le_bytes());
+        routing_metadata[4] = 1;
+        let envelope = TelemetryEnvelope::new(
+            TelemetrySignal::Metrics,
+            TENANT,
+            u32::try_from(records.len())?,
+            routing_metadata.as_slice(),
+            Arc::<[u8]>::from(payload),
+        )?;
+        store.append_telemetry_batch(
+            &NativeTelemetryBatch {
+                partitions: vec![NativePartitionAppend {
+                    topic_partition: metric_partition,
+                    envelope,
+                }],
+            },
+            true,
+        )?;
+    }
+    drop(store);
     Ok(())
 }
 
@@ -922,6 +1055,17 @@ mod tests {
         assert!(manifest.contains("records_per_signal=128\n"));
         assert!(manifest.contains("trace_lookup_rows=8\n"));
         assert!(manifest.contains("metric_lookup_rows=1\n"));
+        let series_id = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("series_id="))
+            .unwrap()
+            .parse::<u128>()
+            .unwrap();
+        let series_id_hex = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("series_id_hex="))
+            .unwrap();
+        assert_eq!(series_id_hex, format!("{series_id:032x}"));
         assert!(fs::metadata(output.join("traces.rowbinary")).unwrap().len() > 0);
         assert!(
             fs::metadata(output.join("metrics.rowbinary"))
