@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
@@ -25,6 +25,7 @@ const SIGNAL_INDEX_MAGIC: &[u8; 4] = b"STSI";
 const SIGNAL_INDEX_HEADER_BYTES: usize = 16;
 const CACHE_HEADER_BYTES: usize = 8 + 8 + 32;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static TRANSACTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Metadata returned for one object-store object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,12 @@ pub trait TelemetryObjectStore: Send + Sync {
     /// Returns object metadata, or `None` when the key is absent.
     fn head(&self, key: &str) -> TelemetryResult<Option<ObjectMetadata>>;
 
+    /// Deletes one exact object key.
+    ///
+    /// Deletion is idempotent: an already absent key is a successful outcome.
+    /// Catalog ownership code never calls this with a discovered or listed key.
+    fn delete(&self, key: &str) -> TelemetryResult<()>;
+
     /// Conditionally replaces a small mutable object.
     fn compare_and_swap(
         &self,
@@ -70,15 +77,83 @@ pub trait TelemetryObjectStore: Send + Sync {
     ) -> TelemetryResult<ObjectMetadata>;
 }
 
+#[derive(Debug, Default)]
+struct ObjectStoreCounters {
+    put_requests: AtomicU64,
+    put_bytes: AtomicU64,
+    get_requests: AtomicU64,
+    get_bytes: AtomicU64,
+    range_requests: AtomicU64,
+    range_bytes: AtomicU64,
+    head_requests: AtomicU64,
+    compare_and_swaps: AtomicU64,
+    delete_requests: AtomicU64,
+    failures: AtomicU64,
+}
+
+/// Process-local object-tier operation counters shared by all stripe owners.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectStoreStats {
+    /// Immutable byte and file put attempts.
+    pub put_requests: u64,
+    /// Source bytes accepted by successful put operations.
+    pub put_bytes: u64,
+    /// Complete-object read attempts.
+    pub get_requests: u64,
+    /// Bytes returned by complete-object reads.
+    pub get_bytes: u64,
+    /// Byte-range read attempts.
+    pub range_requests: u64,
+    /// Bytes returned by byte-range reads.
+    pub range_bytes: u64,
+    /// Metadata lookup attempts.
+    pub head_requests: u64,
+    /// Conditional `CURRENT` publication attempts.
+    pub compare_and_swaps: u64,
+    /// Exact-key idempotent deletion attempts.
+    pub delete_requests: u64,
+    /// Failed object-store operations of any kind.
+    pub failures: u64,
+}
+
 /// Cloneable type-erased object-store handle used by production stripe owners.
 #[derive(Clone)]
-pub struct SharedTelemetryObjectStore(Arc<dyn TelemetryObjectStore>);
+pub struct SharedTelemetryObjectStore {
+    inner: Arc<dyn TelemetryObjectStore>,
+    counters: Arc<ObjectStoreCounters>,
+}
 
 impl SharedTelemetryObjectStore {
     /// Wraps an object-store adapter for use by independently owned stripes.
     #[must_use]
     pub fn new(store: Arc<dyn TelemetryObjectStore>) -> Self {
-        Self(store)
+        Self {
+            inner: store,
+            counters: Arc::new(ObjectStoreCounters::default()),
+        }
+    }
+
+    /// Returns operation and transfer counters shared by every clone.
+    #[must_use]
+    pub fn stats(&self) -> ObjectStoreStats {
+        ObjectStoreStats {
+            put_requests: self.counters.put_requests.load(Ordering::Relaxed),
+            put_bytes: self.counters.put_bytes.load(Ordering::Relaxed),
+            get_requests: self.counters.get_requests.load(Ordering::Relaxed),
+            get_bytes: self.counters.get_bytes.load(Ordering::Relaxed),
+            range_requests: self.counters.range_requests.load(Ordering::Relaxed),
+            range_bytes: self.counters.range_bytes.load(Ordering::Relaxed),
+            head_requests: self.counters.head_requests.load(Ordering::Relaxed),
+            compare_and_swaps: self.counters.compare_and_swaps.load(Ordering::Relaxed),
+            delete_requests: self.counters.delete_requests.load(Ordering::Relaxed),
+            failures: self.counters.failures.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_failure<T>(&self, result: &TelemetryResult<T>) {
+        if result.is_err() {
+            self.counters.failures.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -90,29 +165,76 @@ impl std::fmt::Debug for SharedTelemetryObjectStore {
 
 impl From<LocalObjectStore> for SharedTelemetryObjectStore {
     fn from(store: LocalObjectStore) -> Self {
-        Self(Arc::new(store))
+        Self::new(Arc::new(store))
     }
 }
 
 impl TelemetryObjectStore for SharedTelemetryObjectStore {
     fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> TelemetryResult<ObjectMetadata> {
-        self.0.put_bytes_if_absent(key, bytes)
+        self.counters.put_requests.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.put_bytes_if_absent(key, bytes);
+        self.record_failure(&result);
+        if result.is_ok() {
+            self.counters.put_bytes.fetch_add(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        result
     }
 
     fn put_file_if_absent(&self, key: &str, source: &Path) -> TelemetryResult<ObjectMetadata> {
-        self.0.put_file_if_absent(key, source)
+        self.counters.put_requests.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.put_file_if_absent(key, source);
+        self.record_failure(&result);
+        if let Ok(metadata) = &result {
+            self.counters
+                .put_bytes
+                .fetch_add(metadata.bytes, Ordering::Relaxed);
+        }
+        result
     }
 
     fn get(&self, key: &str, max_bytes: u64) -> TelemetryResult<Vec<u8>> {
-        self.0.get(key, max_bytes)
+        self.counters.get_requests.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.get(key, max_bytes);
+        self.record_failure(&result);
+        if let Ok(bytes) = &result {
+            self.counters.get_bytes.fetch_add(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        result
     }
 
     fn get_range(&self, key: &str, range: Range<u64>) -> TelemetryResult<Vec<u8>> {
-        self.0.get_range(key, range)
+        self.counters.range_requests.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.get_range(key, range);
+        self.record_failure(&result);
+        if let Ok(bytes) = &result {
+            self.counters.range_bytes.fetch_add(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        result
     }
 
     fn head(&self, key: &str) -> TelemetryResult<Option<ObjectMetadata>> {
-        self.0.head(key)
+        self.counters.head_requests.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.head(key);
+        self.record_failure(&result);
+        result
+    }
+
+    fn delete(&self, key: &str) -> TelemetryResult<()> {
+        self.counters
+            .delete_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.delete(key);
+        self.record_failure(&result);
+        result
     }
 
     fn compare_and_swap(
@@ -121,7 +243,12 @@ impl TelemetryObjectStore for SharedTelemetryObjectStore {
         expected_version: Option<&str>,
         bytes: &[u8],
     ) -> TelemetryResult<ObjectMetadata> {
-        self.0.compare_and_swap(key, expected_version, bytes)
+        self.counters
+            .compare_and_swaps
+            .fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.compare_and_swap(key, expected_version, bytes);
+        self.record_failure(&result);
+        result
     }
 }
 
@@ -263,6 +390,18 @@ impl TelemetryObjectStore for LocalObjectStore {
     fn head(&self, key: &str) -> TelemetryResult<Option<ObjectMetadata>> {
         let path = self.object_path(key)?;
         metadata_for_path_if_present(&path)
+    }
+
+    fn delete(&self, key: &str) -> TelemetryResult<()> {
+        let path = self.object_path(key)?;
+        let lock = self.update_lock()?;
+        let result = match fs::remove_file(&path) {
+            Ok(()) => sync_parent(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(object_io(key, "delete", error)),
+        };
+        let unlock = unlock_file(&lock);
+        result.and(unlock)
     }
 
     fn compare_and_swap(
@@ -1164,6 +1303,32 @@ pub struct CatalogRoot {
     pub next_block_id: u64,
     /// Ordered immutable catalog pages.
     pub pages: Vec<CatalogPageRef>,
+    /// Exact keys retired by this generation and awaiting their final reader.
+    ///
+    /// This is a bounded, crash-replayable ownership handoff. It is not a
+    /// tracing garbage-collection root and is never populated by object listing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_objects: Vec<RetiredObject>,
+}
+
+/// One exact object whose previous catalog generation relinquished ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredObject {
+    /// Exact key formerly owned by the retired generation.
+    pub object_key: String,
+    /// Earliest wall-clock millisecond when cross-process readers cannot remain.
+    pub delete_after_unix_millis: u64,
+}
+
+/// Result of one bounded exact-key object-tier retention transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TierRetentionReport {
+    /// Complete immutable groups removed from the selected catalog.
+    pub retired_groups: u64,
+    /// Compressed payload bytes removed from the selected catalog.
+    pub retired_payload_bytes: u64,
+    /// Exact object keys transferred to deferred reclamation ownership.
+    pub retired_objects: u64,
 }
 
 impl CatalogRoot {
@@ -1177,6 +1342,7 @@ impl CatalogRoot {
             latest_checkpoint: None,
             next_block_id: 0,
             pages: Vec::new(),
+            retired_objects: Vec::new(),
         }
     }
 
@@ -1214,7 +1380,43 @@ impl CatalogRoot {
                 "catalog root latest checkpoint disagrees with its final page".into(),
             ));
         }
+        let namespace_prefix = format!("{}/", catalog_namespace(shard_id, partition));
+        for (index, retired) in self.retired_objects.iter().enumerate() {
+            validate_object_key(&retired.object_key)?;
+            if !retired.object_key.starts_with(&namespace_prefix)
+                || retired.object_key.ends_with("/CURRENT")
+                || retired.object_key.ends_with("/PENDING")
+                || self.retired_objects[index + 1..]
+                    .iter()
+                    .any(|other| other.object_key == retired.object_key)
+                || self
+                    .pages
+                    .iter()
+                    .any(|page| page.page_key == retired.object_key)
+            {
+                return Err(TelemetryError::CorruptTier(
+                    "catalog root contains an invalid retired-object ownership set".into(),
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+/// Read lease for one immutable catalog generation.
+///
+/// Cloning a lease is equivalent to cloning an `Arc`: a retired root and any
+/// page it replaced cannot be reclaimed until the final lease is dropped.
+#[derive(Debug, Clone)]
+pub struct CatalogLease {
+    root: Arc<CatalogRoot>,
+}
+
+impl CatalogLease {
+    /// Returns the immutable catalog root owned by this lease.
+    #[must_use]
+    pub fn root(&self) -> &CatalogRoot {
+        &self.root
     }
 }
 
@@ -1231,6 +1433,62 @@ pub struct CatalogPointer {
     pub root_bytes: u64,
     /// Root object BLAKE3 checksum.
     pub root_checksum: String,
+}
+
+/// Crash-replayable ownership of every object prepared before `CURRENT` moves.
+///
+/// Each catalog namespace has exactly one fixed `PENDING` key. A publisher
+/// conditionally acquires it before creating any transaction object. Recovery
+/// can therefore delete the recorded exact keys when the target root was not
+/// selected, without listing storage or tracing reachability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CatalogTransaction {
+    format_version: u8,
+    transaction_id: String,
+    target_generation: u64,
+    target_root_key: String,
+    reclaim_after_unix_millis: u64,
+    owned_objects: Vec<String>,
+}
+
+impl CatalogTransaction {
+    fn validate(&self, namespace: &str, max_objects: usize) -> TelemetryResult<()> {
+        let owned_prefix = format!("{namespace}/transactions/{}/", self.transaction_id);
+        if self.format_version != TIER_FORMAT_VERSION
+            || self.transaction_id.len() != 32
+            || !self
+                .transaction_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.target_generation == 0
+            || self.reclaim_after_unix_millis == 0
+            || self.owned_objects.is_empty()
+            || self.owned_objects.len() > max_objects
+            || !self
+                .owned_objects
+                .iter()
+                .any(|key| key == &self.target_root_key)
+            || !self.target_root_key.starts_with(&owned_prefix)
+            || self
+                .owned_objects
+                .iter()
+                .any(|key| !key.starts_with(&owned_prefix))
+        {
+            return Err(TelemetryError::CorruptTier(
+                "catalog PENDING transaction is invalid".into(),
+            ));
+        }
+        validate_object_key(&self.target_root_key)?;
+        for (index, key) in self.owned_objects.iter().enumerate() {
+            validate_object_key(key)?;
+            if self.owned_objects[index + 1..].contains(key) {
+                return Err(TelemetryError::CorruptTier(
+                    "catalog PENDING transaction repeats an owned key".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl CatalogPointer {
@@ -1341,6 +1599,12 @@ pub struct ObjectTierConfig {
     pub groups_per_page: usize,
     /// Maximum bytes read for any root, page, or group manifest.
     pub max_control_object_bytes: u64,
+    /// Maximum exact retired keys carried by one catalog generation.
+    pub max_retired_objects: usize,
+    /// Safety window for readers in another process that leased the old root.
+    pub retirement_grace: std::time::Duration,
+    /// Maximum expected duration of one publication before failover may reclaim it.
+    pub transaction_lease: std::time::Duration,
 }
 
 impl Default for ObjectTierConfig {
@@ -1351,12 +1615,15 @@ impl Default for ObjectTierConfig {
             max_blocks_per_group: 4_096,
             groups_per_page: 1_024,
             max_control_object_bytes: 64 * 1024 * 1024,
+            max_retired_objects: 4_096,
+            retirement_grace: std::time::Duration::from_secs(10 * 60),
+            transaction_lease: std::time::Duration::from_secs(30 * 60),
         }
     }
 }
 
 impl ObjectTierConfig {
-    fn validate(self) -> TelemetryResult<()> {
+    pub(crate) fn validate(self) -> TelemetryResult<()> {
         if self.target_group_payload_bytes == 0
             || self.max_group_payload_bytes < self.target_group_payload_bytes
         {
@@ -1379,6 +1646,23 @@ impl ObjectTierConfig {
                 "object tier control-object limit must be at least 64 KiB",
             ));
         }
+        if self.max_retired_objects < 2 {
+            return Err(TelemetryError::InvalidConfig(
+                "object tier must allow at least two retired ownership keys",
+            ));
+        }
+        if self.retirement_grace > std::time::Duration::from_secs(24 * 60 * 60) {
+            return Err(TelemetryError::InvalidConfig(
+                "object tier retirement grace cannot exceed 24 hours",
+            ));
+        }
+        if self.transaction_lease.is_zero()
+            || self.transaction_lease > std::time::Duration::from_secs(24 * 60 * 60)
+        {
+            return Err(TelemetryError::InvalidConfig(
+                "object tier transaction lease must be between one nanosecond and 24 hours",
+            ));
+        }
         Ok(())
     }
 }
@@ -1391,8 +1675,10 @@ pub struct TelemetryObjectTier<S> {
     partition: TopicPartition,
     namespace: String,
     config: ObjectTierConfig,
-    root: CatalogRoot,
+    root: Arc<CatalogRoot>,
+    current_root_key: Option<String>,
     current_version: Option<String>,
+    retired_leases: HashMap<String, Weak<CatalogRoot>>,
 }
 
 impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
@@ -1410,15 +1696,19 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         let namespace = catalog_namespace(shard_id, partition);
         let current_key = format!("{namespace}/CURRENT");
         let Some(current_metadata) = store.head(&current_key)? else {
-            return Ok(Self {
+            let mut tier = Self {
                 store,
                 shard_id,
                 partition,
                 namespace,
                 config,
-                root: CatalogRoot::empty(shard_id, partition),
+                root: Arc::new(CatalogRoot::empty(shard_id, partition)),
+                current_root_key: None,
                 current_version: None,
-            });
+                retired_leases: HashMap::new(),
+            };
+            tier.recover_pending_transaction()?;
+            return Ok(tier);
         };
         if current_metadata.bytes > POINTER_READ_LIMIT {
             return Err(TelemetryError::CorruptTier(
@@ -1443,15 +1733,26 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
                 "catalog CURRENT and root generations disagree".into(),
             ));
         }
-        Ok(Self {
+        if root.retired_objects.len() > config.max_retired_objects {
+            return Err(TelemetryError::CorruptTier(
+                "catalog root exceeds the retired-object ownership bound".into(),
+            ));
+        }
+        let current_root_key = pointer.root_key;
+        let mut tier = Self {
             store,
             shard_id,
             partition,
             namespace,
             config,
-            root,
+            root: Arc::new(root),
+            current_root_key: Some(current_root_key),
             current_version: Some(current_metadata.version_token),
-        })
+            retired_leases: HashMap::new(),
+        };
+        tier.recover_pending_transaction()?;
+        tier.reclaim_retired_objects()?;
+        Ok(tier)
     }
 
     /// Returns the currently selected immutable root.
@@ -1460,48 +1761,226 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         &self.root
     }
 
+    /// Acquires an immutable generation lease for a query or background read.
+    #[must_use]
+    pub fn catalog_lease(&self) -> CatalogLease {
+        CatalogLease {
+            root: Arc::clone(&self.root),
+        }
+    }
+
     /// Returns the object-store adapter.
     #[must_use]
     pub fn object_store(&self) -> &S {
         &self.store
     }
 
+    /// Returns exact retired keys still waiting for an in-process reader lease.
+    #[must_use]
+    pub fn pending_retired_objects(&self) -> usize {
+        self.root.retired_objects.len()
+    }
+
+    pub(crate) fn reclaim_retired_objects(&mut self) -> TelemetryResult<()> {
+        if self.root.retired_objects.is_empty() {
+            return Ok(());
+        }
+        let retired = std::mem::take(&mut Arc::make_mut(&mut self.root).retired_objects);
+        let mut pending = Vec::new();
+        let mut first_error = None;
+        let now = unix_time_millis();
+        for retired_object in retired {
+            let key = &retired_object.object_key;
+            let leased = self
+                .retired_leases
+                .get(key)
+                .and_then(Weak::upgrade)
+                .is_some();
+            if leased || now < retired_object.delete_after_unix_millis {
+                pending.push(retired_object);
+                continue;
+            }
+            match self.store.delete(key) {
+                Ok(()) => {
+                    self.retired_leases.remove(key);
+                }
+                Err(error) => {
+                    pending.push(retired_object);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        Arc::make_mut(&mut self.root).retired_objects = pending;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn verify_current_pointer(&self) -> TelemetryResult<()> {
+        let current_key = format!("{}/CURRENT", self.namespace);
+        let observed = self.store.head(&current_key)?;
+        let observed_version = observed
+            .as_ref()
+            .map(|metadata| metadata.version_token.as_str());
+        if observed_version != self.current_version.as_deref() {
+            return Err(TelemetryError::StaleCatalog {
+                expected: self.current_version.clone(),
+                observed: observed.map(|metadata| metadata.version_token),
+            });
+        }
+        Ok(())
+    }
+
+    fn pending_key(&self) -> String {
+        format!("{}/PENDING", self.namespace)
+    }
+
+    fn max_transaction_objects(&self) -> usize {
+        self.config.max_retired_objects.saturating_add(4)
+    }
+
+    fn transaction_id(&self, generation: u64) -> String {
+        let sequence = TRANSACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let identity = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            std::process::id(),
+            timestamp,
+            sequence,
+            self.shard_id.get(),
+            self.partition.topic_id.get(),
+            self.partition.partition_id.get(),
+            generation
+        );
+        checksum_bytes(identity.as_bytes())[..32].to_owned()
+    }
+
+    fn recover_pending_transaction(&mut self) -> TelemetryResult<()> {
+        let pending_key = self.pending_key();
+        let Some(metadata) = self.store.head(&pending_key)? else {
+            return Ok(());
+        };
+        if metadata.bytes > self.config.max_control_object_bytes {
+            return Err(TelemetryError::CorruptTier(
+                "catalog PENDING transaction exceeds its read limit".into(),
+            ));
+        }
+        let bytes = self
+            .store
+            .get(&pending_key, self.config.max_control_object_bytes)?;
+        verify_bytes_metadata(&bytes, &metadata, "catalog PENDING transaction")?;
+        let transaction: CatalogTransaction = decode_json(&bytes, "catalog PENDING transaction")?;
+        transaction.validate(&self.namespace, self.max_transaction_objects())?;
+
+        let committed = self.current_root_key.as_deref()
+            == Some(transaction.target_root_key.as_str())
+            && self.root.generation == transaction.target_generation;
+        if !committed {
+            if unix_time_millis() < transaction.reclaim_after_unix_millis {
+                return Err(TelemetryError::ObjectStore(format!(
+                    "catalog transaction {} is still owned by an active writer lease",
+                    transaction.transaction_id
+                )));
+            }
+            for key in &transaction.owned_objects {
+                self.store.delete(key)?;
+            }
+        }
+        self.store.delete(&pending_key)
+    }
+
+    fn begin_transaction(&mut self, transaction: &CatalogTransaction) -> TelemetryResult<()> {
+        self.recover_pending_transaction()?;
+        self.verify_current_pointer()?;
+        transaction.validate(&self.namespace, self.max_transaction_objects())?;
+        let bytes = encode_json(transaction, "catalog PENDING transaction")?;
+        ensure_control_size(
+            bytes.len(),
+            self.config.max_control_object_bytes,
+            "catalog PENDING transaction",
+        )?;
+        self.store
+            .compare_and_swap(&self.pending_key(), None, &bytes)?;
+        Ok(())
+    }
+
+    fn abort_transaction(
+        &self,
+        transaction: &CatalogTransaction,
+        primary: TelemetryError,
+    ) -> TelemetryError {
+        let mut cleanup_error = None;
+        for key in &transaction.owned_objects {
+            if let Err(error) = self.store.delete(key)
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(error);
+            }
+        }
+        if cleanup_error.is_none()
+            && let Err(error) = self.store.delete(&self.pending_key())
+        {
+            cleanup_error = Some(error);
+        }
+        if let Some(cleanup) = cleanup_error {
+            TelemetryError::ObjectStore(format!(
+                "{primary}; exact-key transaction cleanup will retry from PENDING: {cleanup}"
+            ))
+        } else {
+            primary
+        }
+    }
+
+    fn complete_transaction(&self) {
+        // `CURRENT` already makes the target root authoritative. If this
+        // idempotent cleanup fails, startup observes that target and removes
+        // only PENDING, preserving every selected object.
+        let _ = self.store.delete(&self.pending_key());
+    }
+
     /// Publishes a complete immutable group and conditionally advances `CURRENT`.
     ///
-    /// Artifact, manifest, page, and root writes are idempotent. A competing
-    /// writer can only cause the final compare-and-swap to fail.
+    /// A fixed `PENDING` ownership record is selected before any immutable
+    /// object is created. A crash or stale writer can therefore relinquish
+    /// every exact transaction key without object listing or tracing GC.
     pub fn publish_group(&mut self, source: TierGroupSource) -> TelemetryResult<TierGroupManifest> {
+        self.reclaim_retired_objects()?;
+        self.recover_pending_transaction()?;
+        self.verify_current_pointer()?;
         validate_source(&source)?;
+        let next_generation =
+            self.root.generation.checked_add(1).ok_or_else(|| {
+                TelemetryError::ObjectStore("catalog generation exhausted".into())
+            })?;
+        let transaction_id = self.transaction_id(next_generation);
         let mut artifacts = Vec::with_capacity(source.artifacts.len());
+        let mut artifact_objects = Vec::with_capacity(source.artifacts.len());
         for artifact_source in &source.artifacts {
             let source_metadata = hash_file(&artifact_source.path)?;
             let object_key = format!(
-                "{}/groups/{:020}/{}-{}-{}",
+                "{}/transactions/{}/groups/{:020}/{}-{}-{}",
                 self.namespace,
+                transaction_id,
                 source.group_sequence,
                 artifact_source.kind.key_name(),
                 artifact_source.name,
                 source_metadata.content_digest
             );
-            let stored = self
-                .store
-                .put_file_if_absent(&object_key, &artifact_source.path)?;
-            if stored.bytes != source_metadata.bytes
-                || stored.content_digest != source_metadata.content_digest
-            {
-                return Err(TelemetryError::CorruptTier(format!(
-                    "object store changed artifact {}",
-                    artifact_source.name
-                )));
-            }
             artifacts.push(TierArtifact {
                 kind: artifact_source.kind,
                 name: artifact_source.name.clone(),
-                object_key,
-                bytes: stored.bytes,
+                object_key: object_key.clone(),
+                bytes: source_metadata.bytes,
                 checksum_algorithm: CHECKSUM_ALGORITHM.into(),
-                checksum: stored.content_digest,
+                checksum: source_metadata.content_digest.clone(),
             });
+            artifact_objects.push((object_key, artifact_source.path.clone(), source_metadata));
         }
         let manifest = TierGroupManifest {
             format_version: TIER_FORMAT_VERSION,
@@ -1510,7 +1989,7 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
             shard_id: self.shard_id.get(),
             topic_id: self.partition.topic_id.get().to_string(),
             partition_id: self.partition.partition_id.get(),
-            blocks: source.blocks,
+            blocks: source.blocks.clone(),
             artifacts,
         };
         manifest.validate(
@@ -1527,12 +2006,14 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         )?;
         let manifest_checksum = checksum_bytes(&manifest_bytes);
         let manifest_key = format!(
-            "{}/groups/{:020}/manifest-{}.json",
-            self.namespace, manifest.group_sequence, manifest_checksum
+            "{}/transactions/{}/groups/{:020}/manifest-{}.json",
+            self.namespace, transaction_id, manifest.group_sequence, manifest_checksum
         );
-        let manifest_metadata = self
-            .store
-            .put_bytes_if_absent(&manifest_key, &manifest_bytes)?;
+        let manifest_metadata = ObjectMetadata {
+            bytes: u64::try_from(manifest_bytes.len()).unwrap_or(u64::MAX),
+            version_token: String::new(),
+            content_digest: manifest_checksum,
+        };
         let entry = CatalogGroupEntry::from_manifest(&manifest, manifest_key, &manifest_metadata)?;
 
         if let Some(last_page_ref) = self.root.pages.last() {
@@ -1542,12 +2023,13 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
                 .last()
                 .expect("validated catalog pages are nonempty");
             if source.group_sequence == last_group.group_sequence {
-                if *last_group != entry {
+                let existing = self.load_group(last_group)?;
+                if !same_group_contents(&existing, &manifest) {
                     return Err(TelemetryError::CorruptTier(
                         "group sequence was retried with different contents".into(),
                     ));
                 }
-                return Ok(manifest);
+                return Ok(existing);
             }
             if source.group_sequence < last_group.group_sequence {
                 return Err(TelemetryError::ObjectStore(
@@ -1565,7 +2047,7 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
             Some(last_ref) => {
                 let mut last = self.load_page(last_ref)?;
                 if last.groups.len() < self.config.groups_per_page {
-                    last.groups.push(entry);
+                    last.groups.push(entry.clone());
                     (last, true)
                 } else {
                     (
@@ -1579,7 +2061,7 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
                             shard_id: self.shard_id.get(),
                             topic_id: self.partition.topic_id.get().to_string(),
                             partition_id: self.partition.partition_id.get(),
-                            groups: vec![entry],
+                            groups: vec![entry.clone()],
                         },
                         false,
                     )
@@ -1592,7 +2074,7 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
                     shard_id: self.shard_id.get(),
                     topic_id: self.partition.topic_id.get().to_string(),
                     partition_id: self.partition.partition_id.get(),
-                    groups: vec![entry],
+                    groups: vec![entry.clone()],
                 },
                 false,
             ),
@@ -1606,17 +2088,18 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         )?;
         let page_checksum = checksum_bytes(&page_bytes);
         let page_key = format!(
-            "{}/pages/page-{:020}-{}.json",
-            self.namespace, page.page_sequence, page_checksum
+            "{}/transactions/{}/pages/page-{:020}-{}.json",
+            self.namespace, transaction_id, page.page_sequence, page_checksum
         );
-        let page_metadata = self.store.put_bytes_if_absent(&page_key, &page_bytes)?;
+        let page_metadata = ObjectMetadata {
+            bytes: u64::try_from(page_bytes.len()).unwrap_or(u64::MAX),
+            version_token: String::new(),
+            content_digest: page_checksum,
+        };
         let page_ref = CatalogPageRef::from_page(&page, page_key, &page_metadata)?;
 
-        let mut next_root = self.root.clone();
-        next_root.generation = next_root
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| TelemetryError::ObjectStore("catalog generation exhausted".into()))?;
+        let mut next_root = (*self.root).clone();
+        next_root.generation = next_generation;
         next_root.latest_checkpoint = Some(source.checkpoint);
         let first_block_id = manifest
             .blocks
@@ -1639,9 +2122,45 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
             *next_root
                 .pages
                 .last_mut()
-                .expect("a replaced page has an existing reference") = page_ref;
+                .expect("a replaced page has an existing reference") = page_ref.clone();
         } else {
-            next_root.pages.push(page_ref);
+            next_root.pages.push(page_ref.clone());
+        }
+        let mut newly_retired = Vec::with_capacity(2);
+        let delete_after_unix_millis = unix_time_millis().saturating_add(
+            u64::try_from(self.config.retirement_grace.as_millis()).unwrap_or(u64::MAX),
+        );
+        if let Some(root_key) = &self.current_root_key {
+            newly_retired.push(RetiredObject {
+                object_key: root_key.clone(),
+                delete_after_unix_millis,
+            });
+        }
+        if replace_last {
+            newly_retired.push(RetiredObject {
+                object_key: self
+                    .root
+                    .pages
+                    .last()
+                    .expect("a replaced page has an existing reference")
+                    .page_key
+                    .clone(),
+                delete_after_unix_millis,
+            });
+        }
+        next_root
+            .retired_objects
+            .extend(newly_retired.iter().cloned());
+        next_root
+            .retired_objects
+            .sort_unstable_by(|left, right| left.object_key.cmp(&right.object_key));
+        next_root
+            .retired_objects
+            .dedup_by(|left, right| left.object_key == right.object_key);
+        if next_root.retired_objects.len() > self.config.max_retired_objects {
+            return Err(TelemetryError::ObjectStore(
+                "catalog generation exhausted its exact retired-object ownership bound".into(),
+            ));
         }
         next_root.validate(self.shard_id, self.partition)?;
         let root_bytes = encode_json(&next_root, "catalog root")?;
@@ -1652,16 +2171,20 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         )?;
         let root_checksum = checksum_bytes(&root_bytes);
         let root_key = format!(
-            "{}/roots/root-{:020}-{}.json",
-            self.namespace, next_root.generation, root_checksum
+            "{}/transactions/{}/roots/root-{:020}-{}.json",
+            self.namespace, transaction_id, next_root.generation, root_checksum
         );
-        let root_metadata = self.store.put_bytes_if_absent(&root_key, &root_bytes)?;
+        let root_metadata = ObjectMetadata {
+            bytes: u64::try_from(root_bytes.len()).unwrap_or(u64::MAX),
+            version_token: String::new(),
+            content_digest: root_checksum,
+        };
         let pointer = CatalogPointer {
             format_version: TIER_FORMAT_VERSION,
             generation: next_root.generation,
-            root_key,
+            root_key: root_key.clone(),
             root_bytes: root_metadata.bytes,
-            root_checksum: root_metadata.content_digest,
+            root_checksum: root_metadata.content_digest.clone(),
         };
         let pointer_bytes = encode_json(&pointer, "catalog CURRENT")?;
         if u64::try_from(pointer_bytes.len()).unwrap_or(u64::MAX) > POINTER_READ_LIMIT {
@@ -1669,15 +2192,301 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
                 "catalog CURRENT pointer exceeds its read limit".into(),
             ));
         }
-        let current_key = format!("{}/CURRENT", self.namespace);
-        let current_metadata = self.store.compare_and_swap(
-            &current_key,
-            self.current_version.as_deref(),
-            &pointer_bytes,
-        )?;
-        self.root = next_root;
+        let mut owned_objects = artifact_objects
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<Vec<_>>();
+        owned_objects.extend([
+            entry.manifest_key.clone(),
+            page_ref.page_key.clone(),
+            root_key,
+        ]);
+        let transaction = CatalogTransaction {
+            format_version: TIER_FORMAT_VERSION,
+            transaction_id,
+            target_generation: next_generation,
+            target_root_key: pointer.root_key.clone(),
+            reclaim_after_unix_millis: unix_time_millis().saturating_add(
+                u64::try_from(self.config.transaction_lease.as_millis()).unwrap_or(u64::MAX),
+            ),
+            owned_objects,
+        };
+        self.begin_transaction(&transaction)?;
+
+        let publication = (|| -> TelemetryResult<ObjectMetadata> {
+            for (key, path, expected) in &artifact_objects {
+                let stored = self.store.put_file_if_absent(key, path)?;
+                verify_object_metadata(&stored, expected, "group artifact")?;
+            }
+            let stored_manifest = self
+                .store
+                .put_bytes_if_absent(&entry.manifest_key, &manifest_bytes)?;
+            verify_object_metadata(&stored_manifest, &manifest_metadata, "group manifest")?;
+            let stored_page = self
+                .store
+                .put_bytes_if_absent(&page_ref.page_key, &page_bytes)?;
+            verify_object_metadata(&stored_page, &page_metadata, "catalog page")?;
+            let stored_root = self
+                .store
+                .put_bytes_if_absent(&pointer.root_key, &root_bytes)?;
+            verify_object_metadata(&stored_root, &root_metadata, "catalog root")?;
+
+            self.store.compare_and_swap(
+                &format!("{}/CURRENT", self.namespace),
+                self.current_version.as_deref(),
+                &pointer_bytes,
+            )
+        })();
+        let current_metadata = match publication {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(self.abort_transaction(&transaction, error)),
+        };
+        let retired_root = Arc::clone(&self.root);
+        self.root = Arc::new(next_root);
+        self.current_root_key = Some(pointer.root_key);
         self.current_version = Some(current_metadata.version_token);
+        let retired_lease = Arc::downgrade(&retired_root);
+        for retired in newly_retired {
+            self.retired_leases
+                .insert(retired.object_key, Weak::clone(&retired_lease));
+        }
+        drop(retired_root);
+        self.complete_transaction();
+        self.reclaim_retired_objects()?;
         Ok(manifest)
+    }
+
+    /// Removes complete groups older than `cutoff_timestamp_unix_nanos`.
+    ///
+    /// The transaction is bounded by `max_retired_objects`, rewrites only pages
+    /// that actually lose groups, and records every relinquished key in the new
+    /// root before `CURRENT` advances. The newest group remains as the durable
+    /// recovery checkpoint anchor. No object listing or reachability scan occurs.
+    pub fn retain_since_timestamp(
+        &mut self,
+        cutoff_timestamp_unix_nanos: u64,
+    ) -> TelemetryResult<TierRetentionReport> {
+        self.reclaim_retired_objects()?;
+        self.recover_pending_transaction()?;
+        self.verify_current_pointer()?;
+        let Some(final_group_sequence) =
+            self.root.pages.last().map(|page| page.last_group_sequence)
+        else {
+            return Ok(TierRetentionReport::default());
+        };
+        let available_retirements = self
+            .config
+            .max_retired_objects
+            .saturating_sub(self.root.retired_objects.len())
+            .saturating_sub(1);
+        if available_retirements < 3 {
+            return Ok(TierRetentionReport::default());
+        }
+        let next_generation =
+            self.root.generation.checked_add(1).ok_or_else(|| {
+                TelemetryError::ObjectStore("catalog generation exhausted".into())
+            })?;
+        let transaction_id = self.transaction_id(next_generation);
+
+        let mut next_pages = Vec::with_capacity(self.root.pages.len());
+        let mut replacement_objects = Vec::new();
+        let mut retired_keys = Vec::new();
+        let mut report = TierRetentionReport::default();
+        for page_ref in &self.root.pages {
+            let page = self.load_page(page_ref)?;
+            let mut retained_groups = Vec::with_capacity(page.groups.len());
+            let mut page_changed = false;
+            for group in page.groups {
+                if group.group_sequence == final_group_sequence
+                    || group.max_timestamp_unix_nanos >= cutoff_timestamp_unix_nanos
+                {
+                    retained_groups.push(group);
+                    continue;
+                }
+                let manifest = self.load_group(&group)?;
+                let required = 1usize.saturating_add(manifest.artifacts.len());
+                let page_key_cost = usize::from(!page_changed);
+                if retired_keys
+                    .len()
+                    .saturating_add(required)
+                    .saturating_add(page_key_cost)
+                    > available_retirements
+                {
+                    retained_groups.push(group);
+                    continue;
+                }
+                if !page_changed {
+                    retired_keys.push(page_ref.page_key.clone());
+                    page_changed = true;
+                }
+                retired_keys.push(group.manifest_key.clone());
+                retired_keys.extend(
+                    manifest
+                        .artifacts
+                        .iter()
+                        .map(|artifact| artifact.object_key.clone()),
+                );
+                report.retired_groups = report.retired_groups.saturating_add(1);
+                report.retired_payload_bytes = report
+                    .retired_payload_bytes
+                    .saturating_add(group.payload_bytes);
+            }
+            if !page_changed {
+                next_pages.push(page_ref.clone());
+                continue;
+            }
+            if retained_groups.is_empty() {
+                continue;
+            }
+            let replacement = CatalogPage {
+                format_version: TIER_FORMAT_VERSION,
+                page_sequence: page.page_sequence,
+                shard_id: page.shard_id,
+                topic_id: page.topic_id,
+                partition_id: page.partition_id,
+                groups: retained_groups,
+            };
+            replacement.validate(self.shard_id, self.partition, self.config.groups_per_page)?;
+            let bytes = encode_json(&replacement, "retained catalog page")?;
+            ensure_control_size(
+                bytes.len(),
+                self.config.max_control_object_bytes,
+                "retained catalog page",
+            )?;
+            let checksum = checksum_bytes(&bytes);
+            let key = format!(
+                "{}/transactions/{}/pages/page-{:020}-{}.json",
+                self.namespace, transaction_id, replacement.page_sequence, checksum
+            );
+            let metadata = ObjectMetadata {
+                bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                version_token: String::new(),
+                content_digest: checksum,
+            };
+            next_pages.push(CatalogPageRef::from_page(
+                &replacement,
+                key.clone(),
+                &metadata,
+            )?);
+            replacement_objects.push((key, bytes, metadata));
+        }
+        if report.retired_groups == 0 {
+            return Ok(report);
+        }
+
+        let current_root_key = self.current_root_key.clone().ok_or_else(|| {
+            TelemetryError::CorruptTier("nonempty catalog has no selected root key".into())
+        })?;
+        retired_keys.push(current_root_key);
+        retired_keys.sort_unstable();
+        retired_keys.dedup();
+        let delete_after_unix_millis = unix_time_millis().saturating_add(
+            u64::try_from(self.config.retirement_grace.as_millis()).unwrap_or(u64::MAX),
+        );
+        let newly_retired = retired_keys
+            .into_iter()
+            .map(|object_key| RetiredObject {
+                object_key,
+                delete_after_unix_millis,
+            })
+            .collect::<Vec<_>>();
+        report.retired_objects = u64::try_from(newly_retired.len()).unwrap_or(u64::MAX);
+
+        let mut next_root = (*self.root).clone();
+        next_root.generation = next_generation;
+        next_root.pages = next_pages;
+        next_root
+            .retired_objects
+            .extend(newly_retired.iter().cloned());
+        next_root
+            .retired_objects
+            .sort_unstable_by(|left, right| left.object_key.cmp(&right.object_key));
+        next_root
+            .retired_objects
+            .dedup_by(|left, right| left.object_key == right.object_key);
+        if next_root.retired_objects.len() > self.config.max_retired_objects {
+            return Err(TelemetryError::ObjectStore(
+                "retention exhausted the exact retired-object ownership bound".into(),
+            ));
+        }
+        next_root.validate(self.shard_id, self.partition)?;
+        let root_bytes = encode_json(&next_root, "retained catalog root")?;
+        ensure_control_size(
+            root_bytes.len(),
+            self.config.max_control_object_bytes,
+            "retained catalog root",
+        )?;
+        let root_checksum = checksum_bytes(&root_bytes);
+        let root_key = format!(
+            "{}/transactions/{}/roots/root-{:020}-{}.json",
+            self.namespace, transaction_id, next_root.generation, root_checksum
+        );
+        let root_metadata = ObjectMetadata {
+            bytes: u64::try_from(root_bytes.len()).unwrap_or(u64::MAX),
+            version_token: String::new(),
+            content_digest: root_checksum,
+        };
+        let pointer = CatalogPointer {
+            format_version: TIER_FORMAT_VERSION,
+            generation: next_root.generation,
+            root_key: root_key.clone(),
+            root_bytes: root_metadata.bytes,
+            root_checksum: root_metadata.content_digest.clone(),
+        };
+        let pointer_bytes = encode_json(&pointer, "catalog CURRENT")?;
+        if u64::try_from(pointer_bytes.len()).unwrap_or(u64::MAX) > POINTER_READ_LIMIT {
+            return Err(TelemetryError::CorruptTier(
+                "catalog CURRENT pointer exceeds its read limit".into(),
+            ));
+        }
+        let mut owned_objects = replacement_objects
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<Vec<_>>();
+        owned_objects.push(root_key);
+        let transaction = CatalogTransaction {
+            format_version: TIER_FORMAT_VERSION,
+            transaction_id,
+            target_generation: next_generation,
+            target_root_key: pointer.root_key.clone(),
+            reclaim_after_unix_millis: unix_time_millis().saturating_add(
+                u64::try_from(self.config.transaction_lease.as_millis()).unwrap_or(u64::MAX),
+            ),
+            owned_objects,
+        };
+        self.begin_transaction(&transaction)?;
+        let publication = (|| -> TelemetryResult<ObjectMetadata> {
+            for (key, bytes, expected) in &replacement_objects {
+                let stored = self.store.put_bytes_if_absent(key, bytes)?;
+                verify_object_metadata(&stored, expected, "retained catalog page")?;
+            }
+            let stored_root = self
+                .store
+                .put_bytes_if_absent(&pointer.root_key, &root_bytes)?;
+            verify_object_metadata(&stored_root, &root_metadata, "retained catalog root")?;
+            self.store.compare_and_swap(
+                &format!("{}/CURRENT", self.namespace),
+                self.current_version.as_deref(),
+                &pointer_bytes,
+            )
+        })();
+        let current_metadata = match publication {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(self.abort_transaction(&transaction, error)),
+        };
+        let retired_root = Arc::clone(&self.root);
+        self.root = Arc::new(next_root);
+        self.current_root_key = Some(pointer.root_key);
+        self.current_version = Some(current_metadata.version_token);
+        let retired_lease = Arc::downgrade(&retired_root);
+        for retired in newly_retired {
+            self.retired_leases
+                .insert(retired.object_key, Weak::clone(&retired_lease));
+        }
+        drop(retired_root);
+        self.complete_transaction();
+        self.reclaim_retired_objects()?;
+        Ok(report)
     }
 
     /// Returns group entries whose coarse bounds overlap the query.
@@ -2973,6 +3782,41 @@ fn validate_source(source: &TierGroupSource) -> TelemetryResult<()> {
     Ok(())
 }
 
+fn same_group_contents(left: &TierGroupManifest, right: &TierGroupManifest) -> bool {
+    left.format_version == right.format_version
+        && left.group_sequence == right.group_sequence
+        && left.checkpoint == right.checkpoint
+        && left.shard_id == right.shard_id
+        && left.topic_id == right.topic_id
+        && left.partition_id == right.partition_id
+        && left.blocks == right.blocks
+        && left.artifacts.len() == right.artifacts.len()
+        && left
+            .artifacts
+            .iter()
+            .zip(&right.artifacts)
+            .all(|(left, right)| {
+                left.kind == right.kind
+                    && left.name == right.name
+                    && left.bytes == right.bytes
+                    && left.checksum_algorithm == right.checksum_algorithm
+                    && left.checksum == right.checksum
+            })
+}
+
+fn verify_object_metadata(
+    observed: &ObjectMetadata,
+    expected: &ObjectMetadata,
+    context: &str,
+) -> TelemetryResult<()> {
+    if observed.bytes != expected.bytes || observed.content_digest != expected.content_digest {
+        return Err(TelemetryError::CorruptTier(format!(
+            "object store changed {context}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_artifact(artifact: &TierArtifact) -> TelemetryResult<()> {
     validate_artifact_name(&artifact.name)?;
     validate_object_key(&artifact.object_key)?;
@@ -3001,7 +3845,7 @@ fn validate_artifact_name(name: &str) -> TelemetryResult<()> {
     Ok(())
 }
 
-fn validate_object_key(key: &str) -> TelemetryResult<()> {
+pub(crate) fn validate_object_key(key: &str) -> TelemetryResult<()> {
     let path = Path::new(key);
     if key.is_empty()
         || key.contains('\\')
@@ -3050,6 +3894,14 @@ fn verify_bytes_metadata(
     metadata: &ObjectMetadata,
     context: &str,
 ) -> TelemetryResult<()> {
+    if metadata.content_digest.is_empty() {
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.bytes {
+            return Err(TelemetryError::CorruptTier(format!(
+                "{context} failed object-store length verification"
+            )));
+        }
+        return Ok(());
+    }
     verify_expected_object(bytes, metadata.bytes, &metadata.content_digest, context)
 }
 
@@ -3089,7 +3941,15 @@ fn checksum_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-fn hash_file(path: &Path) -> TelemetryResult<ObjectMetadata> {
+fn unix_time_millis() -> u64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn hash_file(path: &Path) -> TelemetryResult<ObjectMetadata> {
     let mut file =
         File::open(path).map_err(|error| storage_io("open file for BLAKE3 hashing", error))?;
     let mut hasher = blake3::Hasher::new();
@@ -3291,7 +4151,7 @@ fn remove_cache_file(path: &Path) -> TelemetryResult<()> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId};
 
@@ -3559,6 +4419,344 @@ mod tests {
     }
 
     #[test]
+    fn retired_generation_waits_for_its_last_rust_lease() {
+        let directory = TestDirectory::new("tier-ownership-lease");
+        let artifacts = directory.path.join("sources");
+        fs::create_dir_all(&artifacts).expect("artifact directory is created");
+        let store =
+            LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
+        let config = ObjectTierConfig {
+            retirement_grace: std::time::Duration::ZERO,
+            ..tier_config(2)
+        };
+        let mut tier =
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), config)
+                .expect("tier opens");
+        tier.publish_group(group_source(&artifacts, 0, 0, 1_000))
+            .expect("first group publishes");
+        let lease = tier.catalog_lease();
+        let retired_page = lease.root().pages[0].page_key.clone();
+        let current = store
+            .get(&format!("{}/CURRENT", tier.namespace), POINTER_READ_LIMIT)
+            .expect("CURRENT reads");
+        let retired_root = decode_json::<CatalogPointer>(&current, "CURRENT")
+            .expect("CURRENT decodes")
+            .root_key;
+
+        tier.publish_group(group_source(&artifacts, 1, 10, 2_000))
+            .expect("second group publishes");
+        assert_eq!(tier.pending_retired_objects(), 2);
+        assert!(store.head(&retired_root).expect("root head").is_some());
+        assert!(store.head(&retired_page).expect("page head").is_some());
+
+        drop(lease);
+        tier.reclaim_retired_objects()
+            .expect("lease release reclaims");
+        assert_eq!(tier.pending_retired_objects(), 0);
+        assert!(store.head(&retired_root).expect("root head").is_none());
+        assert!(store.head(&retired_page).expect("page head").is_none());
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailDeleteOnceStore {
+        inner: LocalObjectStore,
+        fail_delete: Arc<AtomicBool>,
+    }
+
+    impl TelemetryObjectStore for FailDeleteOnceStore {
+        fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> TelemetryResult<ObjectMetadata> {
+            self.inner.put_bytes_if_absent(key, bytes)
+        }
+
+        fn put_file_if_absent(&self, key: &str, source: &Path) -> TelemetryResult<ObjectMetadata> {
+            self.inner.put_file_if_absent(key, source)
+        }
+
+        fn get(&self, key: &str, max_bytes: u64) -> TelemetryResult<Vec<u8>> {
+            self.inner.get(key, max_bytes)
+        }
+
+        fn get_range(&self, key: &str, range: Range<u64>) -> TelemetryResult<Vec<u8>> {
+            self.inner.get_range(key, range)
+        }
+
+        fn head(&self, key: &str) -> TelemetryResult<Option<ObjectMetadata>> {
+            self.inner.head(key)
+        }
+
+        fn delete(&self, key: &str) -> TelemetryResult<()> {
+            if !key.ends_with("/PENDING") && self.fail_delete.swap(false, Ordering::Relaxed) {
+                return Err(TelemetryError::ObjectStore(
+                    "injected exact-key delete failure".into(),
+                ));
+            }
+            self.inner.delete(key)
+        }
+
+        fn compare_and_swap(
+            &self,
+            key: &str,
+            expected_version: Option<&str>,
+            bytes: &[u8],
+        ) -> TelemetryResult<ObjectMetadata> {
+            self.inner.compare_and_swap(key, expected_version, bytes)
+        }
+    }
+
+    #[test]
+    fn selected_root_replays_exact_retirements_after_delete_failure() {
+        let directory = TestDirectory::new("tier-retirement-replay");
+        let artifacts = directory.path.join("sources");
+        fs::create_dir_all(&artifacts).expect("artifact directory is created");
+        let store = FailDeleteOnceStore {
+            inner: LocalObjectStore::open(directory.path.join("objects"))
+                .expect("object store opens"),
+            fail_delete: Arc::new(AtomicBool::new(false)),
+        };
+        let config = ObjectTierConfig {
+            retirement_grace: std::time::Duration::ZERO,
+            ..tier_config(2)
+        };
+        let mut tier =
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), config)
+                .expect("tier opens");
+        tier.publish_group(group_source(&artifacts, 0, 0, 1_000))
+            .expect("first group publishes");
+        store.fail_delete.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            tier.publish_group(group_source(&artifacts, 1, 10, 2_000)),
+            Err(TelemetryError::ObjectStore(_))
+        ));
+        drop(tier);
+
+        let recovered = TelemetryObjectTier::open(store, ShardId::new(4), partition(), config)
+            .expect("selected root replays its exact retirement set");
+        assert_eq!(recovered.root().generation, 2);
+        assert_eq!(recovered.pending_retired_objects(), 0);
+    }
+
+    #[test]
+    fn startup_relinquishes_every_uncommitted_transaction_key_without_listing() {
+        let directory = TestDirectory::new("tier-pending-abort-replay");
+        let store =
+            LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
+        let tier =
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
+                .expect("tier opens");
+        let transaction_id = "0123456789abcdef0123456789abcdef".to_owned();
+        let first = format!(
+            "{}/transactions/{transaction_id}/groups/00000000000000000000/payload-test",
+            tier.namespace
+        );
+        let root = format!(
+            "{}/transactions/{transaction_id}/roots/root-00000000000000000001-test.json",
+            tier.namespace
+        );
+        let transaction = CatalogTransaction {
+            format_version: TIER_FORMAT_VERSION,
+            transaction_id,
+            target_generation: 1,
+            target_root_key: root.clone(),
+            reclaim_after_unix_millis: 1,
+            owned_objects: vec![first.clone(), root.clone()],
+        };
+        let pending_key = tier.pending_key();
+        store
+            .compare_and_swap(
+                &pending_key,
+                None,
+                &encode_json(&transaction, "test PENDING").expect("transaction encodes"),
+            )
+            .expect("PENDING is selected");
+        store
+            .put_bytes_if_absent(&first, b"uncommitted payload")
+            .expect("first transaction object exists");
+        store
+            .put_bytes_if_absent(&root, b"uncommitted root")
+            .expect("root transaction object exists");
+        drop(tier);
+
+        TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
+            .expect("startup replays PENDING cleanup");
+        assert!(store.head(&first).expect("first head").is_none());
+        assert!(store.head(&root).expect("root head").is_none());
+        assert!(store.head(&pending_key).expect("PENDING head").is_none());
+    }
+
+    #[test]
+    fn startup_preserves_every_key_owned_by_an_active_writer_lease() {
+        let directory = TestDirectory::new("tier-pending-active-writer");
+        let store =
+            LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
+        let tier =
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
+                .expect("tier opens");
+        let transaction_id = "fedcba9876543210fedcba9876543210".to_owned();
+        let payload = format!(
+            "{}/transactions/{transaction_id}/groups/00000000000000000000/payload-test",
+            tier.namespace
+        );
+        let root = format!(
+            "{}/transactions/{transaction_id}/roots/root-00000000000000000001-test.json",
+            tier.namespace
+        );
+        let transaction = CatalogTransaction {
+            format_version: TIER_FORMAT_VERSION,
+            transaction_id,
+            target_generation: 1,
+            target_root_key: root.clone(),
+            reclaim_after_unix_millis: u64::MAX,
+            owned_objects: vec![payload.clone(), root.clone()],
+        };
+        let pending_key = tier.pending_key();
+        store
+            .compare_and_swap(
+                &pending_key,
+                None,
+                &encode_json(&transaction, "test PENDING").expect("transaction encodes"),
+            )
+            .expect("PENDING is selected");
+        store
+            .put_bytes_if_absent(&payload, b"active payload")
+            .expect("active payload exists");
+        store
+            .put_bytes_if_absent(&root, b"active root")
+            .expect("active root exists");
+        drop(tier);
+
+        assert!(matches!(
+            TelemetryObjectTier::open(
+                store.clone(),
+                ShardId::new(4),
+                partition(),
+                tier_config(2)
+            ),
+            Err(TelemetryError::ObjectStore(message))
+                if message.contains("active writer lease")
+        ));
+        assert!(store.head(&payload).expect("payload head").is_some());
+        assert!(store.head(&root).expect("root head").is_some());
+        assert!(store.head(&pending_key).expect("PENDING head").is_some());
+    }
+
+    #[test]
+    fn startup_preserves_a_committed_transaction_when_pending_cleanup_was_interrupted() {
+        let directory = TestDirectory::new("tier-pending-commit-replay");
+        let artifacts = directory.path.join("sources");
+        fs::create_dir_all(&artifacts).expect("artifact directory is created");
+        let store =
+            LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
+        let mut tier =
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
+                .expect("tier opens");
+        tier.publish_group(group_source(&artifacts, 0, 0, 1_000))
+            .expect("group publishes");
+        let root = tier
+            .current_root_key
+            .clone()
+            .expect("published catalog has a root");
+        let transaction_id = root
+            .strip_prefix(&format!("{}/transactions/", tier.namespace))
+            .and_then(|path| path.split('/').next())
+            .expect("root carries transaction identity")
+            .to_owned();
+        let transaction = CatalogTransaction {
+            format_version: TIER_FORMAT_VERSION,
+            transaction_id,
+            target_generation: tier.root().generation,
+            target_root_key: root.clone(),
+            reclaim_after_unix_millis: u64::MAX,
+            owned_objects: vec![root.clone()],
+        };
+        let pending_key = tier.pending_key();
+        store
+            .compare_and_swap(
+                &pending_key,
+                None,
+                &encode_json(&transaction, "test PENDING").expect("transaction encodes"),
+            )
+            .expect("interrupted committed PENDING is restored");
+        drop(tier);
+
+        let recovered =
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
+                .expect("committed PENDING is recognized");
+        assert_eq!(recovered.root().generation, 1);
+        assert!(store.head(&root).expect("root head").is_some());
+        assert!(store.head(&pending_key).expect("PENDING head").is_none());
+    }
+
+    #[test]
+    fn retention_relinquishes_only_catalog_owned_exact_keys() {
+        let directory = TestDirectory::new("tier-retention-ownership");
+        let artifacts = directory.path.join("sources");
+        fs::create_dir_all(&artifacts).expect("artifact directory is created");
+        let store =
+            LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
+        let config = ObjectTierConfig {
+            retirement_grace: std::time::Duration::ZERO,
+            ..tier_config(2)
+        };
+        let mut tier =
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), config)
+                .expect("tier opens");
+        for sequence in 0..4 {
+            tier.publish_group(group_source(
+                &artifacts,
+                sequence,
+                sequence * 10,
+                (sequence + 1) * 1_000,
+            ))
+            .expect("group publishes");
+        }
+        let lease = tier.catalog_lease();
+        let removed_manifest = tier
+            .candidate_groups(TierQueryRange::default())
+            .expect("groups load")[0]
+            .manifest_key
+            .clone();
+        let report = tier
+            .retain_since_timestamp(3_500)
+            .expect("retention publishes");
+        assert_eq!(report.retired_groups, 3);
+        assert!(report.retired_objects >= 9);
+        assert_eq!(
+            tier.pending_retired_objects(),
+            report.retired_objects as usize
+        );
+        assert!(
+            store
+                .head(&removed_manifest)
+                .expect("manifest head")
+                .is_some()
+        );
+        assert_eq!(
+            tier.candidate_groups(TierQueryRange::default())
+                .expect("retained groups")
+                .into_iter()
+                .map(|group| group.group_sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+
+        drop(lease);
+        tier.reclaim_retired_objects().expect("retired keys delete");
+        assert!(
+            store
+                .head(&removed_manifest)
+                .expect("manifest head")
+                .is_none()
+        );
+        let recovered = TelemetryObjectTier::open(store, ShardId::new(4), partition(), config)
+            .expect("retained catalog reopens");
+        assert_eq!(
+            recovered.root().latest_checkpoint,
+            tier.root().latest_checkpoint
+        );
+        assert_eq!(recovered.root().next_block_id, tier.root().next_block_id);
+    }
+
+    #[test]
     fn startup_is_shallow_and_touched_pages_are_verified() {
         let directory = TestDirectory::new("lazy-verification");
         let artifacts = directory.path.join("sources");
@@ -3766,6 +4964,10 @@ mod tests {
 
         fn head(&self, key: &str) -> TelemetryResult<Option<ObjectMetadata>> {
             self.inner.head(key)
+        }
+
+        fn delete(&self, key: &str) -> TelemetryResult<()> {
+            self.inner.delete(key)
         }
 
         fn compare_and_swap(

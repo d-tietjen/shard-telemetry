@@ -26,8 +26,9 @@ use crate::{
     AnalyticsRelation, AnalyticsRow, AnalyticsScanOrder, AnalyticsScanRequest, CaseSensitivity,
     DeleteRequest, LocalObjectStore, LogMatch, LogPredicate, LogQuery, LokiEntry, LokiStore,
     NativeQuery, NativeQueryDirection, ObjectTierConfig, OtlpSinkConfig, QueryCursor,
-    SinkObjectTierConfig, SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig,
-    TelemetryService, TelemetrySinkFactory,
+    S3ObjectStore, S3ObjectStoreConfig, SharedTelemetryObjectStore, SinkObjectTierConfig,
+    SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig, TelemetryService,
+    TelemetrySinkFactory,
 };
 
 const LOKI_TOPIC_ID: TopicId = crate::LOGS_TOPIC_ID;
@@ -58,6 +59,8 @@ pub struct DurableTelemetryConfig {
     pub data_directory: PathBuf,
     /// Optional local object-store directory used by shard-stream and ShardTelemetry.
     pub object_store_directory: Option<PathBuf>,
+    /// Optional production S3 or S3-compatible compressed object tier.
+    pub s3_object_store: Option<S3ObjectStoreConfig>,
     /// Retain a second raw-payload journal for faster hot-index recovery.
     ///
     /// When disabled, startup reconstructs the ephemeral hot index from the
@@ -105,9 +108,15 @@ impl DurableTelemetryConfig {
         if self.retention.is_some()
             && !self.recovery_journal
             && self.object_store_directory.is_none()
+            && self.s3_object_store.is_none()
         {
             return Err(LokiApiError::configuration(
                 "retention requires either the immutable object tier or recovery_journal so the durable index checkpoint survives log truncation",
+            ));
+        }
+        if self.object_store_directory.is_some() && self.s3_object_store.is_some() {
+            return Err(LokiApiError::configuration(
+                "local and S3 object-store backends are mutually exclusive",
             ));
         }
         Ok(())
@@ -130,6 +139,11 @@ pub struct DurableTelemetryStore {
     retention_runs: AtomicU64,
     retention_advanced_offsets: AtomicU64,
     retention_failures: AtomicU64,
+    object_tier_enabled: bool,
+    source_reclaimed_offsets: AtomicU64,
+    retired_object_groups: AtomicU64,
+    retired_object_payload_bytes: AtomicU64,
+    retired_object_keys: AtomicU64,
 }
 
 /// Result of one batch-aligned physical retention pass.
@@ -141,6 +155,12 @@ pub struct RetentionReport {
     pub advanced_partitions: u64,
     /// Logical records made eligible for pack reclamation.
     pub advanced_offsets: u64,
+    /// Complete compressed groups removed from signal catalogs.
+    pub retired_object_groups: u64,
+    /// Compressed payload bytes removed from signal catalogs.
+    pub retired_object_payload_bytes: u64,
+    /// Exact object keys transferred to deferred reclamation.
+    pub retired_object_keys: u64,
 }
 
 impl std::fmt::Debug for DurableTelemetryStore {
@@ -157,7 +177,18 @@ impl std::fmt::Debug for DurableTelemetryStore {
 impl DurableTelemetryStore {
     /// Opens or recovers a standalone durable store.
     pub fn open(config: DurableTelemetryConfig) -> Result<Self, LokiApiError> {
+        Self::open_with_object_tier_config(config, ObjectTierConfig::default())
+    }
+
+    /// Opens a store with explicit object publication and reader-lease bounds.
+    pub fn open_with_object_tier_config(
+        config: DurableTelemetryConfig,
+        object_tier_config: ObjectTierConfig,
+    ) -> Result<Self, LokiApiError> {
         config.validate()?;
+        object_tier_config
+            .validate()
+            .map_err(|error| LokiApiError::configuration(error.to_string()))?;
         let logical_partitions =
             NonZeroU16::new(u16::try_from(config.tenant_partitions).map_err(|_| {
                 LokiApiError::configuration("tenant_partitions must fit the v1 u16 routing space")
@@ -178,7 +209,10 @@ impl DurableTelemetryStore {
         let deletes = DeleteCatalog::open(config.data_directory.join("delete-catalog-v1.json"))?;
         let engine_config = EngineConfig {
             data_dir: config.data_directory.join("stream"),
-            object_store_dir: config.object_store_directory.clone(),
+            // ShardTelemetry's compressed tier is authoritative after its
+            // checkpoint publishes. Keeping shard-stream's raw object archive
+            // as well would permanently duplicate every source byte.
+            object_store_dir: None,
             shard_count: config.shard_count,
             virtual_lane_count: config.shard_count,
             replication_factor: 1,
@@ -191,18 +225,31 @@ impl DurableTelemetryStore {
             max_fetch_bytes: 64 * 1024 * 1024,
             append_linger: config.append_linger,
         };
-        let sink_object_tier = config
-            .object_store_directory
-            .as_ref()
-            .map(|directory| {
-                let store = LocalObjectStore::open(directory)?;
+        let object_store = match (
+            config.object_store_directory.as_ref(),
+            config.s3_object_store.clone(),
+        ) {
+            (Some(directory), None) => Some(SharedTelemetryObjectStore::from(
+                LocalObjectStore::open(directory)
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?,
+            )),
+            (None, Some(s3)) => Some(SharedTelemetryObjectStore::new(Arc::new(
+                S3ObjectStore::open(s3)
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?,
+            ))),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("configuration validation rejects two backends"),
+        };
+        let object_tier_enabled = object_store.is_some();
+        let sink_object_tier = object_store
+            .map(|store| {
                 Ok::<_, crate::TelemetryError>(SinkObjectTierConfig {
-                    store: store.into(),
+                    store,
                     spool_directory: config.data_directory.join("tier-spool"),
                     control_cache_directory: config.data_directory.join("tier-control-cache"),
                     payload_cache_directory: config.data_directory.join("tier-payload-cache"),
                     partitions: object_tier_partitions(config.tenant_partitions),
-                    tier: ObjectTierConfig::default(),
+                    tier: object_tier_config,
                     control_cache: SsdCacheConfig {
                         max_bytes: 8 * 1024 * 1024 * 1024,
                         ..SsdCacheConfig::default()
@@ -270,6 +317,11 @@ impl DurableTelemetryStore {
             retention_runs: AtomicU64::new(0),
             retention_advanced_offsets: AtomicU64::new(0),
             retention_failures: AtomicU64::new(0),
+            object_tier_enabled,
+            source_reclaimed_offsets: AtomicU64::new(0),
+            retired_object_groups: AtomicU64::new(0),
+            retired_object_payload_bytes: AtomicU64::new(0),
+            retired_object_keys: AtomicU64::new(0),
         })
     }
 
@@ -324,6 +376,7 @@ impl DurableTelemetryStore {
                 Err(error) => return Err(engine_error(error)),
             }
         }
+        let object_tier_enabled = service.object_store_stats().is_some();
         Ok(Self {
             _data_directory_lease: data_directory_lease,
             engine,
@@ -338,6 +391,11 @@ impl DurableTelemetryStore {
             retention_runs: AtomicU64::new(0),
             retention_advanced_offsets: AtomicU64::new(0),
             retention_failures: AtomicU64::new(0),
+            object_tier_enabled,
+            source_reclaimed_offsets: AtomicU64::new(0),
+            retired_object_groups: AtomicU64::new(0),
+            retired_object_payload_bytes: AtomicU64::new(0),
+            retired_object_keys: AtomicU64::new(0),
         })
     }
 
@@ -412,6 +470,12 @@ impl DurableTelemetryStore {
             Ok(report) => {
                 self.retention_advanced_offsets
                     .fetch_add(report.advanced_offsets, Ordering::Relaxed);
+                self.retired_object_groups
+                    .fetch_add(report.retired_object_groups, Ordering::Relaxed);
+                self.retired_object_payload_bytes
+                    .fetch_add(report.retired_object_payload_bytes, Ordering::Relaxed);
+                self.retired_object_keys
+                    .fetch_add(report.retired_object_keys, Ordering::Relaxed);
             }
             Err(_) => {
                 self.retention_failures.fetch_add(1, Ordering::Relaxed);
@@ -426,6 +490,15 @@ impl DurableTelemetryStore {
             cutoff_timestamp_unix_nanos: cutoff,
             ..RetentionReport::default()
         };
+        if self.object_tier_enabled {
+            let tier = self
+                .service
+                .retain_object_tier_since(cutoff)
+                .map_err(|error| LokiApiError::internal(error.to_string()))?;
+            report.retired_object_groups = tier.retired_groups;
+            report.retired_object_payload_bytes = tier.retired_payload_bytes;
+            report.retired_object_keys = tier.retired_objects;
+        }
         for partition_id in self.engine.topic_partitions(LOKI_TOPIC_ID) {
             let partition = TopicPartition::new(LOKI_TOPIC_ID, partition_id);
             let watermarks = self.engine.watermarks(partition).map_err(engine_error)?;
@@ -591,8 +664,19 @@ impl DurableTelemetryStore {
         &self,
         query: &crate::TraceQuery,
     ) -> Result<Vec<crate::DurableSpan>, LokiApiError> {
+        let mut query = query.clone();
+        if let Some(cutoff) = self.retention_cutoff() {
+            if query.end_time_unix_nanos.is_some_and(|end| end <= cutoff) {
+                return Ok(Vec::new());
+            }
+            query.start_time_unix_nanos = Some(
+                query
+                    .start_time_unix_nanos
+                    .map_or(cutoff, |start| start.max(cutoff)),
+            );
+        }
         self.service
-            .query_traces(query)
+            .query_traces(&query)
             .map_err(|error| LokiApiError::internal(error.to_string()))
     }
 
@@ -601,8 +685,19 @@ impl DurableTelemetryStore {
         &self,
         query: &crate::MetricQuery,
     ) -> Result<Vec<crate::DurableMetricPoint>, LokiApiError> {
+        let mut query = query.clone();
+        if let Some(cutoff) = self.retention_cutoff() {
+            if query.end_time_unix_nanos.is_some_and(|end| end < cutoff) {
+                return Ok(Vec::new());
+            }
+            query.start_time_unix_nanos = Some(
+                query
+                    .start_time_unix_nanos
+                    .map_or(cutoff, |start| start.max(cutoff)),
+            );
+        }
         self.service
-            .query_metrics(query)
+            .query_metrics(&query)
             .map_err(|error| LokiApiError::internal(error.to_string()))
     }
 
@@ -612,8 +707,19 @@ impl DurableTelemetryStore {
         &self,
         query: &crate::CorrelationQuery,
     ) -> Result<Vec<crate::TelemetryRecordRef>, LokiApiError> {
+        let mut query = query.clone();
+        if let Some(cutoff) = self.retention_cutoff() {
+            if query.end_time_unix_nanos.is_some_and(|end| end < cutoff) {
+                return Ok(Vec::new());
+            }
+            query.start_time_unix_nanos = Some(
+                query
+                    .start_time_unix_nanos
+                    .map_or(cutoff, |start| start.max(cutoff)),
+            );
+        }
         self.service
-            .query_correlations(query)
+            .query_correlations(&query)
             .map_err(|error| LokiApiError::internal(error.to_string()))
     }
 
@@ -1332,6 +1438,11 @@ impl LokiStore for DurableTelemetryStore {
                 self.service
                     .flush_object_tier()
                     .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                if self.object_tier_enabled {
+                    let reclaimed = self.reclaim_source_packs()?;
+                    self.source_reclaimed_offsets
+                        .fetch_add(reclaimed, Ordering::Relaxed);
+                }
                 self.engine.sync().map_err(engine_error)?;
                 return Ok(());
             }
@@ -1359,6 +1470,11 @@ impl LokiStore for DurableTelemetryStore {
             retention_runs: self.retention_runs.load(Ordering::Relaxed),
             retention_advanced_offsets: self.retention_advanced_offsets.load(Ordering::Relaxed),
             retention_failures: self.retention_failures.load(Ordering::Relaxed),
+            object_store: self.service.object_store_stats(),
+            source_reclaimed_offsets: self.source_reclaimed_offsets.load(Ordering::Relaxed),
+            retired_object_groups: self.retired_object_groups.load(Ordering::Relaxed),
+            retired_object_payload_bytes: self.retired_object_payload_bytes.load(Ordering::Relaxed),
+            retired_object_keys: self.retired_object_keys.load(Ordering::Relaxed),
         }
     }
 
@@ -1384,6 +1500,33 @@ impl LokiStore for DurableTelemetryStore {
 }
 
 impl DurableTelemetryStore {
+    fn reclaim_source_packs(&self) -> Result<u64, LokiApiError> {
+        let mut reclaimed = 0u64;
+        for partition in self.engine.all_partitions() {
+            let Some(checkpoint) = self
+                .engine
+                .durable_sink_checkpoint(partition)
+                .map_err(engine_error)?
+            else {
+                continue;
+            };
+            let watermarks = self.engine.watermarks(partition).map_err(engine_error)?;
+            let retained_start = checkpoint.next_offset.min(watermarks.last_stable_offset);
+            if retained_start <= watermarks.log_start {
+                continue;
+            }
+            self.engine
+                .truncate_partition(partition, retained_start)
+                .map_err(engine_error)?;
+            reclaimed = reclaimed.saturating_add(
+                retained_start
+                    .get()
+                    .saturating_sub(watermarks.log_start.get()),
+            );
+        }
+        Ok(reclaimed)
+    }
+
     fn signal_partitions(&self, topic_id: TopicId) -> impl Iterator<Item = TopicPartition> {
         let count = self.tenant_partitions;
         (0..count)
@@ -1750,6 +1893,7 @@ mod tests {
         let store = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
+            s3_object_store: None,
             recovery_journal: true,
             retention: None,
             shard_count: 2,
@@ -2038,6 +2182,7 @@ mod tests {
         let store = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
+            s3_object_store: None,
             recovery_journal: false,
             retention: None,
             shard_count: 2,
@@ -2072,6 +2217,7 @@ mod tests {
         let recovered = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
+            s3_object_store: None,
             recovery_journal: false,
             retention: None,
             shard_count: 2,
@@ -2103,6 +2249,7 @@ mod tests {
         let config = DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: Some(object_directory.clone()),
+            s3_object_store: None,
             recovery_journal: false,
             retention: None,
             shard_count: 1,
@@ -2136,6 +2283,16 @@ mod tests {
             .expect("push");
         LokiStore::flush(&store, Duration::from_secs(30)).expect("object tier flushes");
         assert_eq!(store.operational_metrics().retained_payload_bytes, Some(0));
+        assert_eq!(store.operational_metrics().source_reclaimed_offsets, 2);
+        let log_partition = TopicPartition::new(LOKI_TOPIC_ID, LogicalPartitionId::new(0));
+        assert_eq!(
+            store
+                .engine
+                .watermarks(log_partition)
+                .expect("log watermarks")
+                .log_start,
+            LogicalOffset::new(2)
+        );
         let cold = store
             .query_native(&NativeQuery {
                 tenant: "tenant-a".to_owned(),
@@ -2181,6 +2338,81 @@ mod tests {
     }
 
     #[test]
+    fn object_retention_removes_complete_signal_groups_without_scanning_storage() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-object-retention-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = DurableTelemetryConfig {
+            data_directory: directory.clone(),
+            object_store_directory: Some(directory.join("objects")),
+            s3_object_store: None,
+            recovery_journal: false,
+            retention: None,
+            shard_count: 1,
+            tenant_partitions: 1,
+            append_linger: Duration::ZERO,
+            stripe: StripeConfig::default(),
+            indexed_ack_timeout: Duration::from_secs(30),
+        };
+        let store = DurableTelemetryStore::open(config.clone()).expect("store opens");
+        for (timestamp, line) in [(100, "expired"), (200, "retained")] {
+            store
+                .push(
+                    "tenant-a",
+                    vec![LokiEntry {
+                        timestamp_unix_nanos: timestamp,
+                        labels: BTreeMap::new(),
+                        line: line.into(),
+                        structured_metadata: BTreeMap::new(),
+                    }],
+                )
+                .expect("push");
+            LokiStore::flush(&store, Duration::from_secs(30)).expect("group flushes");
+        }
+        let report = store
+            .compact_retention_before(150)
+            .expect("object retention publishes");
+        assert_eq!(report.retired_object_groups, 1);
+        assert!(report.retired_object_payload_bytes > 0);
+        assert!(report.retired_object_keys >= 4);
+        let matches = store
+            .query_native(&NativeQuery {
+                tenant: "tenant-a".into(),
+                labels: BTreeMap::new(),
+                terms: Vec::new(),
+                start_timestamp_unix_nanos: Some(150),
+                end_timestamp_unix_nanos: None,
+                limit: 10,
+                direction: NativeQueryDirection::OldestFirst,
+            })
+            .expect("retained query");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, "retained");
+        drop(store);
+
+        let recovered = DurableTelemetryStore::open(config).expect("retained store reopens");
+        let matches = recovered
+            .query_native(&NativeQuery {
+                tenant: "tenant-a".into(),
+                labels: BTreeMap::new(),
+                terms: Vec::new(),
+                start_timestamp_unix_nanos: Some(150),
+                end_timestamp_unix_nanos: None,
+                limit: 10,
+                direction: NativeQueryDirection::OldestFirst,
+            })
+            .expect("recovered retained query");
+        assert_eq!(matches.len(), 1);
+        drop(recovered);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
     fn logical_deletes_survive_restart_and_filter_native_and_analytical_reads() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2193,6 +2425,7 @@ mod tests {
         let config = DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
+            s3_object_store: None,
             recovery_journal: false,
             retention: None,
             shard_count: 2,
@@ -2287,6 +2520,7 @@ mod tests {
         let config = DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
+            s3_object_store: None,
             recovery_journal: true,
             retention: Some(Duration::from_secs(60)),
             shard_count: 1,
@@ -2369,6 +2603,7 @@ mod tests {
         let store = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
+            s3_object_store: None,
             recovery_journal: false,
             retention: None,
             shard_count: 1,
@@ -2427,6 +2662,7 @@ mod tests {
         let store = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
+            s3_object_store: None,
             recovery_journal: false,
             retention: None,
             shard_count: 2,

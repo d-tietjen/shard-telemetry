@@ -6,17 +6,17 @@ use axum::serve::ListenerExt;
 use clap::Parser;
 use shard_telemetry::{
     DurableTelemetryConfig, DurableTelemetryStore, LokiApiConfig, NativeServerConfig,
-    OtlpIngestService, OtlpReceiverConfig, ProductionRuntime, PrometheusApiConfig,
-    PrometheusService, ServiceLifecycle, ShardTelemetryConfig, SignalConfig, SingleTenantConfig,
-    StripeConfig, TempoApiConfig, TempoService, loki_router, loki_router_with_clickhouse,
-    otlp_http_router, prometheus_router, serve_native, serve_otlp_grpc, single_tenant_loki_router,
-    tempo_router,
+    ObjectTierConfig, OtlpIngestService, OtlpReceiverConfig, ProductionRuntime,
+    PrometheusApiConfig, PrometheusService, S3ObjectStoreConfig, ServiceLifecycle,
+    ShardTelemetryConfig, SignalConfig, SingleTenantConfig, StripeConfig, TempoApiConfig,
+    TempoService, loki_router, loki_router_with_clickhouse, otlp_http_router, prometheus_router,
+    serve_native, serve_otlp_grpc, single_tenant_loki_router, tempo_router,
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "shard-telemetry-server",
-    about = "Standalone Loki-compatible ShardTelemetry server"
+    about = "Standalone signal-native ShardTelemetry server"
 )]
 struct Arguments {
     /// HTTP listen address.
@@ -46,13 +46,40 @@ struct Arguments {
     /// Durable local data directory.
     #[arg(long, default_value = "./shard-telemetry-data")]
     data_directory: PathBuf,
-    /// Local object-store backend; required with --auth-token-file.
+    /// Local object-store backend; mutually exclusive with S3.
     #[arg(long)]
     object_store_directory: Option<PathBuf>,
+    /// S3 or S3-compatible bucket for the durable compressed tier.
+    #[arg(long)]
+    object_store_s3_bucket: Option<String>,
+    /// Key prefix dedicated to this deployment inside the S3 bucket.
+    #[arg(long, default_value = "shard-telemetry")]
+    object_store_s3_prefix: String,
+    /// Optional AWS region override; otherwise the standard AWS chain is used.
+    #[arg(long)]
+    object_store_s3_region: Option<String>,
+    /// Optional S3-compatible endpoint.
+    #[arg(long)]
+    object_store_s3_endpoint: Option<String>,
+    /// Explicitly permits a plaintext S3-compatible endpoint in development.
+    #[arg(long, default_value_t = false)]
+    object_store_s3_allow_http: bool,
+    /// Uses virtual-hosted-style S3 requests.
+    #[arg(long, default_value_t = false)]
+    object_store_s3_virtual_hosted_style: bool,
+    /// Seconds between ownership reclamation and compressed-tier checkpoints.
+    #[arg(long, default_value_t = 60)]
+    object_store_maintenance_interval_seconds: u64,
+    /// Grace after root replacement before cross-process readers' exact keys are reclaimed.
+    #[arg(long, default_value_t = 600)]
+    object_store_reader_grace_seconds: u64,
+    /// Maximum publication duration before a replacement owner may replay PENDING cleanup.
+    #[arg(long, default_value_t = 1_800)]
+    object_store_writer_lease_seconds: u64,
     /// Retain a duplicate raw-payload journal to accelerate hot-index recovery.
     #[arg(long, default_value_t = false)]
     recovery_journal: bool,
-    /// Retain logs for this many seconds; zero retains them indefinitely.
+    /// Retain logs, traces, and metrics for this many seconds; zero is indefinite.
     #[arg(long, default_value_t = 0)]
     retention_seconds: u64,
     /// Seconds between batch-aligned physical retention passes.
@@ -131,6 +158,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    if arguments.object_store_maintenance_interval_seconds == 0 {
+        return Err("--object-store-maintenance-interval-seconds must be nonzero".into());
+    }
+    if arguments.object_store_writer_lease_seconds == 0 {
+        return Err("--object-store-writer-lease-seconds must be nonzero".into());
+    }
     if arguments.insecure_development_mode && arguments.auth_token_file.is_some() {
         return Err("--insecure-development-mode conflicts with --auth-token-file".into());
     }
@@ -165,27 +198,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     };
-    if production.is_some() && arguments.object_store_directory.is_none() {
+    if arguments.object_store_directory.is_some() && arguments.object_store_s3_bucket.is_some() {
+        return Err("--object-store-directory conflicts with --object-store-s3-bucket".into());
+    }
+    if arguments.object_store_s3_bucket.is_none()
+        && (arguments.object_store_s3_region.is_some()
+            || arguments.object_store_s3_endpoint.is_some()
+            || arguments.object_store_s3_allow_http
+            || arguments.object_store_s3_virtual_hosted_style)
+    {
+        return Err("S3 object-store options require --object-store-s3-bucket".into());
+    }
+    if production.is_some() && arguments.object_store_s3_allow_http {
+        return Err("plaintext S3 endpoints are forbidden in production mode".into());
+    }
+    if production.is_some()
+        && arguments.object_store_directory.is_none()
+        && arguments.object_store_s3_bucket.is_none()
+    {
         return Err(
-            "--object-store-directory is required in production mode for durable compressed checkpoints"
+            "a local or S3 object store is required in production mode for durable compressed checkpoints"
                 .into(),
         );
     }
+    let object_tier_configured =
+        arguments.object_store_directory.is_some() || arguments.object_store_s3_bucket.is_some();
+    if object_tier_configured
+        && arguments.object_store_reader_grace_seconds <= arguments.query_timeout_seconds
+    {
+        return Err(
+            "--object-store-reader-grace-seconds must exceed --query-timeout-seconds".into(),
+        );
+    }
+    if object_tier_configured
+        && arguments.object_store_writer_lease_seconds <= arguments.flush_timeout_seconds
+    {
+        return Err(
+            "--object-store-writer-lease-seconds must exceed --flush-timeout-seconds".into(),
+        );
+    }
+    let object_tier_config = ObjectTierConfig {
+        retirement_grace: std::time::Duration::from_secs(
+            arguments.object_store_reader_grace_seconds,
+        ),
+        transaction_lease: std::time::Duration::from_secs(
+            arguments.object_store_writer_lease_seconds,
+        ),
+        ..ObjectTierConfig::default()
+    };
+    let s3_object_store = arguments
+        .object_store_s3_bucket
+        .map(|bucket| S3ObjectStoreConfig {
+            bucket,
+            prefix: arguments.object_store_s3_prefix,
+            region: arguments.object_store_s3_region,
+            endpoint: arguments.object_store_s3_endpoint,
+            allow_http: arguments.object_store_s3_allow_http,
+            virtual_hosted_style: arguments.object_store_s3_virtual_hosted_style,
+        });
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
     let native_listener = tokio::net::TcpListener::bind(arguments.native_listen).await?;
     let otlp_http_listener = tokio::net::TcpListener::bind(arguments.otlp_http_listen).await?;
-    let store = Arc::new(DurableTelemetryStore::open(DurableTelemetryConfig {
-        data_directory: arguments.data_directory,
-        object_store_directory: arguments.object_store_directory,
-        recovery_journal: arguments.recovery_journal,
-        retention: (arguments.retention_seconds > 0)
-            .then(|| std::time::Duration::from_secs(arguments.retention_seconds)),
-        shard_count: arguments.shards,
-        tenant_partitions: arguments.tenant_partitions,
-        append_linger: std::time::Duration::from_micros(arguments.append_linger_micros),
-        stripe: StripeConfig::default(),
-        indexed_ack_timeout: std::time::Duration::from_secs(arguments.indexed_ack_timeout_seconds),
-    })?);
+    let store = Arc::new(DurableTelemetryStore::open_with_object_tier_config(
+        DurableTelemetryConfig {
+            data_directory: arguments.data_directory,
+            object_store_directory: arguments.object_store_directory,
+            s3_object_store,
+            recovery_journal: arguments.recovery_journal,
+            retention: (arguments.retention_seconds > 0)
+                .then(|| std::time::Duration::from_secs(arguments.retention_seconds)),
+            shard_count: arguments.shards,
+            tenant_partitions: arguments.tenant_partitions,
+            append_linger: std::time::Duration::from_micros(arguments.append_linger_micros),
+            stripe: StripeConfig::default(),
+            indexed_ack_timeout: std::time::Duration::from_secs(
+                arguments.indexed_ack_timeout_seconds,
+            ),
+        },
+        object_tier_config,
+    )?);
     let api_config = LokiApiConfig {
         default_tenant: Arc::from(arguments.default_tenant.as_str()),
         max_query_limit: arguments.max_query_limit,
@@ -297,6 +388,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut native_shutdown = shutdown.subscribe();
     let mut otlp_http_shutdown = shutdown.subscribe();
     let mut otlp_grpc_shutdown = shutdown.subscribe();
+    if object_tier_configured {
+        let maintenance_store = Arc::clone(&store);
+        let maintenance_lifecycle = Arc::clone(&lifecycle);
+        let mut maintenance_shutdown = shutdown.subscribe();
+        let interval =
+            std::time::Duration::from_secs(arguments.object_store_maintenance_interval_seconds);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = maintenance_shutdown.recv() => break,
+                    _ = ticker.tick() => {
+                        let store = Arc::clone(&maintenance_store);
+                        let result = tokio::task::spawn_blocking(move || {
+                            shard_telemetry::LokiStore::flush(store.as_ref(), flush_timeout)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                maintenance_lifecycle.mark_failed(format!(
+                                    "object-tier maintenance failed: {error}"
+                                ));
+                                break;
+                            }
+                            Err(error) => {
+                                maintenance_lifecycle.mark_failed(format!(
+                                    "object-tier maintenance task failed: {error}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
     if arguments.retention_seconds > 0 {
         let retention_store = Arc::clone(&store);
         let retention_lifecycle = Arc::clone(&lifecycle);

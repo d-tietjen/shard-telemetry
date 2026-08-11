@@ -100,9 +100,10 @@ HTTP 400 instead of silently producing approximate results.
 - Query statistics report measured lines, bytes, return count, and elapsed
   throughput, but not every Loki 3.7 storage-stage counter.
 - Compressed frames and independent query indexes are durably published and
-  served cold from bounded object ranges. Until covered shard-stream source
-  packs are reclaimed, storage accounting must continue to report those raw
-  authority bytes separately from ShardTelemetry's compressed catalog.
+  served cold from bounded object ranges. A selected catalog checkpoint
+  automatically advances the batch-aligned shard-stream log start and reclaims
+  covered source packs; accounting reports peak pre-checkpoint disk separately
+  from final post-reclamation disk.
 
 ## Full Loki oracle measurement
 
@@ -125,5 +126,7 @@ Adam, CPUs `0-15`, 16 persistent HTTP connections, 1 MiB JSON pushes, the same
 The result is a historical ablation, not the current storage path. It exposed
 source packs plus a second raw sink journal while compressed sealed blocks were
 memory-owned. The worker now publishes compressed payload and query-index
-groups and releases resident copies; a replacement full-corpus run must still
-account separately for covered raw source packs until reclamation is enabled.
+groups, releases resident copies, and advances shard-stream's batch-aligned log
+start to reclaim source packs covered by the selected catalog checkpoint. A
+replacement full-corpus run must report both peak pre-checkpoint disk and final
+post-reclamation disk.

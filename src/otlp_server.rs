@@ -601,7 +601,50 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::{DurableTelemetryConfig, StripeConfig};
+
+    fn test_service() -> (OtlpIngestService, std::path::PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-otlp-routes-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = Arc::new(
+            DurableTelemetryStore::open(DurableTelemetryConfig {
+                data_directory: directory.clone(),
+                object_store_directory: None,
+                s3_object_store: None,
+                recovery_journal: false,
+                retention: None,
+                shard_count: 1,
+                tenant_partitions: 1,
+                append_linger: Duration::ZERO,
+                stripe: StripeConfig::default(),
+                indexed_ack_timeout: Duration::from_secs(30),
+            })
+            .expect("store opens"),
+        );
+        let service = OtlpIngestService::new(
+            store,
+            OtlpReceiverConfig {
+                tenant: Arc::from("tenant-a"),
+                ..OtlpReceiverConfig::default()
+            },
+        )
+        .expect("OTLP service opens");
+        (service, directory)
+    }
 
     #[test]
     fn gzip_decoder_enforces_decompressed_limit() {
@@ -613,5 +656,50 @@ mod tests {
         let headers =
             HeaderMap::from_iter([(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"))]);
         assert!(decode_http_body(&headers, &body, 1_024).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_otlp_http_and_grpc_signal_accepts_an_empty_valid_export() {
+        let (service, directory) = test_service();
+        let app = otlp_http_router(service.clone());
+        for path in ["/v1/logs", "/otlp/v1/logs", "/v1/traces", "/v1/metrics"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::post(path)
+                        .header(header::CONTENT_TYPE, "application/x-protobuf")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("OTLP HTTP response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/x-protobuf"
+            );
+        }
+        assert!(
+            LogsService::export(&service, Request::new(ExportLogsServiceRequest::default()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            TraceService::export(&service, Request::new(ExportTraceServiceRequest::default()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            MetricsService::export(
+                &service,
+                Request::new(ExportMetricsServiceRequest::default())
+            )
+            .await
+            .is_ok()
+        );
+
+        drop(app);
+        drop(service);
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 }

@@ -1495,6 +1495,7 @@ mod tests {
             DurableTelemetryStore::open(DurableTelemetryConfig {
                 data_directory: directory.clone(),
                 object_store_directory: None,
+                s3_object_store: None,
                 recovery_journal: false,
                 retention: None,
                 shard_count: 2,
@@ -1548,6 +1549,62 @@ mod tests {
             response.headers()["x-prometheus-remote-write-exemplars-written"],
             "1"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stable_prometheus_route_surface_has_no_missing_or_wrong_method_routes() {
+        let (service, directory) = test_service();
+        let app = prometheus_router(service.clone());
+        let routes = [
+            (axum::http::Method::POST, "/api/v1/write"),
+            (axum::http::Method::POST, "/api/v1/read"),
+            (axum::http::Method::GET, "/api/v1/query?query=1"),
+            (axum::http::Method::POST, "/api/v1/query"),
+            (
+                axum::http::Method::GET,
+                "/api/v1/query_range?query=1&start=0&end=1&step=1",
+            ),
+            (axum::http::Method::POST, "/api/v1/query_range"),
+            (axum::http::Method::GET, "/api/v1/series?start=0&end=1"),
+            (axum::http::Method::POST, "/api/v1/series"),
+            (axum::http::Method::GET, "/api/v1/labels?start=0&end=1"),
+            (axum::http::Method::POST, "/api/v1/labels"),
+            (
+                axum::http::Method::GET,
+                "/api/v1/label/job/values?start=0&end=1",
+            ),
+            (axum::http::Method::POST, "/api/v1/label/job/values"),
+            (axum::http::Method::GET, "/api/v1/metadata"),
+            (
+                axum::http::Method::GET,
+                "/api/v1/query_exemplars?query=%7B__name__%3D%22x%22%7D&start=0&end=1",
+            ),
+            (axum::http::Method::POST, "/api/v1/query_exemplars"),
+        ];
+        for (method, path) in routes {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("Prometheus response");
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+            assert_ne!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path}"
+            );
+        }
+
+        drop(app);
+        drop(service);
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

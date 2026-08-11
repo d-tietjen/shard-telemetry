@@ -100,6 +100,16 @@ pub struct StoreMetrics {
     pub retention_advanced_offsets: u64,
     /// Failed retention passes.
     pub retention_failures: u64,
+    /// Object-tier requests, bytes, exact-key deletions, and failures.
+    pub object_store: Option<crate::ObjectStoreStats>,
+    /// Raw shard-stream offsets reclaimed after compressed object publication.
+    pub source_reclaimed_offsets: u64,
+    /// Compressed groups retired by physical retention.
+    pub retired_object_groups: u64,
+    /// Compressed payload bytes retired by physical retention.
+    pub retired_object_payload_bytes: u64,
+    /// Exact object keys transferred to reclamation ownership.
+    pub retired_object_keys: u64,
 }
 
 #[derive(Debug, Default)]
@@ -4373,8 +4383,9 @@ async fn metrics(State(state): State<ApiState>) -> Response {
          shard_telemetry_durable_sink_failures_total {}\n\
          shard_telemetry_durable_sink_dirty_partitions {}\n\
          shard_telemetry_retention_runs_total {}\n\
-         shard_telemetry_retention_advanced_offsets_total {}\n\
-         shard_telemetry_retention_failures_total {}\n",
+             shard_telemetry_retention_advanced_offsets_total {}\n\
+             shard_telemetry_retention_failures_total {}\n\
+             shard_telemetry_source_reclaimed_offsets_total {}\n",
         u8::from(ready),
         store.pending_items,
         store.pending_bytes,
@@ -4386,10 +4397,41 @@ async fn metrics(State(state): State<ApiState>) -> Response {
         store.retention_runs,
         store.retention_advanced_offsets,
         store.retention_failures,
+        store.source_reclaimed_offsets,
     );
+    output.push_str(&format!(
+        "shard_telemetry_retired_object_groups_total {}\n\
+         shard_telemetry_retired_object_payload_bytes_total {}\n\
+         shard_telemetry_retired_object_keys_total {}\n",
+        store.retired_object_groups, store.retired_object_payload_bytes, store.retired_object_keys,
+    ));
     if let Some(retained_payload_bytes) = store.retained_payload_bytes {
         output.push_str(&format!(
             "shard_telemetry_retained_payload_bytes {retained_payload_bytes}\n"
+        ));
+    }
+    if let Some(object) = store.object_store {
+        output.push_str(&format!(
+            "shard_telemetry_object_store_put_requests_total {}\n\
+             shard_telemetry_object_store_put_bytes_total {}\n\
+             shard_telemetry_object_store_get_requests_total {}\n\
+             shard_telemetry_object_store_get_bytes_total {}\n\
+             shard_telemetry_object_store_range_requests_total {}\n\
+             shard_telemetry_object_store_range_bytes_total {}\n\
+             shard_telemetry_object_store_head_requests_total {}\n\
+             shard_telemetry_object_store_compare_and_swaps_total {}\n\
+             shard_telemetry_object_store_exact_deletes_total {}\n\
+             shard_telemetry_object_store_failures_total {}\n",
+            object.put_requests,
+            object.put_bytes,
+            object.get_requests,
+            object.get_bytes,
+            object.range_requests,
+            object.range_bytes,
+            object.head_requests,
+            object.compare_and_swaps,
+            object.delete_requests,
+            object.failures,
         ));
     }
     if let Some(runtime) = &state.production {

@@ -25,7 +25,8 @@ use crate::{
     ObjectTierConfig, OtlpLogDecoder, OtlpLogEvent, QueryOrder, RealtimeDictionaryObserver,
     RealtimeDictionaryTrainer, SharedTelemetryObjectStore, SsdObjectCache, TelemetryError,
     TelemetryObjectTier, TelemetryRecordRef, TelemetryResult, TierArtifactKind, TierArtifactSource,
-    TierCheckpoint, TierGroupSource, TierQueryRange, fingerprint_message, scan_message_terms,
+    TierCheckpoint, TierGroupSource, TierQueryRange, TierRetentionReport, fingerprint_message,
+    scan_message_terms,
     structural::{
         decode_structural_messages, decode_structural_positions, decode_structural_records,
         encode_structural_block, row_source_bytes,
@@ -1202,6 +1203,35 @@ impl LogStripe {
             }
         }
         Ok(published)
+    }
+
+    pub(crate) fn reclaim_retired_object_generations(&mut self) -> TelemetryResult<()> {
+        let Some(state) = self.tier.as_mut() else {
+            return Ok(());
+        };
+        for tier in state.tiers.values_mut() {
+            tier.reclaim_retired_objects()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_object_tier_since(
+        &mut self,
+        cutoff_timestamp_unix_nanos: u64,
+    ) -> TelemetryResult<TierRetentionReport> {
+        let Some(state) = self.tier.as_mut() else {
+            return Ok(TierRetentionReport::default());
+        };
+        let mut total = TierRetentionReport::default();
+        for tier in state.tiers.values_mut() {
+            let report = tier.retain_since_timestamp(cutoff_timestamp_unix_nanos)?;
+            total.retired_groups = total.retired_groups.saturating_add(report.retired_groups);
+            total.retired_payload_bytes = total
+                .retired_payload_bytes
+                .saturating_add(report.retired_payload_bytes);
+            total.retired_objects = total.retired_objects.saturating_add(report.retired_objects);
+        }
+        Ok(total)
     }
 
     fn offload_one_indexed_group(

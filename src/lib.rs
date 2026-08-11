@@ -33,6 +33,7 @@ mod query;
 mod query_index;
 mod realtime_dictionary;
 mod remote_write;
+mod s3_object_store;
 mod signal_ingest;
 mod sink;
 mod sink_journal;
@@ -111,6 +112,7 @@ pub use remote_write::{
     DecodedRemoteWrite, METRIC_FLAG_STALE, PROMETHEUS_STALE_NAN_BITS, RemoteWriteDecoder,
     RemoteWriteStats, RemoteWriteVersion,
 };
+pub use s3_object_store::{S3ObjectStore, S3ObjectStoreConfig};
 pub use signal_ingest::{
     DockerLogRecord, DockerLogStream, decode_log_envelope, prepare_docker_log_envelope,
     prepare_docker_log_envelope_with_context, prepare_log_envelope, prepare_loki_log_envelope,
@@ -133,13 +135,13 @@ pub use telemetry::{
 pub use telemetry_store::{DurableTelemetryConfig, DurableTelemetryStore, RetentionReport};
 pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};
 pub use tier::{
-    CachedObjectRange, CatalogGroupEntry, CatalogPage, CatalogPageRef, CatalogPointer, CatalogRoot,
-    LocalObjectStore, ObjectMetadata, ObjectTierConfig, SharedTelemetryObjectStore,
-    SignalTierPayload, SsdCacheConfig, SsdCacheStats, SsdObjectCache, TelemetryObjectStore,
-    TelemetryObjectTier, TierArtifact, TierArtifactKind, TierArtifactSource, TierBlockEntry,
-    TierCheckpoint, TierGroupManifest, TierGroupSource, TierQueryRange,
-    decode_signal_recovery_state, mark_group_offloaded, stage_signal_group,
-    write_staged_payload_pack,
+    CachedObjectRange, CatalogGroupEntry, CatalogLease, CatalogPage, CatalogPageRef,
+    CatalogPointer, CatalogRoot, LocalObjectStore, ObjectMetadata, ObjectStoreStats,
+    ObjectTierConfig, RetiredObject, SharedTelemetryObjectStore, SignalTierPayload, SsdCacheConfig,
+    SsdCacheStats, SsdObjectCache, TelemetryObjectStore, TelemetryObjectTier, TierArtifact,
+    TierArtifactKind, TierArtifactSource, TierBlockEntry, TierCheckpoint, TierGroupManifest,
+    TierGroupSource, TierQueryRange, TierRetentionReport, decode_signal_recovery_state,
+    mark_group_offloaded, stage_signal_group, write_staged_payload_pack,
 };
 pub use trace::{
     DurableSpan, SpanEvent, SpanLink, SpanStatus, TraceApplyOutcome, TraceDirectory, TraceQuery,

@@ -887,6 +887,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stable_tempo_route_surface_has_no_missing_or_wrong_method_routes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-tempo-routes-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = Arc::new(
+            DurableTelemetryStore::open(DurableTelemetryConfig {
+                data_directory: directory.clone(),
+                object_store_directory: None,
+                s3_object_store: None,
+                recovery_journal: false,
+                retention: None,
+                shard_count: 1,
+                tenant_partitions: 1,
+                append_linger: Duration::ZERO,
+                stripe: StripeConfig::default(),
+                indexed_ack_timeout: Duration::from_secs(30),
+            })
+            .expect("store opens"),
+        );
+        let service = TempoService::new(store, TempoApiConfig::default()).expect("Tempo service");
+        let app = tempo_router(service.clone());
+        for path in [
+            "/api/shard-telemetry/v1/traces/01010101010101010101010101010101/correlations",
+            "/api/v2/traces/01010101010101010101010101010101",
+            "/api/search?q=%7B%7D",
+            "/api/v2/search/tags",
+            "/api/v2/search/tag/service.name/values",
+            "/api/metrics/query_range?q=%7B%7D%20%7C%20rate%28%29&start=1&end=2&step=1s",
+            "/api/metrics/query?q=%7B%7D%20%7C%20count%28%29&time=2",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("Tempo response");
+            if path.starts_with("/api/v2/traces/") {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
+                let body = to_bytes(response.into_body(), 1_024)
+                    .await
+                    .expect("trace miss body");
+                assert_eq!(body.as_ref(), b"trace not found");
+                continue;
+            }
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
+            assert_ne!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "GET {path}"
+            );
+        }
+
+        drop(app);
+        drop(service);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn traceql_metrics_routes_return_tempo_series_envelope() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -900,6 +967,7 @@ mod tests {
             DurableTelemetryStore::open(DurableTelemetryConfig {
                 data_directory: directory.clone(),
                 object_store_directory: None,
+                s3_object_store: None,
                 recovery_journal: true,
                 retention: None,
                 shard_count: 1,

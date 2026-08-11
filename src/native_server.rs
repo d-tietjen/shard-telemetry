@@ -544,6 +544,7 @@ mod tests {
             DurableTelemetryStore::open(DurableTelemetryConfig {
                 data_directory: directory.clone(),
                 object_store_directory: None,
+                s3_object_store: None,
                 recovery_journal: false,
                 retention: None,
                 shard_count: 2,
@@ -656,6 +657,7 @@ mod tests {
             DurableTelemetryStore::open(DurableTelemetryConfig {
                 data_directory: directory.clone(),
                 object_store_directory: None,
+                s3_object_store: None,
                 recovery_journal: false,
                 retention: None,
                 shard_count: 1,

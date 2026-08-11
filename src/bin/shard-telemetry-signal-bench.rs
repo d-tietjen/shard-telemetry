@@ -121,6 +121,7 @@ fn benchmark_server_scans(
     let store = DurableTelemetryStore::open(DurableTelemetryConfig {
         data_directory: data_directory.to_path_buf(),
         object_store_directory: None,
+        s3_object_store: None,
         recovery_journal: true,
         retention: None,
         shard_count: u32::try_from(shard_count)?,
@@ -256,6 +257,7 @@ fn persist_server_store(
     let store = DurableTelemetryStore::open(DurableTelemetryConfig {
         data_directory: data_directory.to_path_buf(),
         object_store_directory: None,
+        s3_object_store: None,
         recovery_journal: true,
         retention: None,
         shard_count,

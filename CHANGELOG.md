@@ -6,7 +6,24 @@ and protocol interfaces when called out in release notes.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- Rust-native S3/S3-compatible durable object storage with workload
+  credentials, conditional catalog publication, streaming multipart uploads,
+  and BLAKE3 verification.
+- Physical all-signal retention, exact-key object-store metrics, and automatic
+  shard-stream source-pack reclamation after compressed catalog checkpoints.
+- Production backup/restore, upgrade/rollback, S3 lifecycle, and monitoring
+  runbooks.
+
+### Changed
+
+- Object publication and retention now use bounded, crash-replayable ownership
+  records, immutable catalog leases, and exact-key reclamation. No bucket
+  listing or tracing garbage collector is required.
+- shard-stream is pinned to `8eca7d9311b2b738f85f79d0f59a003d1f6c3752`,
+  which durably checkpoints sequencer floors and recovers partitions whose
+  retained prefix was completely reclaimed.
 
 ## [0.1.0] - 2026-08-03
 

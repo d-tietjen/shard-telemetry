@@ -36,6 +36,11 @@ partitions. Typed values, resource and scope context, identifiers, dropped
 counts, NaN payload bits, span events and links, and metric exemplars are
 preserved by their signal-native records.
 
+The exact OTLP transport, Prometheus API/PromQL, and Tempo API/TraceQL support
+boundary is documented in
+[TELEMETRY_COMPATIBILITY.md](TELEMETRY_COMPATIBILITY.md). Unsupported query
+features fail with an explicit client error rather than an approximation.
+
 For live ingestion, install `TelemetrySinkFactory` with
 `StreamEngine::open_with_durable_sink`. Every durable append is a checksummed
 `STEL` envelope containing exactly the requested item count. Once shard-stream
@@ -285,10 +290,19 @@ range-read candidate frames through the bounded SSD cache, verify BLAKE3, and
 reconstruct exact records. Restart begins from the catalog checkpoint without
 loading a corpus-wide posting map.
 
-`LocalObjectStore` is the production adapter shipped by the standalone binary.
-Cloud deployments implement the public `TelemetryObjectStore` contract with
-put-if-absent, bounded reads, range reads, HEAD, and conditional replacement;
-the public core deliberately does not tie storage correctness to one cloud SDK.
+The standalone binary ships both a synchronized `LocalObjectStore` and an
+all-Rust `S3ObjectStore`. The S3 adapter uses the standard AWS credential chain,
+streams multipart uploads, verifies BLAKE3 content, performs exact-key
+idempotent deletion, and conditionally replaces catalog control objects by
+version token. Other cloud adapters can implement the public
+`TelemetryObjectStore` contract with the same semantics.
+
+Publication records every transaction-owned key in `PENDING` before upload.
+After a crash, an unselected transaction is reclaimed by those exact keys once
+its writer lease expires; a selected transaction is preserved. Superseded
+catalog objects are released after local leases and the cross-process reader
+grace expire. No bucket listing, reachability sweep, or tracing garbage
+collector is used.
 
 The durable sink also supports an optional stripe-local recovery journal for
 deployments without the object tier. Each synchronized frame contains exact
@@ -490,10 +504,32 @@ across fully expired append batches. OS signals and Loki shutdown endpoints
 stop admission, flush the source log and index checkpoint, close tail/native
 connections, and then stop listeners.
 
-Production mode requires `--object-store-directory`; this is where compressed
+Production mode requires one durable object backend; this is where compressed
 checkpointed groups and their segmented indexes become restart-authoritative.
-The raw recovery journal is opt-in and is intended only as a migration or
-diagnostic fallback.
+Use either `--object-store-directory` or an S3 bucket. The two backends are
+mutually exclusive, and the raw recovery journal is opt-in for migration or
+diagnostics.
+
+For S3, use a bucket or prefix dedicated to one deployment and workload
+credentials with only the required prefix permissions:
+
+```bash
+cargo run --release --bin shard-telemetry-server -- \
+  --auth-token-file /run/secrets/shard-telemetry-token \
+  --default-tenant production \
+  --data-directory /var/lib/shard-telemetry \
+  --object-store-s3-bucket company-telemetry \
+  --object-store-s3-prefix production/shard-telemetry \
+  --object-store-s3-region us-east-1 \
+  --shards 16 \
+  --tenant-partitions 256
+```
+
+Production rejects plaintext S3 endpoints. Configure bucket versioning for
+recovery from operator error and a bounded abort-incomplete-multipart lifecycle
+rule for provider-internal multipart fragments left by hard host failure. Do
+not configure an expiration rule for completed objects; ShardTelemetry owns
+their exact-key retention lifecycle.
 
 To opt into the administrative ClickHouse scan route, create a protected token
 file and add `--clickhouse-token-file /run/secrets/shard-telemetry-clickhouse`. Keep
@@ -501,10 +537,11 @@ the listener on loopback or behind TLS/mTLS; the route is intentionally not
 registered without that option.
 
 The authoritative shard-stream packs are sufficient for recovery in explicit
-development mode. With `--object-store-directory`, production flushes publish
-compressed frames and segmented indexes to the immutable ShardTelemetry catalog;
-restarts use its durable checkpoint and cold reads do not depend on resident
-payload.
+development mode. With either durable object backend, production flushes
+publish compressed frames and segmented indexes to the immutable
+ShardTelemetry catalog. It then advances each batch-aligned source log start to
+the selected catalog checkpoint and reclaims covered source packs. Restarts and
+cold reads use the catalog; keeping a second permanent raw copy is unnecessary.
 
 See [LOKI_COMPATIBILITY.md](LOKI_COMPATIBILITY.md) for the executable API
 surface, differential target, known differences, and wire-path benchmarks. The

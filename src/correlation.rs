@@ -64,6 +64,10 @@ pub struct CorrelationQuery {
     pub labels: Arc<Vec<(Arc<str>, Arc<str>)>>,
     /// Optional signal restriction.
     pub signal: Option<TelemetrySignal>,
+    /// Inclusive lower event-time bound.
+    pub start_time_unix_nanos: Option<u64>,
+    /// Inclusive upper event-time bound.
+    pub end_time_unix_nanos: Option<u64>,
     /// Exclusive stable continuation point.
     pub after: Option<TelemetryRecordRef>,
     /// Maximum record references returned.
@@ -82,6 +86,8 @@ impl CorrelationQuery {
             attributes: Arc::new(Vec::new()),
             labels: Arc::new(Vec::new()),
             signal: None,
+            start_time_unix_nanos: None,
+            end_time_unix_nanos: None,
             after: None,
             limit: 1_000,
         }
@@ -457,7 +463,7 @@ fn visit_attributes<'a>(
 pub struct CorrelationIndex {
     config: CorrelationConfig,
     tenants: HashMap<Arc<str>, u32>,
-    postings: HashMap<(u32, CorrelationKey), Vec<TelemetryRecordRef>>,
+    postings: HashMap<(u32, CorrelationKey), Vec<CorrelationPosting>>,
     resource_pointer_ids: Vec<Option<CachedResourceId>>,
     resource_ids: Vec<Option<CachedResourceId>>,
     scope_pointer_ids: Vec<Option<CachedScopeId>>,
@@ -466,6 +472,12 @@ pub struct CorrelationIndex {
     attribute_ids: Vec<Option<CachedAttributeIds>>,
     refs: usize,
     dropped_postings: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CorrelationPosting {
+    record_ref: TelemetryRecordRef,
+    timestamp_unix_nanos: u64,
 }
 
 #[derive(Debug)]
@@ -526,10 +538,26 @@ impl CorrelationIndex {
             return;
         };
         if let Some(trace_id) = log.trace_id {
-            self.insert(tenant_id, CorrelationKey::Trace(trace_id), log.record_ref);
+            self.insert(
+                tenant_id,
+                CorrelationKey::Trace(trace_id),
+                log.record_ref,
+                log.timestamp_unix_nanos,
+            );
         }
-        self.index_contexts(tenant_id, log.record_ref, &log.resource, &log.scope);
-        self.index_attribute_set(tenant_id, log.record_ref, &log.attributes);
+        self.index_contexts(
+            tenant_id,
+            log.record_ref,
+            log.timestamp_unix_nanos,
+            &log.resource,
+            &log.scope,
+        );
+        self.index_attribute_set(
+            tenant_id,
+            log.record_ref,
+            log.timestamp_unix_nanos,
+            &log.attributes,
+        );
     }
 
     /// Indexes one durable span, including event and link metadata.
@@ -542,19 +570,42 @@ impl CorrelationIndex {
             tenant_id,
             CorrelationKey::Trace(span.trace_id),
             span.record_ref,
+            span.start_time_unix_nanos,
         );
         for link in span.links.iter() {
             self.insert(
                 tenant_id,
                 CorrelationKey::Trace(link.trace_id),
                 span.record_ref,
+                span.start_time_unix_nanos,
             );
-            self.index_attribute_set(tenant_id, span.record_ref, &link.attributes);
+            self.index_attribute_set(
+                tenant_id,
+                span.record_ref,
+                span.start_time_unix_nanos,
+                &link.attributes,
+            );
         }
-        self.index_contexts(tenant_id, span.record_ref, &span.resource, &span.scope);
-        self.index_attribute_set(tenant_id, span.record_ref, &span.attributes);
+        self.index_contexts(
+            tenant_id,
+            span.record_ref,
+            span.start_time_unix_nanos,
+            &span.resource,
+            &span.scope,
+        );
+        self.index_attribute_set(
+            tenant_id,
+            span.record_ref,
+            span.start_time_unix_nanos,
+            &span.attributes,
+        );
         for event in span.events.iter() {
-            self.index_attribute_set(tenant_id, span.record_ref, &event.attributes);
+            self.index_attribute_set(
+                tenant_id,
+                span.record_ref,
+                span.start_time_unix_nanos,
+                &event.attributes,
+            );
         }
     }
 
@@ -566,22 +617,39 @@ impl CorrelationIndex {
         };
         for exemplar in point.exemplars.iter() {
             if let Some(trace_id) = exemplar.trace_id {
-                self.insert(tenant_id, CorrelationKey::Trace(trace_id), point.record_ref);
+                self.insert(
+                    tenant_id,
+                    CorrelationKey::Trace(trace_id),
+                    point.record_ref,
+                    point.timestamp_unix_nanos,
+                );
             }
-            self.index_attribute_set(tenant_id, point.record_ref, &exemplar.filtered_attributes);
+            self.index_attribute_set(
+                tenant_id,
+                point.record_ref,
+                point.timestamp_unix_nanos,
+                &exemplar.filtered_attributes,
+            );
         }
         self.index_contexts(
             tenant_id,
             point.record_ref,
+            point.timestamp_unix_nanos,
             &point.identity.resource,
             &point.identity.scope,
         );
         self.index_attribute_set(
             tenant_id,
             point.record_ref,
+            point.timestamp_unix_nanos,
             &point.identity.point_attributes,
         );
-        self.index_attribute_set(tenant_id, point.record_ref, &point.metadata);
+        self.index_attribute_set(
+            tenant_id,
+            point.record_ref,
+            point.timestamp_unix_nanos,
+            &point.metadata,
+        );
     }
 
     /// Returns the deterministic intersection of every requested posting.
@@ -623,33 +691,43 @@ impl CorrelationIndex {
         let Some(first) = lists.first() else {
             return Vec::new();
         };
-        let start = query
-            .after
-            .map_or(0, |after| first.partition_point(|record| *record <= after));
+        let start = query.after.map_or(0, |after| {
+            first.partition_point(|posting| posting.record_ref <= after)
+        });
         let mut selected = Vec::with_capacity(query.limit.min(first.len().saturating_sub(start)));
         let mut cursors = lists[1..]
             .iter()
             .map(|incoming| {
                 query.after.map_or(0, |after| {
-                    incoming.partition_point(|record| *record <= after)
+                    incoming.partition_point(|posting| posting.record_ref <= after)
                 })
             })
             .collect::<Vec<_>>();
-        'candidate: for &record in &first[start..] {
+        'candidate: for posting in &first[start..] {
+            let record = posting.record_ref;
             if query.signal.is_some_and(|signal| record.signal != signal) {
+                continue;
+            }
+            if query
+                .start_time_unix_nanos
+                .is_some_and(|start| posting.timestamp_unix_nanos < start)
+                || query
+                    .end_time_unix_nanos
+                    .is_some_and(|end| posting.timestamp_unix_nanos > end)
+            {
                 continue;
             }
             for (incoming, cursor) in lists[1..].iter().zip(&mut cursors) {
                 while incoming
                     .get(*cursor)
-                    .is_some_and(|current| *current < record)
+                    .is_some_and(|current| current.record_ref < record)
                 {
                     *cursor += 1;
                 }
                 let Some(current) = incoming.get(*cursor) else {
                     return selected;
                 };
-                if *current != record {
+                if current.record_ref != record {
                     continue 'candidate;
                 }
             }
@@ -659,6 +737,17 @@ impl CorrelationIndex {
             }
         }
         selected
+    }
+
+    /// Drops expired bounded navigation postings without touching durable data.
+    pub fn retain_since_timestamp(&mut self, cutoff_timestamp_unix_nanos: u64) {
+        let mut retained = 0usize;
+        self.postings.retain(|_, postings| {
+            postings.retain(|posting| posting.timestamp_unix_nanos >= cutoff_timestamp_unix_nanos);
+            retained = retained.saturating_add(postings.len());
+            !postings.is_empty()
+        });
+        self.refs = retained;
     }
 
     /// Returns current bounds and drop diagnostics.
@@ -675,25 +764,52 @@ impl CorrelationIndex {
         &mut self,
         tenant_id: u32,
         record_ref: TelemetryRecordRef,
+        timestamp_unix_nanos: u64,
         resource: &Arc<ResourceContext>,
         scope: &Arc<ScopeContext>,
     ) {
         let resource_id = self.resource_id(resource);
         let scope_id = self.scope_id(scope);
-        self.insert(tenant_id, CorrelationKey::Resource(resource_id), record_ref);
-        self.insert(tenant_id, CorrelationKey::Scope(scope_id), record_ref);
-        self.index_attribute_set(tenant_id, record_ref, &resource.attributes);
-        self.index_attribute_set(tenant_id, record_ref, &scope.attributes);
+        self.insert(
+            tenant_id,
+            CorrelationKey::Resource(resource_id),
+            record_ref,
+            timestamp_unix_nanos,
+        );
+        self.insert(
+            tenant_id,
+            CorrelationKey::Scope(scope_id),
+            record_ref,
+            timestamp_unix_nanos,
+        );
+        self.index_attribute_set(
+            tenant_id,
+            record_ref,
+            timestamp_unix_nanos,
+            &resource.attributes,
+        );
+        self.index_attribute_set(
+            tenant_id,
+            record_ref,
+            timestamp_unix_nanos,
+            &scope.attributes,
+        );
     }
 
     fn index_attribute_set(
         &mut self,
         tenant_id: u32,
         record_ref: TelemetryRecordRef,
+        timestamp_unix_nanos: u64,
         attributes: &Arc<Vec<TelemetryAttribute>>,
     ) {
         for id in self.attribute_ids(attributes).iter().copied() {
-            self.insert(tenant_id, CorrelationKey::Attribute(id), record_ref);
+            self.insert(
+                tenant_id,
+                CorrelationKey::Attribute(id),
+                record_ref,
+                timestamp_unix_nanos,
+            );
         }
     }
 
@@ -821,7 +937,13 @@ impl CorrelationIndex {
         Some(tenant_id)
     }
 
-    fn insert(&mut self, tenant_id: u32, key: CorrelationKey, record_ref: TelemetryRecordRef) {
+    fn insert(
+        &mut self,
+        tenant_id: u32,
+        key: CorrelationKey,
+        record_ref: TelemetryRecordRef,
+        timestamp_unix_nanos: u64,
+    ) {
         let lookup = (tenant_id, key);
         let refs = if self.postings.len() < self.config.max_keys {
             self.postings.entry(lookup).or_default()
@@ -831,19 +953,26 @@ impl CorrelationIndex {
             self.dropped_postings = self.dropped_postings.saturating_add(1);
             return;
         };
-        if refs.last().copied() == Some(record_ref) {
+        if refs
+            .last()
+            .is_some_and(|posting| posting.record_ref == record_ref)
+        {
             return;
         }
         if refs.len() >= self.config.max_refs_per_key || self.refs >= self.config.max_total_refs {
             self.dropped_postings = self.dropped_postings.saturating_add(1);
             return;
         }
-        if refs.last().is_none_or(|last| *last < record_ref) {
-            refs.push(record_ref);
+        let posting = CorrelationPosting {
+            record_ref,
+            timestamp_unix_nanos,
+        };
+        if refs.last().is_none_or(|last| last.record_ref < record_ref) {
+            refs.push(posting);
         } else {
-            match refs.binary_search(&record_ref) {
+            match refs.binary_search_by_key(&record_ref, |posting| posting.record_ref) {
                 Ok(_) => return,
-                Err(position) => refs.insert(position, record_ref),
+                Err(position) => refs.insert(position, posting),
             }
         }
         self.refs += 1;
@@ -948,12 +1077,14 @@ mod tests {
                 tenant_id,
                 CorrelationKey::Attribute(first.fingerprint()),
                 record,
+                offset,
             );
             if offset % 2 == 0 {
                 index.insert(
                     tenant_id,
                     CorrelationKey::Attribute(second.fingerprint()),
                     record,
+                    offset,
                 );
             }
         }
@@ -977,5 +1108,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![4_992, 4_994, 4_996]
         );
+    }
+
+    #[test]
+    fn time_bounds_and_retention_remove_expired_navigation_postings() {
+        let resource = Arc::new(ResourceContext {
+            attributes: Arc::new(vec![TelemetryAttribute::new(
+                "service.name",
+                TelemetryValue::String(Arc::from("checkout")),
+            )]),
+            ..ResourceContext::default()
+        });
+        let partition = TopicPartition::new(LOGS_TOPIC_ID, LogicalPartitionId::new(1));
+        let mut index = CorrelationIndex::new(CorrelationConfig::default());
+        for (offset, timestamp) in [(0, 10), (1, 20)] {
+            let mut log = DurableLog::new(
+                ShardId::new(0),
+                partition,
+                LogicalOffset::new(offset),
+                timestamp,
+                "message",
+                CompressionCohortId::new(1),
+            );
+            log.resource = Arc::clone(&resource);
+            index.index_log("tenant-a", &log);
+        }
+        let query = CorrelationQuery {
+            start_time_unix_nanos: Some(15),
+            ..CorrelationQuery::new("tenant-a").with_resource_id(resource.id())
+        };
+        assert_eq!(
+            index
+                .query(&query)
+                .into_iter()
+                .map(|record| record.offset.get())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        index.retain_since_timestamp(15);
+        assert_eq!(index.query(&query).len(), 1);
+        assert!(index.stats().refs > 0);
+        let expired = CorrelationQuery {
+            end_time_unix_nanos: Some(14),
+            ..CorrelationQuery::new("tenant-a").with_resource_id(resource.id())
+        };
+        assert!(index.query(&expired).is_empty());
     }
 }

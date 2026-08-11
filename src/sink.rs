@@ -23,13 +23,13 @@ use crate::trace::decode_trace_block_matching;
 use crate::{
     CorrelationConfig, CorrelationIndex, CorrelationQuery, DictionaryCatalog, DurableMetricPoint,
     DurableSpan, LogMatch, LogPredicate, LogQuery, LogStripe, MetricApplyOutcome,
-    MetricIngestProtocol, MetricQuery, MetricStripe, ObjectMetadata, ObjectTierConfig,
-    RealtimeDictionaryObserver, RealtimeDictionaryTrainer, ShardTelemetryConfig,
+    MetricIngestProtocol, MetricQuery, MetricStripe, ObjectMetadata, ObjectStoreStats,
+    ObjectTierConfig, RealtimeDictionaryObserver, RealtimeDictionaryTrainer, ShardTelemetryConfig,
     SharedTelemetryObjectStore, SsdCacheConfig, SsdCacheStats, SsdObjectCache, StripeConfig,
     TelemetryEnvelope, TelemetryError, TelemetryObjectTier, TelemetryRecordRef, TelemetryResult,
     TelemetryRouter, TelemetrySignal, TierArtifactKind, TierCheckpoint, TierQueryRange,
-    TraceApplyOutcome, TraceQuery, TraceStripe, decode_metric_chunk, decode_signal_recovery_state,
-    decode_trace_block, stage_signal_group,
+    TierRetentionReport, TraceApplyOutcome, TraceQuery, TraceStripe, decode_metric_chunk,
+    decode_signal_recovery_state, decode_trace_block, stage_signal_group,
 };
 
 /// Immutable object-tier and bounded SSD-cache settings shared by sink stripes.
@@ -180,6 +180,7 @@ pub struct TelemetrySinkFactory {
     journals: Mutex<HashMap<ShardId, Arc<SinkJournal>>>,
     query_workers: Arc<Mutex<HashMap<ShardId, SyncSender<SinkCommand>>>>,
     tier_caches: Option<TierCaches>,
+    object_store: Option<SharedTelemetryObjectStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -350,6 +351,7 @@ impl TelemetrySinkFactory {
         let mut recovered_checkpoints = HashMap::new();
         let mut recovered_transactions = Vec::new();
         let mut journals = HashMap::new();
+        let object_store = config.object_tier.as_ref().map(|tier| tier.store.clone());
         let tier_caches = config
             .object_tier
             .as_ref()
@@ -504,6 +506,7 @@ impl TelemetrySinkFactory {
             journals: Mutex::new(journals),
             query_workers: Arc::new(Mutex::new(HashMap::new())),
             tier_caches,
+            object_store,
         })
     }
 
@@ -514,6 +517,7 @@ impl TelemetrySinkFactory {
         TelemetryService {
             workers: Arc::clone(&self.query_workers),
             tier_caches: self.tier_caches.clone(),
+            object_store: self.object_store.clone(),
         }
     }
 }
@@ -643,6 +647,10 @@ enum SinkCommand {
     },
     Flush {
         response: SyncSender<TelemetryResult<usize>>,
+    },
+    RetainObjectTier {
+        cutoff_timestamp_unix_nanos: u64,
+        response: SyncSender<TelemetryResult<TierRetentionReport>>,
     },
     RetainedPayloadBytes {
         response: SyncSender<u64>,
@@ -774,6 +782,15 @@ fn run_sink_worker(
                 let result = flush_object_tiers(&mut stripe, &checkpoints);
                 let _ = response.send(result);
             }
+            SinkCommand::RetainObjectTier {
+                cutoff_timestamp_unix_nanos,
+                response,
+            } => {
+                let _ = response.send(retain_object_tiers(
+                    &mut stripe,
+                    cutoff_timestamp_unix_nanos,
+                ));
+            }
             SinkCommand::RetainedPayloadBytes { response } => {
                 let bytes = stripe
                     .logs
@@ -795,6 +812,7 @@ fn run_sink_worker(
 pub struct TelemetryService {
     workers: Arc<Mutex<HashMap<ShardId, SyncSender<SinkCommand>>>>,
     tier_caches: Option<TierCaches>,
+    object_store: Option<SharedTelemetryObjectStore>,
 }
 
 impl TelemetryService {
@@ -807,6 +825,14 @@ impl TelemetryService {
                 control: caches.control.stats(),
                 payload: caches.payload.stats(),
             })
+    }
+
+    /// Returns object-store request, transfer, deletion, and failure counters.
+    #[must_use]
+    pub fn object_store_stats(&self) -> Option<ObjectStoreStats> {
+        self.object_store
+            .as_ref()
+            .map(SharedTelemetryObjectStore::stats)
     }
 
     /// Fans a partition-local query across all active physical stripes.
@@ -957,6 +983,46 @@ impl TelemetryService {
                 })??;
                 Ok(total.saturating_add(published))
             })
+    }
+
+    /// Applies bounded physical retention to every signal catalog in parallel.
+    pub fn retain_object_tier_since(
+        &self,
+        cutoff_timestamp_unix_nanos: u64,
+    ) -> TelemetryResult<TierRetentionReport> {
+        let workers = self.worker_senders()?;
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::RetainObjectTier {
+                    cutoff_timestamp_unix_nanos,
+                    response,
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting object retention"
+                    ))
+                })?;
+            responses.push((shard_id, receiver));
+        }
+        responses.into_iter().try_fold(
+            TierRetentionReport::default(),
+            |mut total, (shard_id, receiver)| {
+                let report = receiver.recv().map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped during object retention"
+                    ))
+                })??;
+                total.retired_groups = total.retired_groups.saturating_add(report.retired_groups);
+                total.retired_payload_bytes = total
+                    .retired_payload_bytes
+                    .saturating_add(report.retired_payload_bytes);
+                total.retired_objects =
+                    total.retired_objects.saturating_add(report.retired_objects);
+                Ok(total)
+            },
+        )
     }
 
     /// Returns compressed bytes still resident while awaiting a complete group.
@@ -1484,7 +1550,36 @@ fn flush_object_tiers(
             stripe, partition, checkpoint, true,
         )?);
     }
+    stripe.logs.reclaim_retired_object_generations()?;
+    for state in stripe.signal_tiers.values_mut() {
+        for tier in state.tiers.values_mut() {
+            tier.reclaim_retired_objects()?;
+        }
+    }
     Ok(published)
+}
+
+fn retain_object_tiers(
+    stripe: &mut TelemetryStripeState,
+    cutoff_timestamp_unix_nanos: u64,
+) -> TelemetryResult<TierRetentionReport> {
+    stripe
+        .correlations
+        .retain_since_timestamp(cutoff_timestamp_unix_nanos);
+    let mut total = stripe
+        .logs
+        .retain_object_tier_since(cutoff_timestamp_unix_nanos)?;
+    for state in stripe.signal_tiers.values_mut() {
+        for tier in state.tiers.values_mut() {
+            let report = tier.retain_since_timestamp(cutoff_timestamp_unix_nanos)?;
+            total.retired_groups = total.retired_groups.saturating_add(report.retired_groups);
+            total.retired_payload_bytes = total
+                .retired_payload_bytes
+                .saturating_add(report.retired_payload_bytes);
+            total.retired_objects = total.retired_objects.saturating_add(report.retired_objects);
+        }
+    }
+    Ok(total)
 }
 
 fn read_signal_tier_payloads(
@@ -1810,6 +1905,8 @@ fn query_correlation_stripe(
             let mut log_query = LogQuery::new(partition)
                 .where_predicate(LogPredicate::and(label_predicates.clone()))
                 .with_limit(query.limit);
+            log_query.start_timestamp_unix_nanos = query.start_time_unix_nanos;
+            log_query.end_timestamp_unix_nanos = query.end_time_unix_nanos;
             if let Some(after) = query.after.filter(|after| {
                 after.signal == TelemetrySignal::Logs && after.topic_partition == partition
             }) {
@@ -1841,20 +1938,33 @@ fn query_correlation_stripe(
         };
         let mut partitions = state.tiers.keys().copied().collect::<Vec<_>>();
         partitions.sort_unstable();
-        for payload in
-            read_signal_tier_payloads(state, &partitions, TierQueryRange::default(), Some(query))?
-        {
+        for payload in read_signal_tier_payloads(
+            state,
+            &partitions,
+            TierQueryRange {
+                min_timestamp_unix_nanos: query.start_time_unix_nanos,
+                max_timestamp_unix_nanos: query.end_time_unix_nanos,
+                ..TierQueryRange::default()
+            },
+            Some(query),
+        )? {
             match signal {
                 TelemetrySignal::Traces => refs.extend(
                     decode_trace_block(payload.as_ref())?
                         .into_iter()
-                        .filter(|span| span_matches_correlation(query, span))
+                        .filter(|span| {
+                            correlation_time_matches(query, span.start_time_unix_nanos)
+                                && span_matches_correlation(query, span)
+                        })
                         .map(|span| span.record_ref),
                 ),
                 TelemetrySignal::Metrics => refs.extend(
                     decode_metric_chunk(payload.as_ref())?
                         .into_iter()
-                        .filter(|point| metric_matches_correlation(query, point))
+                        .filter(|point| {
+                            correlation_time_matches(query, point.timestamp_unix_nanos)
+                                && metric_matches_correlation(query, point)
+                        })
                         .map(|point| point.record_ref),
                 ),
                 TelemetrySignal::Logs => unreachable!("loop contains only cold native signals"),
@@ -1874,6 +1984,15 @@ fn query_correlation_stripe(
     }
     refs.truncate(query.limit);
     Ok(refs)
+}
+
+fn correlation_time_matches(query: &CorrelationQuery, timestamp_unix_nanos: u64) -> bool {
+    query
+        .start_time_unix_nanos
+        .is_none_or(|start| timestamp_unix_nanos >= start)
+        && query
+            .end_time_unix_nanos
+            .is_none_or(|end| timestamp_unix_nanos <= end)
 }
 
 fn validate_relative_offsets(
@@ -2367,6 +2486,9 @@ mod tests {
                     max_blocks_per_group: 64,
                     groups_per_page: 8,
                     max_control_object_bytes: 64 * 1024,
+                    max_retired_objects: 64,
+                    retirement_grace: std::time::Duration::from_secs(1),
+                    transaction_lease: std::time::Duration::from_secs(60),
                 },
                 control_cache: SsdCacheConfig {
                     max_bytes: 16 * 1024 * 1024,
