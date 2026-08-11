@@ -1,5 +1,7 @@
--- StorageShardTelemetry requires a ClickHouse binary built with clickhouse/adapter.
--- Inject the token from a protected source; do not commit a real credential.
+-- These external tables work with an unmodified ClickHouse binary. The data
+-- source, authentication, projection, and serialization endpoint are provided
+-- by ShardTelemetry's Rust service. Inject the token from a protected source;
+-- do not commit a real credential.
 
 CREATE DATABASE IF NOT EXISTS shardtelemetry;
 
@@ -17,9 +19,9 @@ CREATE TABLE IF NOT EXISTS shardtelemetry.logs
     scope_attribute_ids Map(String, String), attributes_json Nullable(String),
     resource_attributes_json Nullable(String), scope_attributes_json Nullable(String)
 )
-ENGINE = ShardTelemetry(
-    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=logs',
-    'ArrowStream',
+ENGINE = URL(
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=logs&wire=rowbinary',
+    'RowBinary',
     headers('Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE', 'X-Scope-OrgID' = 'fake')
 );
 
@@ -39,9 +41,9 @@ CREATE TABLE IF NOT EXISTS shardtelemetry.spans
     resource_attributes_json Nullable(String), scope_attributes_json Nullable(String),
     events_json Nullable(String), links_json Nullable(String)
 )
-ENGINE = ShardTelemetry(
-    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=spans',
-    'ArrowStream',
+ENGINE = URL(
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=spans&wire=rowbinary',
+    'RowBinary',
     headers('Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE', 'X-Scope-OrgID' = 'fake')
 );
 
@@ -56,9 +58,9 @@ CREATE TABLE IF NOT EXISTS shardtelemetry.span_events
     attribute_ids Map(String, String), attributes_json Nullable(String),
     resource_attributes_json Nullable(String), scope_attributes_json Nullable(String)
 )
-ENGINE = ShardTelemetry(
-    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=span_events',
-    'ArrowStream',
+ENGINE = URL(
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=span_events&wire=rowbinary',
+    'RowBinary',
     headers('Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE', 'X-Scope-OrgID' = 'fake')
 );
 
@@ -73,9 +75,9 @@ CREATE TABLE IF NOT EXISTS shardtelemetry.span_links
     attribute_ids Map(String, String), attributes_json Nullable(String),
     resource_attributes_json Nullable(String), scope_attributes_json Nullable(String)
 )
-ENGINE = ShardTelemetry(
-    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=span_links',
-    'ArrowStream',
+ENGINE = URL(
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=span_links&wire=rowbinary',
+    'RowBinary',
     headers('Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE', 'X-Scope-OrgID' = 'fake')
 );
 
@@ -95,9 +97,9 @@ CREATE TABLE IF NOT EXISTS shardtelemetry.metric_points
     resource_attributes_json Nullable(String), scope_attributes_json Nullable(String),
     exemplars_json Nullable(String)
 )
-ENGINE = ShardTelemetry(
-    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=metric_points',
-    'ArrowStream',
+ENGINE = URL(
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=metric_points&wire=rowbinary',
+    'RowBinary',
     headers('Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE', 'X-Scope-OrgID' = 'fake')
 );
 
@@ -112,9 +114,9 @@ CREATE TABLE IF NOT EXISTS shardtelemetry.metric_exemplars
     attribute_ids Map(String, String), attributes_json Nullable(String),
     labels Map(String, String), metadata Map(String, String)
 )
-ENGINE = ShardTelemetry(
-    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=metric_exemplars',
-    'ArrowStream',
+ENGINE = URL(
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=metric_exemplars&wire=rowbinary',
+    'RowBinary',
     headers('Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE', 'X-Scope-OrgID' = 'fake')
 );
 

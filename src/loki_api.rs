@@ -3,6 +3,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, Request, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -125,6 +127,30 @@ pub trait LokiStore: Send + Sync + std::fmt::Debug {
         emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
     ) -> Result<(), LokiApiError> {
         crate::analytics::scan_entries(self.entries(&request.tenant)?, request, emit)
+    }
+
+    /// Emits an already-columnar Arrow batch when the storage engine can
+    /// project a narrow indexed query without first constructing normalized
+    /// row objects. Returning `false` asks the protocol boundary to use
+    /// [`Self::scan_analytics`].
+    fn scan_analytics_arrow(
+        &self,
+        _request: &AnalyticsScanRequest,
+        _schema: &SchemaRef,
+        _emit: &mut dyn FnMut(&RecordBatch) -> Result<(), LokiApiError>,
+    ) -> Result<bool, LokiApiError> {
+        Ok(false)
+    }
+
+    /// Writes a projected query directly as ClickHouse RowBinary when the
+    /// storage engine can avoid normalized row materialization. Returning
+    /// `false` asks the boundary to encode [`Self::scan_analytics`] output.
+    fn scan_analytics_rowbinary(
+        &self,
+        _request: &AnalyticsScanRequest,
+        _writer: &mut dyn std::io::Write,
+    ) -> Result<bool, LokiApiError> {
+        Ok(false)
     }
 
     /// Emits exact row counts for analytical scans that do not materialize a
@@ -534,7 +560,7 @@ async fn clickhouse_scan(
         tenant(&headers, &state.config),
         raw_query.as_deref(),
     )?;
-    Ok(crate::analytics::arrow_stream_response(
+    Ok(crate::analytics::analytics_stream_response(
         state.store,
         request,
     ))
@@ -5209,6 +5235,7 @@ mod tests {
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
         let authorized = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/shardtelemetry/api/v1/clickhouse/scan?term=failed&label.app=api&metadata.code=500")
@@ -5255,6 +5282,48 @@ mod tests {
                 .value(0),
             "request failed"
         );
+
+        let rowbinary = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/shardtelemetry/api/v1/clickhouse/scan?term=failed&columns=timestamp%2Cmessage&wire=rowbinary")
+                    .header("authorization", "Bearer analytics-secret")
+                    .header("x-scope-orgid", "tenant-a")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(rowbinary.status(), StatusCode::OK);
+        assert_eq!(
+            rowbinary.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        let body = to_bytes(rowbinary.into_body(), usize::MAX)
+            .await
+            .expect("RowBinary body");
+        let mut expected = 123_i64.to_le_bytes().to_vec();
+        expected.extend_from_slice(&[0, 14]);
+        expected.extend_from_slice(b"request failed");
+        assert_eq!(body.as_ref(), expected);
+
+        let cardinality = app
+            .oneshot(
+                Request::builder()
+                    .uri("/shardtelemetry/api/v1/clickhouse/scan?columns=partition&cardinality_only=1&wire=rowbinary")
+                    .header("authorization", "Bearer analytics-secret")
+                    .header("x-scope-orgid", "tenant-a")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(cardinality.status(), StatusCode::OK);
+        let body = to_bytes(cardinality.into_body(), usize::MAX)
+            .await
+            .expect("RowBinary cardinality body");
+        assert_eq!(body.as_ref(), 0_u32.to_le_bytes());
     }
 
     #[tokio::test]

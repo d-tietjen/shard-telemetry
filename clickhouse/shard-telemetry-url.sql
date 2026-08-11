@@ -1,6 +1,6 @@
 -- A stock ClickHouse binary can query every relation through url(...).
--- The complete pinned schemas are in shard-telemetry-engine.sql. Replace the
--- engine name with URL and add the explicit structure shown there.
+-- The complete persistent URL-engine schemas are in
+-- shard-telemetry-engine.sql.
 
 SELECT tenant, trace_id, span_id, name, duration_nanos
 FROM url(
@@ -14,8 +14,8 @@ ORDER BY timestamp DESC
 LIMIT 100;
 
 -- Cross-signal joins use exact binary-ID renderings and content-addressed
--- resource/scope/typed-attribute identities. The StorageShardTelemetry DDL
--- defines convenient persistent external tables for these queries.
+-- resource/scope/typed-attribute identities. The stock URL-engine DDL defines
+-- convenient persistent external tables for these queries.
 SELECT
     spans.name,
     count() AS matching_logs,

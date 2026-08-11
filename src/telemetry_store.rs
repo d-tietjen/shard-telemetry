@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use rayon::prelude::*;
 use shard_stream_core::{
@@ -372,11 +374,10 @@ impl DurableTelemetryStore {
         )
     }
 
-    fn tenant_partitions(&self, _tenant: &str) -> impl Iterator<Item = TopicPartition> {
-        let count = self.tenant_partitions;
-        (0..count).map(move |partition| {
-            TopicPartition::new(LOKI_TOPIC_ID, LogicalPartitionId::new(partition))
-        })
+    fn tenant_partitions(&self, tenant: &str) -> Result<Vec<TopicPartition>, LokiApiError> {
+        self.service
+            .active_log_partitions(Arc::from(tenant))
+            .map_err(|error| LokiApiError::internal(error.to_string()))
     }
 
     fn retention_cutoff(&self) -> Option<u64> {
@@ -688,7 +689,8 @@ impl DurableTelemetryStore {
             return self.query_native_with_deletes(request, &delete_filter);
         }
         let queries = self
-            .tenant_partitions(&request.tenant)
+            .tenant_partitions(&request.tenant)?
+            .into_iter()
             .map(|partition| {
                 let mut query = LogQuery::new(partition)
                     .sort_by_timestamp()
@@ -741,7 +743,7 @@ impl DurableTelemetryStore {
         let result_limit = request.limit as usize;
         let page_limit = result_limit.clamp(1_024, 8_192);
         let mut accepted = Vec::<(LokiEntry, u64)>::new();
-        for partition in self.tenant_partitions(&request.tenant) {
+        for partition in self.tenant_partitions(&request.tenant)? {
             let mut after = None;
             let mut accepted_from_partition = 0usize;
             loop {
@@ -849,7 +851,8 @@ impl LokiStore for DurableTelemetryStore {
 
     fn entries(&self, tenant: &str) -> Result<Vec<LokiEntry>, LokiApiError> {
         let queries = self
-            .tenant_partitions(tenant)
+            .tenant_partitions(tenant)?
+            .into_iter()
             .map(|partition| {
                 LogQuery::new(partition)
                     .sort_by_timestamp()
@@ -875,6 +878,193 @@ impl LokiStore for DurableTelemetryStore {
         apply_logical_deletes(&mut entries, &self.deletes.list(tenant)?)?;
         entries.sort_unstable_by_key(|entry| entry.timestamp_unix_nanos);
         Ok(entries)
+    }
+
+    fn scan_analytics_arrow(
+        &self,
+        request: &AnalyticsScanRequest,
+        schema: &SchemaRef,
+        emit: &mut dyn FnMut(&RecordBatch) -> Result<(), LokiApiError>,
+    ) -> Result<bool, LokiApiError> {
+        request.validate()?;
+        let Some(limit) = request
+            .limit
+            .filter(|limit| *limit <= crate::analytics::DEFAULT_SCAN_BATCH_ROWS)
+        else {
+            return Ok(false);
+        };
+        if limit == 0 {
+            return Ok(true);
+        }
+        match request.relation {
+            AnalyticsRelation::MetricPoints
+                if request.series_id.is_some()
+                    && request.trace_id.is_none()
+                    && request.span_id.is_none()
+                    && request.metadata.is_empty()
+                    && request.attributes.is_empty()
+                    && request.resource_attributes.is_empty()
+                    && request.scope_attributes.is_empty()
+                    && crate::analytics::can_direct_metric_projection(&request.columns) =>
+            {
+                let query = crate::MetricQuery {
+                    tenant: Arc::clone(&request.tenant),
+                    partition: None,
+                    start_offset: None,
+                    series: request.series_id,
+                    name: request.name.as_ref().map(Arc::clone),
+                    exact_labels: Arc::new(
+                        request
+                            .labels
+                            .iter()
+                            .map(|field| (Arc::clone(&field.key), Arc::clone(&field.value)))
+                            .collect(),
+                    ),
+                    start_time_unix_nanos: request.start_timestamp_unix_nanos,
+                    end_time_unix_nanos: request
+                        .end_timestamp_unix_nanos
+                        .and_then(|end| end.checked_sub(1)),
+                    limit,
+                };
+                let points = self.query_metrics(&query)?;
+                if !points.is_empty() {
+                    let batch = crate::analytics::direct_metric_record_batch(
+                        &points,
+                        &request.columns,
+                        Arc::clone(schema),
+                    )?
+                    .expect("direct metric projection was checked");
+                    emit(&batch)?;
+                }
+                Ok(true)
+            }
+            AnalyticsRelation::Spans
+                if (request.trace_id.is_some() || !request.resource_attributes.is_empty())
+                    && request.labels.is_empty()
+                    && request.metadata.is_empty()
+                    && crate::analytics::can_direct_span_projection(&request.columns) =>
+            {
+                let pairs = |fields: &[crate::MetadataField]| {
+                    Arc::new(
+                        fields
+                            .iter()
+                            .map(|field| (Arc::clone(&field.key), Arc::clone(&field.value)))
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let query = crate::TraceQuery {
+                    tenant: Arc::clone(&request.tenant),
+                    partition: None,
+                    start_offset: None,
+                    trace_id: request.trace_id,
+                    span_id: request.span_id,
+                    name: request.name.as_ref().map(Arc::clone),
+                    exact_attributes: pairs(&request.attributes),
+                    exact_resource_attributes: pairs(&request.resource_attributes),
+                    exact_scope_attributes: pairs(&request.scope_attributes),
+                    start_time_unix_nanos: request.start_timestamp_unix_nanos,
+                    end_time_unix_nanos: request.end_timestamp_unix_nanos,
+                    min_duration_nanos: None,
+                    limit,
+                };
+                let spans = self.query_traces(&query)?;
+                if !spans.is_empty() {
+                    let batch = crate::analytics::direct_span_record_batch(
+                        &spans,
+                        &request.columns,
+                        Arc::clone(schema),
+                    )?
+                    .expect("direct span projection was checked");
+                    emit(&batch)?;
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn scan_analytics_rowbinary(
+        &self,
+        request: &AnalyticsScanRequest,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<bool, LokiApiError> {
+        request.validate()?;
+        let Some(limit) = request
+            .limit
+            .filter(|limit| *limit <= crate::analytics::DEFAULT_SCAN_BATCH_ROWS)
+        else {
+            return Ok(false);
+        };
+        if limit == 0 {
+            return Ok(true);
+        }
+        match request.relation {
+            AnalyticsRelation::MetricPoints
+                if request.series_id.is_some()
+                    && request.trace_id.is_none()
+                    && request.span_id.is_none()
+                    && request.metadata.is_empty()
+                    && request.attributes.is_empty()
+                    && request.resource_attributes.is_empty()
+                    && request.scope_attributes.is_empty()
+                    && crate::analytics::can_direct_metric_projection(&request.columns) =>
+            {
+                let query = crate::MetricQuery {
+                    tenant: Arc::clone(&request.tenant),
+                    partition: None,
+                    start_offset: None,
+                    series: request.series_id,
+                    name: request.name.as_ref().map(Arc::clone),
+                    exact_labels: Arc::new(
+                        request
+                            .labels
+                            .iter()
+                            .map(|field| (Arc::clone(&field.key), Arc::clone(&field.value)))
+                            .collect(),
+                    ),
+                    start_time_unix_nanos: request.start_timestamp_unix_nanos,
+                    end_time_unix_nanos: request
+                        .end_timestamp_unix_nanos
+                        .and_then(|end| end.checked_sub(1)),
+                    limit,
+                };
+                let points = self.query_metrics(&query)?;
+                crate::analytics::write_direct_metric_rowbinary(&points, &request.columns, writer)
+            }
+            AnalyticsRelation::Spans
+                if (request.trace_id.is_some() || !request.resource_attributes.is_empty())
+                    && request.labels.is_empty()
+                    && request.metadata.is_empty()
+                    && crate::analytics::can_direct_span_projection(&request.columns) =>
+            {
+                let pairs = |fields: &[crate::MetadataField]| {
+                    Arc::new(
+                        fields
+                            .iter()
+                            .map(|field| (Arc::clone(&field.key), Arc::clone(&field.value)))
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let query = crate::TraceQuery {
+                    tenant: Arc::clone(&request.tenant),
+                    partition: None,
+                    start_offset: None,
+                    trace_id: request.trace_id,
+                    span_id: request.span_id,
+                    name: request.name.as_ref().map(Arc::clone),
+                    exact_attributes: pairs(&request.attributes),
+                    exact_resource_attributes: pairs(&request.resource_attributes),
+                    exact_scope_attributes: pairs(&request.scope_attributes),
+                    start_time_unix_nanos: request.start_timestamp_unix_nanos,
+                    end_time_unix_nanos: request.end_timestamp_unix_nanos,
+                    min_duration_nanos: None,
+                    limit,
+                };
+                let spans = self.query_traces(&query)?;
+                crate::analytics::write_direct_span_rowbinary(&spans, &request.columns, writer)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn scan_analytics(
@@ -910,7 +1100,8 @@ impl LokiStore for DurableTelemetryStore {
             && request.name.is_none();
         if index_complete_ordered_scan {
             let queries = self
-                .tenant_partitions(&request.tenant)
+                .tenant_partitions(&request.tenant)?
+                .into_iter()
                 .map(|partition| {
                     let mut query = LogQuery::new(partition)
                         .sort_by_timestamp()
@@ -957,21 +1148,21 @@ impl LokiStore for DurableTelemetryStore {
                 .query_partitions(&queries)
                 .map_err(|error| LokiApiError::internal(error.to_string()))?
                 .into_iter()
-                .map(|matched| analytics_row_and_entry(&request.tenant, matched))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .filter_map(|(row, entry)| {
-                    (!delete_filter.matches(&entry) && crate::analytics::row_matches(&row, request))
-                        .then_some(row)
+                .map(|matched| {
+                    crate::analytics::projected_log_row(
+                        &request.tenant,
+                        &matched.record,
+                        &request.columns,
+                    )
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()?;
             if !rows.is_empty() {
                 emit(&rows)?;
             }
             return Ok(());
         }
         let mut emitted = 0usize;
-        for partition in self.tenant_partitions(&request.tenant) {
+        for partition in self.tenant_partitions(&request.tenant)? {
             let mut next_offset = None;
             loop {
                 let page_limit = 8_192usize.min(limit.saturating_sub(emitted));
@@ -1078,7 +1269,7 @@ impl LokiStore for DurableTelemetryStore {
             && self.retention.is_none()
             && self.deletes.list(&request.tenant)?.is_empty();
         if unfiltered_log_count {
-            let partitions = self.tenant_partitions(&request.tenant).collect::<Vec<_>>();
+            let partitions = self.tenant_partitions(&request.tenant)?;
             let mut count = self
                 .service
                 .count_log_records(Arc::clone(&request.tenant), partitions)
@@ -1215,19 +1406,8 @@ impl DurableTelemetryStore {
             })?)
             .ok_or_else(|| LokiApiError::internal("tenant partition count is zero"))?,
         );
-        let bounded_span_scan = request.relation == AnalyticsRelation::Spans
-            && request.limit.is_some()
-            && request.trace_id.is_none();
         let partitions = request.trace_id.map_or_else(
-            || {
-                if bounded_span_scan {
-                    vec![None]
-                } else {
-                    self.signal_partitions(crate::TRACES_TOPIC_ID)
-                        .map(Some)
-                        .collect::<Vec<_>>()
-                }
-            },
+            || vec![None],
             |trace_id| vec![Some(router.trace(&request.tenant, trace_id))],
         );
         let pairs = |fields: &[crate::MetadataField]| {
@@ -1245,6 +1425,9 @@ impl DurableTelemetryStore {
         };
         let exact_resource_attributes = pairs(&request.resource_attributes);
         let exact_scope_attributes = pairs(&request.scope_attributes);
+        let span_predicates_fully_pushed = request.relation == AnalyticsRelation::Spans
+            && request.labels.is_empty()
+            && request.metadata.is_empty();
         for partition in partitions {
             let mut next_offset = None;
             loop {
@@ -1288,8 +1471,18 @@ impl DurableTelemetryStore {
                     .get();
                 let mut rows = Vec::with_capacity(page_limit.min(limit.saturating_sub(emitted)));
                 for span in spans {
-                    for row in crate::analytics::span_rows(&span, request.relation)? {
-                        if !crate::analytics::row_matches(&row, request) {
+                    let candidate_rows = if span_predicates_fully_pushed {
+                        vec![crate::analytics::projected_span_row(
+                            &span,
+                            &request.columns,
+                        )?]
+                    } else {
+                        crate::analytics::span_rows(&span, request.relation)?
+                    };
+                    for row in candidate_rows {
+                        if !span_predicates_fully_pushed
+                            && !crate::analytics::row_matches(&row, request)
+                        {
                             continue;
                         }
                         rows.push(row);
@@ -1344,17 +1537,34 @@ impl DurableTelemetryStore {
             },
             |series| vec![router.metric(&request.tenant, series)],
         );
+        let metric_predicates_fully_pushed = request.relation == AnalyticsRelation::MetricPoints
+            && request.trace_id.is_none()
+            && request.span_id.is_none()
+            && request.metadata.is_empty()
+            && request.attributes.is_empty()
+            && request.resource_attributes.is_empty()
+            && request.scope_attributes.is_empty();
+        let exact_series_single_page = metric_predicates_fully_pushed
+            && request.series_id.is_some()
+            && request
+                .limit
+                .is_some_and(|limit| limit <= crate::analytics::DEFAULT_SCAN_BATCH_ROWS);
         for partition in partitions {
             let mut next_offset = None;
             loop {
                 if emitted == limit {
                     return Ok(());
                 }
-                let page_limit = crate::analytics::DEFAULT_SCAN_BATCH_ROWS;
+                let page_limit =
+                    crate::analytics::DEFAULT_SCAN_BATCH_ROWS.min(limit.saturating_sub(emitted));
                 let exemplar_relation = request.relation == AnalyticsRelation::MetricExemplars;
                 let query = crate::MetricQuery {
                     tenant: Arc::clone(&request.tenant),
-                    partition: Some(partition),
+                    // A bounded exact-series scan needs no continuation cursor.
+                    // Leaving the partition unset selects the timestamp-ordered,
+                    // disjoint-chunk fast path instead of rebuilding offset order
+                    // for every point in the series.
+                    partition: (!exact_series_single_page).then_some(partition),
                     start_offset: next_offset.map(LogicalOffset::new),
                     series: request.series_id,
                     name: request.name.as_ref().map(Arc::clone),
@@ -1390,8 +1600,18 @@ impl DurableTelemetryStore {
                     .get();
                 let mut rows = Vec::with_capacity(page_limit.min(limit.saturating_sub(emitted)));
                 for point in points {
-                    for row in crate::analytics::metric_rows(&point, request.relation)? {
-                        if !crate::analytics::row_matches(&row, request) {
+                    let candidate_rows = if metric_predicates_fully_pushed {
+                        vec![crate::analytics::projected_metric_row(
+                            &point,
+                            &request.columns,
+                        )?]
+                    } else {
+                        crate::analytics::metric_rows(&point, request.relation)?
+                    };
+                    for row in candidate_rows {
+                        if !metric_predicates_fully_pushed
+                            && !crate::analytics::row_matches(&row, request)
+                        {
                             continue;
                         }
                         rows.push(row);
@@ -1725,12 +1945,30 @@ mod tests {
             .unwrap();
         assert_eq!(exact_trace_rows.len(), 1);
 
+        exact_trace.columns = vec![
+            crate::AnalyticsColumn::Timestamp,
+            crate::AnalyticsColumn::Name,
+        ];
+        exact_trace_rows.clear();
+        store
+            .scan_analytics(&exact_trace, &mut |batch| {
+                exact_trace_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(exact_trace_rows.len(), 1);
+        assert_eq!(exact_trace_rows[0].name.as_deref(), Some("checkout"));
+        assert!(exact_trace_rows[0].resource_attributes.is_empty());
+        assert!(exact_trace_rows[0].attributes_json.is_none());
+        assert!(exact_trace_rows[0].events_json.is_none());
+
         let mut exact_metric = crate::AnalyticsScanRequest::for_relation(
             "tenant-a",
             crate::AnalyticsRelation::MetricPoints,
         );
         exact_metric.series_id = Some(points[0].series_fingerprint());
         exact_metric.name = Some(Arc::from("requests"));
+        exact_metric.limit = Some(10);
         let mut exact_metric_rows = Vec::new();
         store
             .scan_analytics(&exact_metric, &mut |batch| {
@@ -1739,6 +1977,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(exact_metric_rows.len(), 1);
+
+        exact_metric.columns = vec![
+            crate::AnalyticsColumn::Timestamp,
+            crate::AnalyticsColumn::ScalarInteger,
+        ];
+        exact_metric_rows.clear();
+        store
+            .scan_analytics(&exact_metric, &mut |batch| {
+                exact_metric_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(exact_metric_rows.len(), 1);
+        assert_eq!(exact_metric_rows[0].scalar_integer, Some(7));
+        assert!(exact_metric_rows[0].labels.is_empty());
+        assert!(exact_metric_rows[0].value_json.is_none());
 
         for (relation, start, end) in [
             (crate::AnalyticsRelation::SpanEvents, 15, 16),
@@ -2251,6 +2505,21 @@ mod tests {
         assert_eq!(newest_rows.len(), 1);
         assert_eq!(newest_rows[0].timestamp_unix_nanos, 300);
         assert_eq!(newest_rows[0].message.as_deref(), Some("newest request"));
+        newest.columns = vec![
+            crate::AnalyticsColumn::Timestamp,
+            crate::AnalyticsColumn::Message,
+        ];
+        newest_rows.clear();
+        store
+            .scan_analytics(&newest, &mut |batch| {
+                newest_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .expect("projected newest scan");
+        assert_eq!(newest_rows.len(), 1);
+        assert_eq!(newest_rows[0].message.as_deref(), Some("newest request"));
+        assert!(newest_rows[0].metadata.is_empty());
+        assert!(newest_rows[0].body_json.is_none());
         let mut newest_exact_token = AnalyticsScanRequest::new("tenant-a");
         newest_exact_token.limit = Some(1);
         newest_exact_token.order = Some(AnalyticsScanOrder::TimestampDescending);

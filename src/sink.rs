@@ -625,6 +625,10 @@ enum SinkCommand {
         partitions: Vec<TopicPartition>,
         response: SyncSender<TelemetryResult<u64>>,
     },
+    ActiveLogPartitions {
+        tenant: Arc<str>,
+        response: SyncSender<TelemetryResult<Vec<TopicPartition>>>,
+    },
     QueryTraces {
         query: TraceQuery,
         response: SyncSender<TelemetryResult<Vec<DurableSpan>>>,
@@ -753,6 +757,9 @@ fn run_sink_worker(
                 response,
             } => {
                 let _ = response.send(stripe.logs.count_tenant_records(&tenant, &partitions));
+            }
+            SinkCommand::ActiveLogPartitions { tenant, response } => {
+                let _ = response.send(stripe.logs.tenant_partitions(&tenant));
             }
             SinkCommand::QueryTraces { query, response } => {
                 let _ = response.send(query_trace_stripe(&stripe, &query));
@@ -1079,6 +1086,42 @@ impl TelemetryService {
                     .checked_add(count)
                     .ok_or(TelemetryError::RecordTooLarge)
             })
+    }
+
+    /// Resolves the exact logical log partitions currently containing a
+    /// tenant across hot, compressed, and object-tier stripe state.
+    pub(crate) fn active_log_partitions(
+        &self,
+        tenant: Arc<str>,
+    ) -> TelemetryResult<Vec<TopicPartition>> {
+        let workers = self.worker_senders()?;
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::ActiveLogPartitions {
+                    tenant: Arc::clone(&tenant),
+                    response,
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before resolving active log partitions"
+                    ))
+                })?;
+            responses.push((shard_id, receiver));
+        }
+
+        let mut partitions = Vec::new();
+        for (shard_id, receiver) in responses {
+            partitions.extend(receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped while resolving active log partitions"
+                ))
+            })??);
+        }
+        partitions.sort_unstable();
+        partitions.dedup();
+        Ok(partitions)
     }
 }
 
@@ -1619,64 +1662,87 @@ fn query_metric_stripe(
 ) -> TelemetryResult<Vec<DurableMetricPoint>> {
     let mut storage_query = query.clone();
     storage_query.start_offset = None;
+    let resident = stripe.metrics.query(&storage_query)?;
+    let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Metrics) else {
+        return Ok(finalize_metric_query(resident, query));
+    };
     let mut winners = BTreeMap::new();
-    for point in stripe.metrics.query(&storage_query)? {
+    for point in resident {
         winners.insert(
-            (point.series_fingerprint(), point.timestamp_unix_nanos),
+            (
+                query.series.unwrap_or_else(|| point.series_fingerprint()),
+                point.timestamp_unix_nanos,
+            ),
             point,
         );
     }
-    if let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Metrics) {
-        let partitions = if let Some(partition) = query.partition {
-            vec![partition]
-        } else {
-            query.series.map_or_else(
-                || state.tiers.keys().copied().collect::<Vec<_>>(),
-                |series| vec![stripe.router.metric(&query.tenant, series)],
-            )
-        };
-        for payload in read_signal_tier_payloads(
-            state,
-            &partitions,
-            TierQueryRange {
-                min_timestamp_unix_nanos: query.start_time_unix_nanos,
-                max_timestamp_unix_nanos: query.end_time_unix_nanos,
-                signal_identity: query.series.map(crate::SeriesFingerprint::get),
-                ..TierQueryRange::default()
-            },
-            None,
-        )? {
-            for point in decode_metric_chunk(payload.as_ref())?
-                .into_iter()
-                .filter(|point| metric_query_matches(&storage_query, point))
+    let partitions = if let Some(partition) = query.partition {
+        vec![partition]
+    } else {
+        query.series.map_or_else(
+            || state.tiers.keys().copied().collect::<Vec<_>>(),
+            |series| vec![stripe.router.metric(&query.tenant, series)],
+        )
+    };
+    for payload in read_signal_tier_payloads(
+        state,
+        &partitions,
+        TierQueryRange {
+            min_timestamp_unix_nanos: query.start_time_unix_nanos,
+            max_timestamp_unix_nanos: query.end_time_unix_nanos,
+            signal_identity: query.series.map(crate::SeriesFingerprint::get),
+            ..TierQueryRange::default()
+        },
+        None,
+    )? {
+        let points = decode_metric_chunk(payload.as_ref())?;
+        if let Some(series) = query.series
+            && points
+                .first()
+                .is_some_and(|point| point.series_fingerprint() != series)
+        {
+            continue;
+        }
+        for point in points
+            .into_iter()
+            .filter(|point| metric_query_matches(&storage_query, point))
+        {
+            let key = (
+                query.series.unwrap_or_else(|| point.series_fingerprint()),
+                point.timestamp_unix_nanos,
+            );
+            if winners
+                .get(&key)
+                .is_none_or(|existing: &DurableMetricPoint| {
+                    existing.record_ref.offset < point.record_ref.offset
+                })
             {
-                let key = (point.series_fingerprint(), point.timestamp_unix_nanos);
-                if winners
-                    .get(&key)
-                    .is_none_or(|existing: &DurableMetricPoint| {
-                        existing.record_ref.offset < point.record_ref.offset
-                    })
-                {
-                    winners.insert(key, point);
-                }
+                winners.insert(key, point);
             }
         }
     }
-    let mut points = winners
-        .into_values()
-        .filter(|point| {
-            query
-                .start_offset
-                .is_none_or(|offset| point.record_ref.offset >= offset)
-        })
-        .collect::<Vec<_>>();
+    Ok(finalize_metric_query(
+        winners.into_values().collect(),
+        query,
+    ))
+}
+
+fn finalize_metric_query(
+    mut points: Vec<DurableMetricPoint>,
+    query: &MetricQuery,
+) -> Vec<DurableMetricPoint> {
+    points.retain(|point| {
+        query
+            .start_offset
+            .is_none_or(|offset| point.record_ref.offset >= offset)
+    });
     if query.partition.is_some() {
         points.sort_unstable_by_key(|point| point.record_ref.offset);
     } else {
         points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
     }
     points.truncate(query.limit.max(1));
-    Ok(points)
+    points
 }
 
 fn query_correlation_stripe(

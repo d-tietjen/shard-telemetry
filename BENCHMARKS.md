@@ -1,6 +1,23 @@
 # Compression benchmark results
 
-## Current release-candidate evidence — 2026-08-04
+## Current stock-ClickHouse compatibility evidence — 2026-08-06
+
+The supported ClickHouse integration contains no C++ adapter or custom
+ClickHouse build. The Rust scan endpoint streams RowBinary into the stock
+ClickHouse `URL` engine. The retained Adam acceptance run passed 30/30 exact
+result cases against the unmodified official `26.3.17.56` image: 18 log cases
+and 12 span, event, link, metric, exemplar, and cross-signal cases.
+
+```text
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-stock-url-20260806-v1/acceptance-3-26.3
+```
+
+This is functional SQL compatibility evidence, not a URL-table latency claim.
+Stock ClickHouse cannot infer arbitrary SQL predicates into URL parameters, so
+performance-sensitive callers use ShardTelemetry's Rust APIs and indexes
+directly or supply explicit scan parameters.
+
+## Historical retained evidence — 2026-08-04
 
 The current evidence root on Adam is:
 
@@ -12,10 +29,16 @@ These are sequential native-Linux performance runs with pinned binaries,
 corpus hashes, CPU affinity, exact-result checksums, and retained failed
 attempts. They are not deterministic-simulation replay claims.
 
-The custom ClickHouse query node was built from exact tag
+The directory name predates removal of the C++ ClickHouse prototype. Storage,
+compression, native-query, and ingestion measurements remain valid. Results
+whose query path explicitly used `StorageShardTelemetry` are historical
+prototype evidence and are not release evidence for the supported stock
+ClickHouse URL boundary.
+
+The historical custom ClickHouse query node was built from exact tag
 `v26.3.17.56-lts`, commit
 `c57540de480d8a501b601163471d3843674378cf`, using the official pinned
-builder. Its automatic `StorageShardTelemetry` path passes 30/30 exact-result
+builder. Its retired automatic-pushdown path passed 30/30 exact-result
 cases: 18 log cases, nine signal-relation cases, and three cross-signal joins.
 
 ### Authoritative full 80 GiB log head-to-head
@@ -161,30 +184,72 @@ the direct-view result. Retained evidence is under:
 /home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-adapter-20260804-v1/ingress-sonic-2g-attempt1
 ```
 
+### Retired projected-RowBinary prototype head-to-head — Adam, 2 GiB
+
+`clickhouse-query-optimization-20260805-v1/attempt13-rowbinary-projected-schema-2g`
+used CPUs 0–15 sequentially and the exact 2,147,483,681-byte accepted source
+prefix. Both engines returned 15,184,074 records. This run validates the
+adapter-level subset capability required to keep ClickHouse's positional
+RowBinary parser aligned with ShardTelemetry's projected response.
+
+| Engine | Stored bytes | Ratio | Durable ingest | Relative result |
+| --- | ---: | ---: | ---: | --- |
+| **ShardTelemetry** | **67,808,000** | **31.67x** | **957.44 MiB/s** | 2.25x smaller, 5.11x faster |
+| ClickHouse MergeTree | 152,459,902 | 14.09x | 187.20 MiB/s | baseline |
+
+All latest, exact-stream, and indexed-token result files were byte-identical.
+The warm query results below used 20 measured iterations after prewarming.
+
+| Query | ShardTelemetry p50/p99 | ClickHouse p50/p99 | Remaining gap |
+| --- | ---: | ---: | ---: |
+| Latest 100 | 61/70 ms | **27/29 ms** | 2.26x p50 |
+| Exact stream, latest 100 | 59/66 ms | **4/5 ms** | 14.75x p50 |
+| Indexed token, latest 100 | 92/106 ms | **51/59 ms** | 1.80x p50 |
+
+This closed the prototype's RowBinary trivial-count correctness failure and
+demonstrates the ingress/storage improvement. Its query timings are historical;
+the supported stock URL boundary must be measured separately. The native pack
+timings above remain direct storage-index measurements.
+
 ### Traces and metrics, one core
 
-`signals-server-1core-attempt4` used 262,144 deterministic correlated records
-per signal on CPU 0. The same trace and metric rows were inserted into an
-isolated ClickHouse 26.5.1.882 container pinned by image digest. The per-signal
-rows below measure the signal-native durable payload and auxiliary bytes; the
-complete restarted ShardTelemetry server directory was 6,612,008 bytes for
-both signals, versus 9,636,264 bytes across the two ClickHouse table parts.
+`clickhouse-query-optimization-20260805-v1/attempt5-owner-fast` used 262,144
+deterministic correlated records per signal on CPU 0. The same trace and metric
+rows were inserted into an isolated ClickHouse 26.5.1.882 container pinned by
+image digest. The per-signal rows below measure the signal-native durable
+payload and auxiliary bytes; the complete restarted ShardTelemetry server
+directory was 6,612,008 bytes for both signals, versus 9,636,264 bytes across
+the two ClickHouse table parts.
 
 | Signal | Engine | Canonical bytes | Stored bytes | Ratio | Encode |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Traces | **ShardTelemetry** | 107,609,736 | **902,077** | **119.29x** | **263.29 MiB/s** |
-| Traces | ClickHouse | 107,609,736 | 5,753,460 | 18.70x | 105.80 MiB/s |
-| Metrics | **ShardTelemetry** | 126,451,328 | **1,966,452** | **64.30x** | **591.01 MiB/s** |
-| Metrics | ClickHouse | 126,451,328 | 3,882,804 | 32.57x | 108.64 MiB/s |
+| Traces | **ShardTelemetry** | 107,609,736 | **902,077** | **119.29x** | **258.31 MiB/s** |
+| Traces | ClickHouse | 107,609,736 | 5,753,460 | 18.70x | 108.03 MiB/s |
+| Metrics | **ShardTelemetry** | 126,451,328 | **1,966,452** | **64.30x** | **604.32 MiB/s** |
+| Metrics | ClickHouse | 126,451,328 | 3,882,804 | 32.57x | 119.40 MiB/s |
 
-Server-facing queries were executed through the same pinned ClickHouse client
-and evaluator process. Exact trace lookup returned eight rows at 2/6 ms
-ShardTelemetry p50/p99 versus 3/7 ms for MergeTree. Exact metric-series lookup
-returned 2,048 rows at 77/121 ms versus 3/3 ms. A 1,000-row resource-attribute
-scan took 828/1,118 ms versus 4/11 ms. Every result file was byte-identical.
-This isolates the current query priority: direct identities are competitive,
-while broad trace metadata requires a persisted record-level posting/top-k
-index rather than block Bloom filters alone.
+Server-facing queries used ClickHouse `RowBinary` on both sides and the same
+pinned ClickHouse client/evaluator process. Each class ran for 2,000 warm
+iterations after an untimed warmup.
+
+| Server-facing query | Rows | ShardTelemetry QPS | ClickHouse QPS | ShardTelemetry advantage |
+| --- | ---: | ---: | ---: | ---: |
+| Exact trace ID | 8 | **501.562** | 302.827 | **1.66x** |
+| Exact metric series | 2,048 | **321.999** | 283.734 | **1.13x** |
+| Resource attribute, limit 1,000 | 1,000 | **276.269** | 190.069 | **1.45x** |
+
+Every ordered result file was byte-identical. The optimization removes generic
+row materialization from narrow scans, writes projected span/metric lanes
+directly as RowBinary, keeps a bounded append-only resource index with lazy
+ordering, and avoids a second metric conflict-resolution/fingerprint pass after
+the owning `MetricStripe` has already selected winners. The previous 77 ms
+metric-series and 828 ms resource-scan p50 losses are therefore closed.
+
+Retained evidence:
+
+```text
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-query-optimization-20260805-v1/attempt5-owner-fast
+```
 
 ### Current cold-tier microbenchmark
 
@@ -2777,7 +2842,7 @@ host-scheduled benchmark evidence, not exact task-schedule replay.
 
 ## ClickHouse analytical compatibility gate
 
-The authenticated Arrow scan boundary and stock ClickHouse evaluator path pass
+The authenticated Arrow/RowBinary scan boundary and stock ClickHouse evaluator path pass
 13 exact-result query classes: row count, native-map grouping, conditional and
 exact aggregates, windows, CTE/array aggregation, self-join, timestamp plus map
 filtering, mixed pushed/residual filtering, disjunction, missing-map grouping,
@@ -2791,29 +2856,24 @@ cases plus 12 span/event/link/metric/exemplar and correlation cases produced
 byte-identical output against ClickHouse `Memory` snapshots. This is a
 functional compatibility result, not an 80 GiB throughput or latency result.
 
-`clickhouse/adapter` now contains the pinned `StorageShardTelemetry` implementation.
-It reuses `StorageURL` and adds automatic projection, timestamp, exact nonempty
-label/metadata equality, and safe filtered trivial-limit pushdown. The exact
-26.3 analyzer emits the map subcolumn forms handled by the adapter. Unsupported
-expressions and empty map equality remain ClickHouse residuals.
+The supported integration now uses stock ClickHouse's `URL` engine against the
+Rust RowBinary endpoint. No ClickHouse source patch, custom binary, or C++
+adapter is part of the product. Explicit endpoint parameters retain native
+index pushdown for callers that construct the source URL; arbitrary SQL
+predicates remain residual ClickHouse work.
 
-The next command after producing a custom image from exact tag
-`v26.3.17.56-lts` is:
+Run the functional matrix with the official pinned image:
 
 ```bash
 SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE=/run/secrets/shardtelemetry-clickhouse-token \
-CLICKHOUSE_IMAGE=shardtelemetry-clickhouse@sha256:REPLACE_WITH_BUILT_DIGEST \
+CLICKHOUSE_IMAGE=clickhouse/clickhouse-server@sha256:REPLACE_WITH_PINNED_DIGEST \
 SHARD_TELEMETRY_URL=http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan \
 SHARD_TELEMETRY_TENANT=fake \
-scripts/run-clickhouse-adapter-compatibility.sh
+scripts/run-clickhouse-telemetry-compatibility.sh
 ```
 
 The 80 GiB cold/warm head-to-head follows only after that functional gate
-passes. It must sequentially query the same loaded
-ShardTelemetry corpus through `StorageShardTelemetry` and the retained
+passes. `scripts/run-clickhouse-head-to-head.sh` must sequentially query the
+same loaded ShardTelemetry corpus through the stock URL table and the retained
 `benchmark.logs` MergeTree snapshot on CPUs 0-15, with equal `max_threads`,
-cache state, result checksums, and query ordering. Adam had only 56 GiB free at
-94% utilization when this adapter was added. On 2026-08-04 it had recovered to
-186 GiB free at 79%, but still had no retained compiler, CMake, Ninja, source,
-or build cache. The custom image should be produced on a dedicated build worker
-so the preserved benchmark corpora are not put at risk.
+cache state, result checksums, and query ordering.

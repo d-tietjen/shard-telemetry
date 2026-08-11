@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+shopt -u patsub_replacement 2>/dev/null || true
 
 if [[ -z ${SHARD_TELEMETRY_CLICKHOUSE_TOKEN:-} ]]; then
     : "${SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE:?set SHARD_TELEMETRY_CLICKHOUSE_TOKEN or SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE}"
@@ -21,7 +22,6 @@ SHARD_TELEMETRY_URL=${SHARD_TELEMETRY_URL:-http://127.0.0.1:3100/shardtelemetry/
 SHARD_TELEMETRY_TENANT=${SHARD_TELEMETRY_TENANT:-fake}
 EXPECTED_CLICKHOUSE_VERSION=${EXPECTED_CLICKHOUSE_VERSION:-26.3.17.56}
 STRICT_CLICKHOUSE_VERSION=${STRICT_CLICKHOUSE_VERSION:-1}
-SHARD_TELEMETRY_ADAPTER_MODE=${SHARD_TELEMETRY_ADAPTER_MODE:-0}
 
 if [[ -n $CLICKHOUSE_IMAGE ]]; then
     command -v docker >/dev/null || {
@@ -67,13 +67,10 @@ TOKEN_SQL=$(escape_sql "$SHARD_TELEMETRY_CLICKHOUSE_TOKEN")
 TENANT_SQL=$(escape_sql "$SHARD_TELEMETRY_TENANT")
 STRUCTURE="tenant String, signal String, timestamp DateTime64(9, 'UTC'), observed_timestamp Nullable(DateTime64(9, 'UTC')), partition UInt32, offset UInt64, resource_id Nullable(String), scope_id Nullable(String), trace_id Nullable(String), span_id Nullable(String), message Nullable(String), body_json Nullable(String), severity_number Nullable(Int32), severity_text Nullable(String), event_name Nullable(String), flags Nullable(UInt32), dropped_attributes_count Nullable(UInt32), labels Map(String, String), metadata Map(String, String), attributes Map(String, String), resource_attributes Map(String, String), scope_attributes Map(String, String), attribute_ids Map(String, String), resource_attribute_ids Map(String, String), scope_attribute_ids Map(String, String), attributes_json Nullable(String), resource_attributes_json Nullable(String), scope_attributes_json Nullable(String)"
 STRUCTURE_SQL=$(escape_sql "$STRUCTURE")
-if [[ $SHARD_TELEMETRY_ADAPTER_MODE -eq 1 ]]; then
-    SOURCE=shardtelemetry_source
-    SOURCE_SETUP="CREATE TABLE shardtelemetry_source ($STRUCTURE) ENGINE = ShardTelemetry('$URL_SQL', 'ArrowStream', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'));"
-else
-    SOURCE="url('$URL_SQL', 'ArrowStream', '$STRUCTURE_SQL', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'))"
-    SOURCE_SETUP=
-fi
+ROWBINARY_SEPARATOR='?'
+[[ $URL_SQL == *\?* ]] && ROWBINARY_SEPARATOR='&'
+ROWBINARY_URL_SQL="${URL_SQL}${ROWBINARY_SEPARATOR}wire=rowbinary"
+SOURCE="url('$ROWBINARY_URL_SQL', 'RowBinary', '$STRUCTURE_SQL', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'))"
 
 RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/shard-telemetry-clickhouse-compat.XXXXXX")
 cleanup() {
@@ -111,12 +108,10 @@ for entry in "${queries[@]}"; do
     reference_output=$RESULT_DIR/$name.reference
 
     {
-        [[ -z $SOURCE_SETUP ]] || printf '%s\n' "$SOURCE_SETUP"
         printf '%s FORMAT JSONCompactEachRow\n' "$external_query"
     } | run_clickhouse local --multiquery >"$external_output"
 
     {
-        [[ -z $SOURCE_SETUP ]] || printf '%s\n' "$SOURCE_SETUP"
         printf '%s\n' "CREATE TABLE reference ($STRUCTURE) ENGINE = Memory;"
         printf '%s\n' "INSERT INTO reference SELECT * FROM $SOURCE;"
         printf '%s FORMAT JSONCompactEachRow\n' "$reference_query"
@@ -130,8 +125,4 @@ for entry in "${queries[@]}"; do
     echo "PASS $name"
 done
 
-if [[ $SHARD_TELEMETRY_ADAPTER_MODE -eq 1 ]]; then
-    echo "StorageShardTelemetry compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
-else
-    echo "ClickHouse compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
-fi
+echo "Stock ClickHouse URL/RowBinary compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"

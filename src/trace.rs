@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
@@ -242,7 +243,7 @@ pub fn decode_trace_block(encoded: &[u8]) -> TelemetryResult<Vec<DurableSpan>> {
 }
 
 /// Decodes only spans which can satisfy a native trace query while preserving
-/// whole-block integrity validation and exact conflict resolution.
+/// relevant-block integrity validation and exact conflict resolution.
 pub(crate) fn decode_trace_block_matching(
     encoded: &[u8],
     query: &TraceQuery,
@@ -266,11 +267,6 @@ fn decode_trace_block_filtered(
         ));
     }
     let payload_end = encoded.len() - 32;
-    if blake3::hash(&encoded[..payload_end]).as_bytes() != &encoded[payload_end..] {
-        return Err(TelemetryError::InvalidBlockEncoding(
-            "trace block checksum mismatch",
-        ));
-    }
     let stream_shard_id = ShardId::new(u32::from_le_bytes(
         encoded[8..12].try_into().expect("fixed range"),
     ));
@@ -282,6 +278,22 @@ fn decode_trace_block_filtered(
             encoded[28..32].try_into().expect("fixed range"),
         )),
     );
+    // Partition ownership is in the fixed header. Recovery validates every
+    // authoritative block before it becomes query-visible, so a
+    // partition-local scan can reject unrelated blocks without hashing,
+    // decompressing, or materializing their column lanes again.
+    if query.is_some_and(|query| {
+        query
+            .partition
+            .is_some_and(|partition| partition != topic_partition)
+    }) {
+        return Ok(Vec::new());
+    }
+    if blake3::hash(&encoded[..payload_end]).as_bytes() != &encoded[payload_end..] {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "trace block checksum mismatch",
+        ));
+    }
     let count = u32::from_le_bytes(encoded[32..36].try_into().expect("fixed range")) as usize;
     if count == 0 {
         return Err(TelemetryError::InvalidBlockEncoding(
@@ -943,6 +955,9 @@ struct RecentlySealedTrace {
     retries: u64,
 }
 
+type AnalyticalResourceKey = (Arc<str>, crate::ResourceContextId);
+type AnalyticalResourceRows = HashMap<AnalyticalResourceKey, Vec<DurableSpan>>;
+
 /// Result of applying one span to a stripe-local trace head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceApplyOutcome {
@@ -971,6 +986,12 @@ pub struct TraceStripe {
     pending_blocks: Vec<SignalTierPayload>,
     directory: TraceDirectory,
     next_block_id: u64,
+    analytical_resources: RefCell<AnalyticalResourceRows>,
+    analytical_winners: HashMap<(Arc<str>, TraceId, SpanId), LogicalOffset>,
+    analytical_index_dirty: Cell<bool>,
+    analytical_index_bytes: usize,
+    analytical_index_budget_bytes: usize,
+    analytical_index_complete: bool,
 }
 
 struct PreparedTrace {
@@ -1001,6 +1022,12 @@ impl TraceStripe {
             pending_blocks: Vec::new(),
             directory: TraceDirectory::default(),
             next_block_id: 1,
+            analytical_resources: RefCell::new(HashMap::new()),
+            analytical_winners: HashMap::new(),
+            analytical_index_dirty: Cell::new(false),
+            analytical_index_bytes: 0,
+            analytical_index_budget_bytes: head_budget_bytes / 2,
+            analytical_index_complete: true,
         })
     }
 
@@ -1017,6 +1044,7 @@ impl TraceStripe {
         }
         let key = (Arc::clone(&span.tenant), span.trace_id);
         let estimated = span.estimated_head_bytes();
+        let analytical_span = span.clone();
         if estimated > self.head_budget_bytes {
             return Err(TelemetryError::RecordTooLarge);
         }
@@ -1066,14 +1094,14 @@ impl TraceStripe {
             retries: 0,
         });
         trace.last_append_nanos = append_time_nanos;
-        match trace.spans.get(&span.span_id) {
+        let outcome = match trace.spans.get(&span.span_id) {
             Some(existing) if same_span_payload(existing, &span) => {
                 trace.retries = trace.retries.saturating_add(1);
-                Ok(TraceApplyOutcome::Duplicate)
+                TraceApplyOutcome::Duplicate
             }
             Some(existing) if existing.record_ref.offset >= span.record_ref.offset => {
                 trace.conflicts = trace.conflicts.saturating_add(1);
-                Ok(TraceApplyOutcome::Obsolete)
+                TraceApplyOutcome::Obsolete
             }
             Some(existing) => {
                 let previous = existing.estimated_head_bytes();
@@ -1087,23 +1115,64 @@ impl TraceStripe {
                     .saturating_sub(previous)
                     .saturating_add(estimated);
                 trace.spans.insert(span.span_id, span);
-                Ok(TraceApplyOutcome::Replaced)
+                TraceApplyOutcome::Replaced
             }
             None => {
                 trace.bytes = trace.bytes.saturating_add(estimated);
                 self.head_bytes = self.head_bytes.saturating_add(estimated);
                 trace.spans.insert(span.span_id, span);
-                Ok(if replaces_recent {
+                if replaces_recent {
                     TraceApplyOutcome::Replaced
                 } else {
                     TraceApplyOutcome::Inserted
-                })
+                }
             }
+        };
+        if matches!(
+            outcome,
+            TraceApplyOutcome::Inserted | TraceApplyOutcome::Replaced
+        ) {
+            self.update_analytical_index(analytical_span);
         }
+        Ok(outcome)
+    }
+
+    fn update_analytical_index(&mut self, span: DurableSpan) {
+        if !self.analytical_index_complete {
+            return;
+        }
+        let identity = (Arc::clone(&span.tenant), span.trace_id, span.span_id);
+        let resource_id = span.resource_id();
+        let entry_bytes = std::mem::size_of::<DurableSpan>()
+            .saturating_add(128)
+            .saturating_add(
+                usize::from(!self.analytical_winners.contains_key(&identity)).saturating_mul(96),
+            );
+        if self.analytical_index_bytes.saturating_add(entry_bytes)
+            > self.analytical_index_budget_bytes
+            || self.resident_state_bytes().saturating_add(entry_bytes) > self.head_budget_bytes
+        {
+            self.analytical_resources.get_mut().clear();
+            self.analytical_winners.clear();
+            self.analytical_index_bytes = 0;
+            self.analytical_index_complete = false;
+            return;
+        }
+        self.analytical_winners
+            .insert(identity, span.record_ref.offset);
+        self.analytical_resources
+            .get_mut()
+            .entry((Arc::clone(&span.tenant), resource_id))
+            .or_default()
+            .push(span);
+        self.analytical_index_dirty.set(true);
+        self.analytical_index_bytes = self.analytical_index_bytes.saturating_add(entry_bytes);
     }
 
     fn resident_state_bytes(&self) -> usize {
-        self.head_bytes.saturating_add(self.recently_sealed_bytes)
+        self.head_bytes
+            .saturating_add(self.recently_sealed_bytes)
+            .saturating_add(self.analytical_index_bytes)
     }
 
     fn expire_recent(&mut self, now_nanos: u64) {
@@ -1375,7 +1444,10 @@ impl TraceStripe {
         if let Some(trace_id) = query.trace_id {
             return self.query_exact_trace(query, trace_id, limit);
         }
-        let mut winners = BTreeMap::<(Arc<str>, TraceId, SpanId), DurableSpan>::new();
+        if let Some(spans) = self.query_analytical_resource_index(query, limit) {
+            return Ok(spans);
+        }
+        let mut winners = HashMap::<(TraceId, SpanId), DurableSpan>::new();
         for payload in self.sealed_blocks.values() {
             for span in decode_trace_block_matching(payload, query)? {
                 retain_newest_span(&mut winners, span);
@@ -1401,8 +1473,22 @@ impl TraceStripe {
             .filter(|span| trace_query_cursor_matches(query, span))
             .collect::<Vec<_>>();
         if query.partition.is_some() {
+            if spans.len() > limit {
+                spans.select_nth_unstable_by_key(limit - 1, |span| span.record_ref.offset);
+                spans.truncate(limit);
+            }
             spans.sort_unstable_by_key(|span| span.record_ref.offset);
         } else {
+            if spans.len() > limit {
+                spans.select_nth_unstable_by_key(limit - 1, |span| {
+                    (
+                        span.trace_id,
+                        span.start_time_unix_nanos,
+                        span.record_ref.offset,
+                    )
+                });
+                spans.truncate(limit);
+            }
             spans.sort_unstable_by_key(|span| {
                 (
                     span.trace_id,
@@ -1411,8 +1497,79 @@ impl TraceStripe {
                 )
             });
         }
-        spans.truncate(limit);
         Ok(spans)
+    }
+
+    fn query_analytical_resource_index(
+        &self,
+        query: &TraceQuery,
+        limit: usize,
+    ) -> Option<Vec<DurableSpan>> {
+        if !self.analytical_index_complete
+            || query.partition.is_some()
+            || query.exact_resource_attributes.is_empty()
+        {
+            return None;
+        }
+        let mut resources = self.analytical_resources.borrow_mut();
+        if self.analytical_index_dirty.replace(false) {
+            for entries in resources.values_mut() {
+                entries.sort_unstable_by_key(|span| {
+                    (
+                        span.trace_id,
+                        span.start_time_unix_nanos,
+                        span.span_id,
+                        span.record_ref.offset,
+                    )
+                });
+            }
+        }
+        let mut spans = Vec::new();
+        for ((tenant, _), entries) in resources.iter() {
+            if tenant.as_ref() != query.tenant.as_ref()
+                || entries.first().is_none_or(|span| {
+                    !rendered_attributes_match(
+                        &span.resource.attributes,
+                        &query.exact_resource_attributes,
+                    )
+                })
+            {
+                continue;
+            }
+            spans.extend(
+                entries
+                    .iter()
+                    .filter(|span| {
+                        self.analytical_winners.get(&(
+                            Arc::clone(&span.tenant),
+                            span.trace_id,
+                            span.span_id,
+                        )) == Some(&span.record_ref.offset)
+                            && trace_query_matches(query, span)
+                            && trace_query_cursor_matches(query, span)
+                    })
+                    .take(limit)
+                    .cloned(),
+            );
+        }
+        if spans.len() > limit {
+            spans.select_nth_unstable_by_key(limit - 1, |span| {
+                (
+                    span.trace_id,
+                    span.start_time_unix_nanos,
+                    span.record_ref.offset,
+                )
+            });
+            spans.truncate(limit);
+        }
+        spans.sort_unstable_by_key(|span| {
+            (
+                span.trace_id,
+                span.start_time_unix_nanos,
+                span.record_ref.offset,
+            )
+        });
+        Some(spans)
     }
 
     fn query_exact_trace(
@@ -1544,11 +1701,8 @@ fn same_span_payload(left: &DurableSpan, right: &DurableSpan) -> bool {
     left == &normalized
 }
 
-fn retain_newest_span(
-    winners: &mut BTreeMap<(Arc<str>, TraceId, SpanId), DurableSpan>,
-    span: DurableSpan,
-) {
-    let key = (Arc::clone(&span.tenant), span.trace_id, span.span_id);
+fn retain_newest_span(winners: &mut HashMap<(TraceId, SpanId), DurableSpan>, span: DurableSpan) {
+    let key = (span.trace_id, span.span_id);
     if winners
         .get(&key)
         .is_none_or(|existing| existing.record_ref.offset < span.record_ref.offset)
@@ -1681,6 +1835,71 @@ mod tests {
             Arc::from("inventory-api"),
         )]);
         assert!(!trace_query_matches(&mismatch, &record));
+    }
+
+    #[test]
+    fn bounded_resource_index_preserves_global_trace_order_across_sealing() {
+        let with_service = |offset, trace_byte, service: &'static str| {
+            let mut record = span(offset, trace_byte, trace_byte);
+            record.resource = Arc::new(ResourceContext {
+                attributes: Arc::new(vec![TelemetryAttribute::new(
+                    "service.name",
+                    crate::TelemetryValue::String(Arc::from(service)),
+                )]),
+                ..ResourceContext::default()
+            });
+            record
+        };
+        let mut stripe = TraceStripe::new(4 * 1024 * 1024).unwrap();
+        for trace_byte in (1..=50).rev() {
+            let record = with_service(
+                u64::from(trace_byte),
+                trace_byte,
+                if trace_byte == 50 {
+                    "inventory-api"
+                } else {
+                    "checkout-api"
+                },
+            );
+            stripe
+                .apply(record, u64::from(trace_byte))
+                .expect("span indexes");
+        }
+        let query = TraceQuery {
+            tenant: Arc::from("tenant-a"),
+            exact_resource_attributes: Arc::new(vec![(
+                Arc::from("service.name"),
+                Arc::from("checkout-api"),
+            )]),
+            limit: 3,
+            ..TraceQuery::default()
+        };
+        let expected = vec![
+            TraceId::from_bytes([1; 16]).unwrap(),
+            TraceId::from_bytes([2; 16]).unwrap(),
+            TraceId::from_bytes([3; 16]).unwrap(),
+        ];
+        assert_eq!(
+            stripe
+                .query(&query)
+                .unwrap()
+                .into_iter()
+                .map(|span| span.trace_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        stripe
+            .seal_idle(DEFAULT_TRACE_IDLE_NANOS + 100)
+            .expect("idle traces seal");
+        assert_eq!(
+            stripe
+                .query(&query)
+                .unwrap()
+                .into_iter()
+                .map(|span| span.trace_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]

@@ -10,12 +10,8 @@ QUERY_ITERATIONS=${QUERY_ITERATIONS:-20}
 REQUIRED_NOFILE=${REQUIRED_NOFILE:-262144}
 SHARD_TELEMETRY_SERVER=${SHARD_TELEMETRY_SERVER:?set SHARD_TELEMETRY_SERVER}
 SHARD_TELEMETRY_LOAD_BIN=${SHARD_TELEMETRY_LOAD_BIN:?set SHARD_TELEMETRY_LOAD_BIN}
-CLICKHOUSE_BIN=${CLICKHOUSE_BIN:?set CLICKHOUSE_BIN to the custom ClickHouse binary}
-CLICKHOUSE_SOURCE=${CLICKHOUSE_SOURCE:?set CLICKHOUSE_SOURCE to the pinned ClickHouse checkout}
-EXPECTED_CLICKHOUSE_TAG=${EXPECTED_CLICKHOUSE_TAG:-v26.3.17.56-lts}
-EXPECTED_CLICKHOUSE_COMMIT=${EXPECTED_CLICKHOUSE_COMMIT:-c57540de480d8a501b601163471d3843674378cf}
-CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-sha256:770156c537ca9124046e138a3b5845c64ea58ce8722de7a2e05fd827f4976520}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-clickhouse-adapter-head-to-head}
+CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-sha256:422be85ae7344058369cdd366ac0efea9daa8428b55c9cf50258e83a7d12fcb3}
+RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-clickhouse-head-to-head}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 SHARD_HTTP_ADDRESS=${SHARD_HTTP_ADDRESS:-127.0.0.1:32100}
 SHARD_NATIVE_ADDRESS=${SHARD_NATIVE_ADDRESS:-127.0.0.1:32101}
@@ -27,7 +23,7 @@ CLICKHOUSE_INTERSERVER_PORT=19009
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CLICKHOUSE_CONFIG=$SCRIPT_DIR/clickhouse-benchmark.xml
-CLICKHOUSE_PORT_CONFIG=$SCRIPT_DIR/clickhouse-adapter-benchmark-ports.xml
+CLICKHOUSE_PORT_CONFIG=$SCRIPT_DIR/clickhouse-benchmark-ports.xml
 CLICKHOUSE_INGEST=$SCRIPT_DIR/clickhouse-ingest-range.sh
 TENANT=benchmark
 CLICKHOUSE_TOKEN=shard-telemetry-clickhouse-head-to-head-token
@@ -52,7 +48,7 @@ fi
 if [[ $(ulimit -Sn) -lt $REQUIRED_NOFILE ]]; then
     ulimit -Sn "$REQUIRED_NOFILE"
 fi
-for command in awk cmp curl dd docker git grep lscpu sha256sum ss stat taskset; do
+for command in awk cmp curl dd docker grep lscpu sha256sum ss stat taskset; do
     command -v "$command" >/dev/null || {
         echo "missing required command: $command" >&2
         exit 2
@@ -62,8 +58,6 @@ for path in \
     "$SOURCE" \
     "$SHARD_TELEMETRY_SERVER" \
     "$SHARD_TELEMETRY_LOAD_BIN" \
-    "$CLICKHOUSE_BIN" \
-    "$CLICKHOUSE_SOURCE" \
     "$CLICKHOUSE_CONFIG" \
     "$CLICKHOUSE_PORT_CONFIG" \
     "$CLICKHOUSE_INGEST"; do
@@ -72,7 +66,7 @@ for path in \
         exit 2
     }
 done
-for executable in "$SHARD_TELEMETRY_SERVER" "$SHARD_TELEMETRY_LOAD_BIN" "$CLICKHOUSE_BIN"; do
+for executable in "$SHARD_TELEMETRY_SERVER" "$SHARD_TELEMETRY_LOAD_BIN"; do
     [[ -x $executable ]] || {
         echo "required binary is not executable: $executable" >&2
         exit 2
@@ -104,13 +98,6 @@ SOURCE_SHA256=$(sha256sum "$SOURCE" | awk '{ print $1 }')
     echo "source SHA-256 mismatch" >&2
     exit 2
 }
-OBSERVED_CLICKHOUSE_TAG=$(git -C "$CLICKHOUSE_SOURCE" describe --tags --exact-match 2>/dev/null || true)
-OBSERVED_CLICKHOUSE_COMMIT=$(git -C "$CLICKHOUSE_SOURCE" rev-parse HEAD)
-[[ $OBSERVED_CLICKHOUSE_TAG == "$EXPECTED_CLICKHOUSE_TAG" \
-    && $OBSERVED_CLICKHOUSE_COMMIT == "$EXPECTED_CLICKHOUSE_COMMIT" ]] || {
-    echo "ClickHouse source revision mismatch" >&2
-    exit 2
-}
 IMAGE_ID=$(docker image inspect "$CLICKHOUSE_IMAGE" --format '{{.Id}}')
 [[ $IMAGE_ID == "$CLICKHOUSE_IMAGE" ]] || {
     echo "ClickHouse image mismatch" >&2
@@ -125,7 +112,7 @@ RUN_DIR=$RESULT_ROOT/$RUN_ID
 mkdir -p "$RUN_DIR/shard-data" "$RUN_DIR/clickhouse-data" "$RUN_DIR/clickhouse-logs"
 exec > >(tee "$RUN_DIR/harness.log") 2>&1
 
-CH_CONTAINER="shard-telemetry-adapter-${RUN_ID//[^a-zA-Z0-9_.-]/-}"
+CH_CONTAINER="shard-telemetry-clickhouse-${RUN_ID//[^a-zA-Z0-9_.-]/-}"
 CH_STARTED=0
 SHARD_STARTED=0
 cleanup() {
@@ -157,10 +144,6 @@ trap cleanup EXIT INT TERM
     echo "shard_telemetry_server_sha256=$(sha256sum "$SHARD_TELEMETRY_SERVER" | awk '{ print $1 }')"
     echo "shard_telemetry_load_bin=$SHARD_TELEMETRY_LOAD_BIN"
     echo "shard_telemetry_load_sha256=$(sha256sum "$SHARD_TELEMETRY_LOAD_BIN" | awk '{ print $1 }')"
-    echo "clickhouse_binary=$CLICKHOUSE_BIN"
-    echo "clickhouse_binary_sha256=$(sha256sum "$CLICKHOUSE_BIN" | awk '{ print $1 }')"
-    echo "clickhouse_source_tag=$OBSERVED_CLICKHOUSE_TAG"
-    echo "clickhouse_source_commit=$OBSERVED_CLICKHOUSE_COMMIT"
     echo "clickhouse_image=$CLICKHOUSE_IMAGE"
     echo "clickhouse_image_id=$IMAGE_ID"
     echo "clickhouse_http_port=$CLICKHOUSE_HTTP_PORT"
@@ -234,7 +217,7 @@ curl --fail --silent --show-error -X POST http://127.0.0.1:32100/flush \
 curl --fail --silent http://127.0.0.1:32100/metrics >"$RUN_DIR/shard-metrics.txt"
 du -sb "$RUN_DIR/shard-data" >"$RUN_DIR/shard-data-du.txt"
 
-echo "ClickHouse: starting custom server on CPUs $CPU_SET"
+echo "ClickHouse: starting stock server on CPUs $CPU_SET"
 if ss -ltn | grep -Eq ":($CLICKHOUSE_HTTP_PORT|$CLICKHOUSE_TCP_PORT|$CLICKHOUSE_INTERSERVER_PORT)[[:space:]]"; then
     echo "one or more benchmark ClickHouse host-network ports are already in use" >&2
     exit 2
@@ -245,7 +228,6 @@ docker run --detach \
     --cpuset-cpus "$CPU_SET" \
     --ulimit nofile=262144:262144 \
     --env CLICKHOUSE_SKIP_USER_SETUP=1 \
-    --volume "$CLICKHOUSE_BIN:/usr/bin/clickhouse:ro" \
     --volume "$SOURCE:/benchmark/input.json:ro" \
     --volume "$SCRIPT_DIR:/benchmark-scripts:ro" \
     --volume "$CLICKHOUSE_CONFIG:/etc/clickhouse-server/config.d/benchmark.xml:ro" \
@@ -264,16 +246,8 @@ done
 docker exec "$CH_CONTAINER" clickhouse-client --port "$CLICKHOUSE_TCP_PORT" \
     --query 'SELECT version()' \
     >"$RUN_DIR/clickhouse-version.txt"
-docker exec "$CH_CONTAINER" clickhouse-client --port "$CLICKHOUSE_TCP_PORT" --query \
-    "SELECT name FROM system.table_engines WHERE name = 'ShardTelemetry'" \
-    >"$RUN_DIR/clickhouse-engine.txt"
-[[ $(<"$RUN_DIR/clickhouse-engine.txt") == ShardTelemetry ]] || {
-    echo "custom ClickHouse server does not advertise ShardTelemetry" >&2
-    exit 1
-}
-
 LOG_STRUCTURE="tenant String, signal String, timestamp DateTime64(9, 'UTC'), observed_timestamp Nullable(DateTime64(9, 'UTC')), partition UInt32, offset UInt64, resource_id Nullable(String), scope_id Nullable(String), trace_id Nullable(String), span_id Nullable(String), message Nullable(String), body_json Nullable(String), severity_number Nullable(Int32), severity_text Nullable(String), event_name Nullable(String), flags Nullable(UInt32), dropped_attributes_count Nullable(UInt32), labels Map(String, String), metadata Map(String, String), attributes Map(String, String), resource_attributes Map(String, String), scope_attributes Map(String, String), attribute_ids Map(String, String), resource_attribute_ids Map(String, String), scope_attribute_ids Map(String, String), attributes_json Nullable(String), resource_attributes_json Nullable(String), scope_attributes_json Nullable(String)"
-ADAPTER_URL="http://127.0.0.1:32100/shardtelemetry/api/v1/clickhouse/scan?relation=logs"
+SHARD_URL="http://127.0.0.1:32100/shardtelemetry/api/v1/clickhouse/scan?relation=logs&wire=rowbinary"
 docker exec "$CH_CONTAINER" clickhouse-client --port "$CLICKHOUSE_TCP_PORT" --multiquery --query "
 CREATE DATABASE benchmark;
 CREATE TABLE benchmark.logs
@@ -287,7 +261,7 @@ ENGINE = MergeTree
 ORDER BY (stream, time)
 SETTINGS index_granularity = 8192, fsync_after_insert = 1;
 CREATE TABLE benchmark.shard_logs ($LOG_STRUCTURE)
-ENGINE = ShardTelemetry('$ADAPTER_URL', 'ArrowStream', headers(
+ENGINE = URL('$SHARD_URL', 'RowBinary', headers(
     'Authorization' = 'Bearer $CLICKHOUSE_TOKEN',
     'X-Scope-OrgID' = '$TENANT'));
 "
@@ -312,9 +286,9 @@ docker exec "$CH_CONTAINER" clickhouse-client --port "$CLICKHOUSE_TCP_PORT" \
     --query 'SELECT count() FROM benchmark.shard_logs' \
     >"$RUN_DIR/shard-row-count.txt"
 CLICKHOUSE_RECORDS=$(tr -d '[:space:]' <"$RUN_DIR/clickhouse-row-count.txt")
-ADAPTER_RECORDS=$(tr -d '[:space:]' <"$RUN_DIR/shard-row-count.txt")
-[[ $CLICKHOUSE_RECORDS -eq $SHARD_RECORDS && $ADAPTER_RECORDS -eq $SHARD_RECORDS ]] || {
-    echo "record-count mismatch: loader=$SHARD_RECORDS adapter=$ADAPTER_RECORDS ClickHouse=$CLICKHOUSE_RECORDS" >&2
+SHARD_QUERY_RECORDS=$(tr -d '[:space:]' <"$RUN_DIR/shard-row-count.txt")
+[[ $CLICKHOUSE_RECORDS -eq $SHARD_RECORDS && $SHARD_QUERY_RECORDS -eq $SHARD_RECORDS ]] || {
+    echo "record-count mismatch: loader=$SHARD_RECORDS URL=$SHARD_QUERY_RECORDS ClickHouse=$CLICKHOUSE_RECORDS" >&2
     exit 1
 }
 

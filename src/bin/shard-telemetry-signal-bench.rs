@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicPartition};
 use shard_telemetry::{
-    CompressionCohortId, CorrelationBlockFilter, CorrelationConfig, CorrelationIndex,
-    CorrelationQuery, DurableLog, DurableMetricPoint, DurableSpan, DurableTelemetryConfig,
-    DurableTelemetryStore, LOGS_TOPIC_ID, LogQuery, LogStripe, METRICS_TOPIC_ID, MetadataField,
-    MetricIdentity, MetricIngestProtocol, MetricKind, MetricQuery, MetricStripe, MetricValue,
+    AnalyticsColumn, AnalyticsRelation, AnalyticsScanRequest, CompressionCohortId,
+    CorrelationBlockFilter, CorrelationConfig, CorrelationIndex, CorrelationQuery, DurableLog,
+    DurableMetricPoint, DurableSpan, DurableTelemetryConfig, DurableTelemetryStore, LOGS_TOPIC_ID,
+    LogQuery, LogStripe, LokiStore, METRICS_TOPIC_ID, MetadataField, MetricIdentity,
+    MetricIngestProtocol, MetricKind, MetricQuery, MetricStripe, MetricValue,
     NativePartitionAppend, NativeTelemetryBatch, NumberValue, OtlpLogEvent, ResourceContext,
     ScopeContext, SeriesFingerprint, SpanId, SpanStatus, StripeConfig, TRACES_TOPIC_ID,
     TelemetryAttribute, TelemetryEnvelope, TelemetryRecordRef, TelemetryRouter, TelemetrySignal,
@@ -30,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut durable_output_dir = None::<PathBuf>;
     let mut server_data_directory = None::<PathBuf>;
     let mut server_shards = 1usize;
+    let mut server_scan_iterations = None::<usize>;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -53,6 +55,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             "--server-shards" => server_shards = parse_usize(args.next(), "--server-shards")?,
+            "--server-scan-iterations" => {
+                server_scan_iterations =
+                    Some(parse_usize(args.next(), "--server-scan-iterations")?);
+            }
             _ => return Err(format!("unknown argument {argument}").into()),
         }
     }
@@ -79,6 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_shards,
             started.elapsed().as_secs_f64()
         );
+        if let Some(scan_iterations) = server_scan_iterations {
+            benchmark_server_scans(&corpus, data_directory, server_shards, scan_iterations)?;
+        }
     }
     println!("ShardTelemetry signal benchmark (v1)");
     println!("records_per_signal={records} lookup_iterations={iterations}");
@@ -97,6 +106,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         correlation_result.lookup_p50.as_secs_f64() * 1e6,
         correlation_result.lookup_p99.as_secs_f64() * 1e6,
     );
+    Ok(())
+}
+
+fn benchmark_server_scans(
+    corpus: &Corpus,
+    data_directory: &Path,
+    shard_count: usize,
+    iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if iterations == 0 {
+        return Err("--server-scan-iterations must be nonzero".into());
+    }
+    let store = DurableTelemetryStore::open(DurableTelemetryConfig {
+        data_directory: data_directory.to_path_buf(),
+        object_store_directory: None,
+        recovery_journal: true,
+        retention: None,
+        shard_count: u32::try_from(shard_count)?,
+        tenant_partitions: 256,
+        append_linger: Duration::ZERO,
+        stripe: StripeConfig::default(),
+        indexed_ack_timeout: Duration::from_secs(300),
+    })?;
+    let selected_trace = corpus.spans[corpus.spans.len() / 2].trace_id;
+    let selected_series = corpus.points[corpus.points.len() / 2].series_fingerprint();
+    let mut trace = AnalyticsScanRequest::for_relation(TENANT, AnalyticsRelation::Spans);
+    trace.trace_id = Some(selected_trace);
+    trace.limit = Some(32);
+    trace.columns = vec![AnalyticsColumn::Timestamp, AnalyticsColumn::Name];
+    let mut metric = AnalyticsScanRequest::for_relation(TENANT, AnalyticsRelation::MetricPoints);
+    metric.series_id = Some(selected_series);
+    metric.limit = Some(3_000);
+    metric.columns = vec![
+        AnalyticsColumn::Timestamp,
+        AnalyticsColumn::ScalarDoubleBits,
+    ];
+    let mut resource = AnalyticsScanRequest::for_relation(TENANT, AnalyticsRelation::Spans);
+    resource
+        .resource_attributes
+        .push(MetadataField::new("service.name", "checkout-api"));
+    resource.limit = Some(1_000);
+    resource.columns = vec![AnalyticsColumn::Timestamp, AnalyticsColumn::Name];
+    for (name, request) in [("trace", trace), ("metric", metric), ("resource", resource)] {
+        let (rows, ops, p50, p99) = measure_lookup(iterations, || {
+            let mut count = 0;
+            store
+                .scan_analytics(&request, &mut |batch| {
+                    count += batch.len();
+                    Ok(())
+                })
+                .expect("server analytical scan");
+            count
+        });
+        println!(
+            "server_scan signal={name} rows={rows} lookup_ops_s={ops:.2} p50_us={:.3} p99_us={:.3}",
+            p50.as_secs_f64() * 1e6,
+            p99.as_secs_f64() * 1e6,
+        );
+    }
     Ok(())
 }
 

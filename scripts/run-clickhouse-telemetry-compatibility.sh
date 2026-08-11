@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+shopt -u patsub_replacement 2>/dev/null || true
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 "$SCRIPT_DIR/run-clickhouse-compatibility.sh"
@@ -14,7 +15,6 @@ CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-}
 CLICKHOUSE_NETWORK=${CLICKHOUSE_NETWORK:-host}
 SHARD_TELEMETRY_URL=${SHARD_TELEMETRY_URL:-http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan}
 SHARD_TELEMETRY_TENANT=${SHARD_TELEMETRY_TENANT:-fake}
-SHARD_TELEMETRY_ADAPTER_MODE=${SHARD_TELEMETRY_ADAPTER_MODE:-0}
 REQUIRE_NONEMPTY=${SHARD_TELEMETRY_REQUIRE_NONEMPTY:-1}
 
 run_clickhouse() {
@@ -64,23 +64,11 @@ relation_url() {
 
 source_sql() {
     local relation=$1
-    if [[ $SHARD_TELEMETRY_ADAPTER_MODE -eq 1 ]]; then
-        printf 'source_%s' "$relation"
-    else
-        local url structure
-        url=$(escape_sql "$(relation_url "$relation")")
-        structure=$(escape_sql "$(relation_structure "$relation")")
-        printf "url('%s', 'ArrowStream', '%s', headers('Authorization' = 'Bearer %s', 'X-Scope-OrgID' = '%s'))" \
-            "$url" "$structure" "$(escape_sql "$SHARD_TELEMETRY_CLICKHOUSE_TOKEN")" \
-            "$(escape_sql "$SHARD_TELEMETRY_TENANT")"
-    fi
-}
-
-source_setup() {
-    local relation=$1
-    [[ $SHARD_TELEMETRY_ADAPTER_MODE -eq 1 ]] || return 0
-    printf "CREATE TABLE source_%s (%s) ENGINE = ShardTelemetry('%s', 'ArrowStream', headers('Authorization' = 'Bearer %s', 'X-Scope-OrgID' = '%s'));\n" \
-        "$relation" "$(relation_structure "$relation")" "$(escape_sql "$(relation_url "$relation")")" \
+    local url structure
+    url=$(escape_sql "$(relation_url "$relation")")
+    structure=$(escape_sql "$(relation_structure "$relation")")
+    printf "url('%s&wire=rowbinary', 'RowBinary', '%s', headers('Authorization' = 'Bearer %s', 'X-Scope-OrgID' = '%s'))" \
+        "$url" "$structure" \
         "$(escape_sql "$SHARD_TELEMETRY_CLICKHOUSE_TOKEN")" "$(escape_sql "$SHARD_TELEMETRY_TENANT")"
 }
 
@@ -98,12 +86,10 @@ run_case() {
     reference_output="$RESULT_DIR/$name.reference"
 
     {
-        source_setup "$relation"
         printf '%s FORMAT JSONCompactEachRow\n' "${query//__TABLE__/$source}"
     } | run_clickhouse local --multiquery >"$external_output"
 
     {
-        source_setup "$relation"
         printf 'CREATE TABLE %s (%s) ENGINE = Memory;\n' "$reference" "$(relation_structure "$relation")"
         printf 'INSERT INTO %s SELECT * FROM %s;\n' "$reference" "$source"
         printf '%s FORMAT JSONCompactEachRow\n' "${query//__TABLE__/$reference}"
@@ -131,16 +117,11 @@ run_cross_case() {
     reference_output="$RESULT_DIR/$name.reference"
 
     {
-        source_setup logs
-        source_setup spans
-        source_setup metric_points
-        source_setup metric_exemplars
         printf '%s FORMAT JSONCompactEachRow\n' "$external_query"
     } | run_clickhouse local --multiquery >"$external_output"
 
     {
         for relation in logs spans metric_points metric_exemplars; do
-            source_setup "$relation"
             printf 'CREATE TABLE reference_%s (%s) ENGINE = Memory;\n' \
                 "$relation" "$(relation_structure "$relation")"
             printf 'INSERT INTO reference_%s SELECT * FROM %s;\n' \
@@ -161,7 +142,6 @@ if [[ $REQUIRE_NONEMPTY -eq 1 ]]; then
     for relation in spans span_events span_links metric_points metric_exemplars; do
         count=$(
             {
-                source_setup "$relation"
                 printf 'SELECT count() FROM %s;\n' "$(source_sql "$relation")"
             } | run_clickhouse local --multiquery
         )

@@ -1536,6 +1536,29 @@ impl LogStripe {
         Ok(total)
     }
 
+    /// Returns only logical partitions that currently contain this tenant.
+    ///
+    /// The directory is reconstructed from hot postings, compressed-frame
+    /// append metadata, and object-tier catalogs, so callers do not need to
+    /// enumerate every configured logical partition after restart or offload.
+    pub(crate) fn tenant_partitions(&self, tenant: &str) -> TelemetryResult<Vec<TopicPartition>> {
+        let mut candidates = self.partitions.keys().copied().collect::<Vec<_>>();
+        candidates.extend(self.indexed_frame_partitions.keys().copied());
+        if let Some(state) = &self.tier {
+            candidates.extend(state.tiers.keys().copied());
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        let mut matches = Vec::with_capacity(candidates.len());
+        for partition in candidates {
+            if self.count_tenant_records(tenant, std::slice::from_ref(&partition))? > 0 {
+                matches.push(partition);
+            }
+        }
+        Ok(matches)
+    }
+
     fn count_tiered_tenant_records(
         &self,
         topic_partition: TopicPartition,
@@ -1797,6 +1820,56 @@ impl LogStripe {
             && candidates.len() > limit.saturating_mul(2).max(256)
         {
             let structural = decompress_indexed_ingest_frame(frame)?;
+            if frame.index.timestamp_offset_ordinal_ordered() {
+                let filter_messages_first = query.has_residual_predicate() && message_filterable;
+                let batch_len = if filter_messages_first {
+                    limit.saturating_mul(4).max(1_024)
+                } else {
+                    limit.saturating_mul(2).max(256)
+                };
+                let mut matches = Vec::new();
+                let mut consumed = 0usize;
+                while matches.len() < limit && consumed < candidates.len() {
+                    let mut batch = match query.order {
+                        QueryOrder::OldestFirst => {
+                            let start = consumed;
+                            let end = candidates.len().min(start.saturating_add(batch_len));
+                            consumed = end;
+                            candidates[start..end].to_vec()
+                        }
+                        QueryOrder::NewestFirst => {
+                            let end = candidates.len().saturating_sub(consumed);
+                            let start = end.saturating_sub(batch_len);
+                            consumed = consumed.saturating_add(end - start);
+                            candidates[start..end].to_vec()
+                        }
+                    };
+                    if filter_messages_first {
+                        let messages = decode_structural_messages(&structural, &batch)?;
+                        batch = batch
+                            .into_iter()
+                            .zip(messages)
+                            .filter_map(|(ordinal, message)| {
+                                query
+                                    .message_candidate_matches(&message)
+                                    .unwrap_or(false)
+                                    .then_some(ordinal)
+                            })
+                            .collect();
+                    }
+                    if !batch.is_empty() {
+                        matches.extend(self.decode_decompressed_frame_candidates(
+                            query,
+                            append,
+                            frame,
+                            &structural,
+                            &batch,
+                        )?);
+                    }
+                }
+                sort_and_limit_matches(&mut matches, query, limit);
+                return Ok(matches);
+            }
             let (offsets, timestamps) = decode_structural_positions(&structural)?;
             let mut ranked = candidates.to_vec();
             for ordinal in &ranked {
@@ -3211,6 +3284,7 @@ mod tests {
 
     #[test]
     fn compressed_frame_timestamp_top_k_selects_before_full_record_decode() {
+        let fields = Arc::new(vec![crate::MetadataField::new("docker_stream", "stderr")]);
         let events = (0..1_024u64)
             .map(|ordinal| OtlpLogEvent {
                 timestamp_unix_nanos: ordinal,
@@ -3219,6 +3293,7 @@ mod tests {
                 } else {
                     "prefix_target suffix".to_owned()
                 }),
+                fields: Arc::clone(&fields),
                 compression_cohort: CompressionCohortId::new(1),
                 ..OtlpLogEvent::default()
             })
@@ -3243,6 +3318,21 @@ mod tests {
             stripe
                 .query_checked(&latest)
                 .expect("latest query")
+                .into_iter()
+                .map(|matched| matched.record.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            vec![1_023, 1_022, 1_021]
+        );
+
+        let latest_stream = LogQuery::new(partition())
+            .with_field("docker_stream", "stderr")
+            .sort_by_timestamp()
+            .newest_first()
+            .with_limit(3);
+        assert_eq!(
+            stripe
+                .query_checked(&latest_stream)
+                .expect("latest exact-stream query")
                 .into_iter()
                 .map(|matched| matched.record.timestamp_unix_nanos)
                 .collect::<Vec<_>>(),

@@ -34,6 +34,7 @@ const EMBEDDED_MEMBERSHIP_FILTER_WORDS: usize = 1;
 const INDEX_FINGERPRINT_MASK: u32 = 0x00ff_ffff;
 const PACKED_IDS_BITPACKED: u8 = 0;
 const PACKED_IDS_RUN_LENGTH: u8 = 1;
+const PACKED_IDS_POSITION_ORDERED: u8 = 1 << 7;
 
 type DecodedAttributeTables = (Vec<Arc<str>>, Vec<Vec<Arc<str>>>);
 
@@ -395,6 +396,7 @@ impl MembershipFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedFrameIndex {
     record_count: u32,
+    timestamp_offset_ordinal_ordered: bool,
     layout_count: u32,
     layout_ids: PackedIdColumn,
     residual_layout_ids: Vec<u32>,
@@ -431,6 +433,14 @@ impl EmbeddedFrameIndex {
     #[must_use]
     pub const fn record_count(&self) -> u32 {
         self.record_count
+    }
+
+    /// Returns whether record ordinals already have exact timestamp/offset
+    /// order. Ordered top-k queries can then choose candidate ordinals without
+    /// decoding the Pco position lanes first.
+    #[must_use]
+    pub const fn timestamp_offset_ordinal_ordered(&self) -> bool {
+        self.timestamp_offset_ordinal_ordered
     }
 
     /// Returns a lossless candidate superset for a case-insensitive token.
@@ -494,6 +504,7 @@ impl EmbeddedFrameIndex {
         template_ids: &[Option<usize>],
         attributes: &AttributeTables,
         fields: &ParsedFieldSets,
+        timestamp_offset_ordinal_ordered: bool,
     ) -> TelemetryResult<Self> {
         let record_count =
             u32::try_from(messages.layout_ids.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
@@ -617,6 +628,7 @@ impl EmbeddedFrameIndex {
         let field_membership = term_membership.clone();
         Ok(Self {
             record_count,
+            timestamp_offset_ordinal_ordered,
             layout_count,
             layout_ids: pack_ids(
                 &messages
@@ -646,6 +658,7 @@ impl EmbeddedFrameIndex {
             &self.layout_ids,
             self.layout_count,
             self.record_count,
+            self.timestamp_offset_ordinal_ordered,
             &mut encoded,
         )?;
         encode_optional_sorted_ids(&self.residual_layout_ids, self.layout_count, &mut encoded)?;
@@ -662,6 +675,7 @@ impl EmbeddedFrameIndex {
             &self.field_set_ids,
             self.field_set_count,
             self.record_count,
+            false,
             &mut encoded,
         )?;
         write_varint(
@@ -677,7 +691,8 @@ impl EmbeddedFrameIndex {
 
     fn decode(encoded: &[u8], record_count: u32) -> TelemetryResult<Self> {
         let mut cursor = 0;
-        let (layout_count, layout_ids) = decode_packed_column(encoded, &mut cursor, record_count)?;
+        let (layout_count, layout_ids, timestamp_offset_ordinal_ordered) =
+            decode_packed_column(encoded, &mut cursor, record_count, true)?;
         let residual_layout_ids = decode_optional_sorted_ids(encoded, &mut cursor, layout_count)?;
         let term_membership = decode_membership_filter(encoded, &mut cursor)?;
         let term_count = read_usize(encoded, &mut cursor)?;
@@ -703,8 +718,9 @@ impl EmbeddedFrameIndex {
                 layout_ids,
             });
         }
-        let (field_set_count, field_set_ids) =
-            decode_packed_column(encoded, &mut cursor, record_count)?;
+        let (field_set_count, field_set_ids, field_position_flag) =
+            decode_packed_column(encoded, &mut cursor, record_count, false)?;
+        debug_assert!(!field_position_flag);
         let field_membership = term_membership.clone();
         let field_count = read_usize(encoded, &mut cursor)?;
         ensure_count_within(
@@ -732,6 +748,7 @@ impl EmbeddedFrameIndex {
         require_consumed(encoded, cursor)?;
         Ok(Self {
             record_count,
+            timestamp_offset_ordinal_ordered,
             layout_count,
             layout_ids,
             residual_layout_ids,
@@ -1083,8 +1100,22 @@ pub fn encode_indexed_structural_records<R: StructuralRecordView>(
     let attribute_tables = encode_attribute_tables(&attributes)?;
     let (fields, parsed_fields) = encode_fields(&resolved_fields, &attributes, field_membership)?;
     let typed_metadata = encode_typed_metadata(records)?;
-    let index =
-        EmbeddedFrameIndex::build(&parsed_messages, &template_ids, &attributes, &parsed_fields)?;
+    let timestamp_offset_ordinal_ordered = records.windows(2).all(|pair| {
+        (
+            pair[0].structural_timestamp_unix_nanos(),
+            pair[0].structural_offset(),
+        ) <= (
+            pair[1].structural_timestamp_unix_nanos(),
+            pair[1].structural_offset(),
+        )
+    });
+    let index = EmbeddedFrameIndex::build(
+        &parsed_messages,
+        &template_ids,
+        &attributes,
+        &parsed_fields,
+        timestamp_offset_ordinal_ordered,
+    )?;
     let embedded_index = index.encode()?;
     let embedded_index_bytes = embedded_index.len();
 
@@ -3164,6 +3195,7 @@ fn encode_packed_column(
     column: &PackedIdColumn,
     dictionary_count: u32,
     record_count: u32,
+    position_ordered: bool,
     encoded: &mut Vec<u8>,
 ) -> TelemetryResult<()> {
     write_varint(u64::from(dictionary_count), encoded);
@@ -3200,11 +3232,16 @@ fn encode_packed_column(
     let run_length_bytes = 1usize
         .checked_add(run_length.len())
         .ok_or(TelemetryError::RecordTooLarge)?;
+    let position_flag = if position_ordered {
+        PACKED_IDS_POSITION_ORDERED
+    } else {
+        0
+    };
     if run_length_bytes < bitpacked_bytes {
-        encoded.push(PACKED_IDS_RUN_LENGTH);
+        encoded.push(PACKED_IDS_RUN_LENGTH | position_flag);
         encoded.extend_from_slice(&run_length);
     } else {
-        encoded.push(PACKED_IDS_BITPACKED);
+        encoded.push(PACKED_IDS_BITPACKED | position_flag);
         append_bytes(encoded, &column.values)?;
     }
     Ok(())
@@ -3214,7 +3251,8 @@ fn decode_packed_column(
     encoded: &[u8],
     cursor: &mut usize,
     record_count: u32,
-) -> TelemetryResult<(u32, PackedIdColumn)> {
+    allow_position_flag: bool,
+) -> TelemetryResult<(u32, PackedIdColumn, bool)> {
     let dictionary_count = read_u32(encoded, cursor)?;
     if (record_count == 0 && dictionary_count != 0)
         || (record_count != 0 && (dictionary_count == 0 || dictionary_count > record_count))
@@ -3229,7 +3267,14 @@ fn decode_packed_column(
         .checked_mul(usize::from(bits_per_id))
         .ok_or(TelemetryError::RecordTooLarge)?
         .div_ceil(u8::BITS as usize);
-    let encoding = read_byte(encoded, cursor)?;
+    let encoded_kind = read_byte(encoded, cursor)?;
+    let position_ordered = encoded_kind & PACKED_IDS_POSITION_ORDERED != 0;
+    if position_ordered && !allow_position_flag {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "packed ID column has an unexpected position-order flag",
+        ));
+    }
+    let encoding = encoded_kind & !PACKED_IDS_POSITION_ORDERED;
     let values = match encoding {
         PACKED_IDS_BITPACKED => {
             let values = read_bytes(encoded, cursor)?.to_vec();
@@ -3304,7 +3349,7 @@ fn decode_packed_column(
             ));
         }
     }
-    Ok((dictionary_count, column))
+    Ok((dictionary_count, column, position_ordered))
 }
 
 fn encode_sorted_ids(ids: &[u32], upper_bound: u32, encoded: &mut Vec<u8>) -> TelemetryResult<()> {
@@ -3799,6 +3844,18 @@ mod tests {
         let recovered =
             decode_embedded_frame_index(&indexed.structural).expect("embedded index recovers");
         assert_eq!(recovered, indexed.index);
+        assert!(recovered.timestamp_offset_ordinal_ordered());
+
+        let mut unordered = records.clone();
+        unordered[1].timestamp_unix_nanos = 1;
+        let unordered = encode_indexed_structural_records(&unordered)
+            .expect("unordered indexed structural block encodes");
+        assert!(!unordered.index.timestamp_offset_ordinal_ordered());
+        assert_eq!(
+            decode_embedded_frame_index(&unordered.structural)
+                .expect("unordered embedded index recovers"),
+            unordered.index
+        );
 
         let assert_query = |candidate_ordinals: Vec<u32>, query: LogQuery| {
             let candidates = decode_structural_records(&indexed.structural, &candidate_ordinals)
@@ -3852,7 +3909,7 @@ mod tests {
         let repeated_ids = vec![1_u32; 4_096];
         let repeated = pack_ids(&repeated_ids, 2).expect("repeated IDs pack");
         let mut repeated_encoded = Vec::new();
-        encode_packed_column(&repeated, 2, 4_096, &mut repeated_encoded)
+        encode_packed_column(&repeated, 2, 4_096, false, &mut repeated_encoded)
             .expect("repeated column encodes");
         let mut cursor = 0;
         assert_eq!(read_u32(&repeated_encoded, &mut cursor).unwrap(), 2);
@@ -3861,14 +3918,16 @@ mod tests {
             PACKED_IDS_RUN_LENGTH
         );
         cursor = 0;
-        let (_, decoded) = decode_packed_column(&repeated_encoded, &mut cursor, 4_096).unwrap();
+        let (_, decoded, position_ordered) =
+            decode_packed_column(&repeated_encoded, &mut cursor, 4_096, true).unwrap();
+        assert!(!position_ordered);
         assert_eq!(decoded, repeated);
         require_consumed(&repeated_encoded, cursor).unwrap();
 
         let alternating_ids = (0..4_096).map(|ordinal| ordinal & 1).collect::<Vec<_>>();
         let alternating = pack_ids(&alternating_ids, 2).expect("alternating IDs pack");
         let mut alternating_encoded = Vec::new();
-        encode_packed_column(&alternating, 2, 4_096, &mut alternating_encoded)
+        encode_packed_column(&alternating, 2, 4_096, false, &mut alternating_encoded)
             .expect("alternating column encodes");
         cursor = 0;
         assert_eq!(read_u32(&alternating_encoded, &mut cursor).unwrap(), 2);
@@ -3877,7 +3936,9 @@ mod tests {
             PACKED_IDS_BITPACKED
         );
         cursor = 0;
-        let (_, decoded) = decode_packed_column(&alternating_encoded, &mut cursor, 4_096).unwrap();
+        let (_, decoded, position_ordered) =
+            decode_packed_column(&alternating_encoded, &mut cursor, 4_096, true).unwrap();
+        assert!(!position_ordered);
         assert_eq!(decoded, alternating);
         require_consumed(&alternating_encoded, cursor).unwrap();
     }

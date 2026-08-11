@@ -230,8 +230,8 @@ CREATE TABLE benchmark.shard_trace_lookup
     name Nullable(String)
 )
 ENGINE = URL(
-    'http://127.0.0.1:$SHARD_HTTP_PORT/shardtelemetry/api/v1/clickhouse/scan?relation=spans&columns=timestamp%2Cname&trace_id=$TRACE_ID_HEX&limit=32',
-    ArrowStream,
+    'http://127.0.0.1:$SHARD_HTTP_PORT/shardtelemetry/api/v1/clickhouse/scan?relation=spans&columns=timestamp%2Cname&trace_id=$TRACE_ID_HEX&limit=32&wire=rowbinary',
+    RowBinary,
     headers('Authorization' = 'Bearer $CLICKHOUSE_TOKEN', 'X-Scope-OrgID' = '$TENANT')
 );
 
@@ -241,8 +241,8 @@ CREATE TABLE benchmark.shard_metric_lookup
     scalar_double_bits Nullable(UInt64)
 )
 ENGINE = URL(
-    'http://127.0.0.1:$SHARD_HTTP_PORT/shardtelemetry/api/v1/clickhouse/scan?relation=metric_points&columns=timestamp%2Cscalar_double_bits&series_id=$SERIES_ID_HEX&limit=3000',
-    ArrowStream,
+    'http://127.0.0.1:$SHARD_HTTP_PORT/shardtelemetry/api/v1/clickhouse/scan?relation=metric_points&columns=timestamp%2Cscalar_double_bits&series_id=$SERIES_ID_HEX&limit=3000&wire=rowbinary',
+    RowBinary,
     headers('Authorization' = 'Bearer $CLICKHOUSE_TOKEN', 'X-Scope-OrgID' = '$TENANT')
 );
 
@@ -252,8 +252,8 @@ CREATE TABLE benchmark.shard_resource_lookup
     name Nullable(String)
 )
 ENGINE = URL(
-    'http://127.0.0.1:$SHARD_HTTP_PORT/shardtelemetry/api/v1/clickhouse/scan?relation=spans&columns=timestamp%2Cname&resource.service.name=$SERVICE_NAME&limit=1000',
-    ArrowStream,
+    'http://127.0.0.1:$SHARD_HTTP_PORT/shardtelemetry/api/v1/clickhouse/scan?relation=spans&columns=timestamp%2Cname&resource.service.name=$SERVICE_NAME&limit=1000&wire=rowbinary',
+    RowBinary,
     headers('Authorization' = 'Bearer $CLICKHOUSE_TOKEN', 'X-Scope-OrgID' = '$TENANT')
 );
 "

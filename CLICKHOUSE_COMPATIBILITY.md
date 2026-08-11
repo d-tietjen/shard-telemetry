@@ -1,273 +1,212 @@
 # ClickHouse query compatibility
 
-ShardTelemetry delegates analytical SQL semantics to a pinned ClickHouse query node
-and remains responsible for log ingestion, indexing, compression, and tiered
-storage. The query evaluator remains unmodified. Production automatic pushdown
-uses the narrow in-tree `StorageShardTelemetry` adapter described below; the generic
-URL path remains available for an entirely stock ClickHouse binary. The pinned
-compatibility target is source tag `v26.3.17.56-lts` at commit
-`c57540de480d8a501b601163471d3843674378cf`. The custom Adam binary has
-SHA-256 `1c8b28af4b209a1cdf127b8eac1220deb63d54f1142d277df1954b58e0bcfd66`.
+ShardTelemetry's ClickHouse integration is implemented entirely in Rust. The
+server exposes authenticated, typed telemetry relations over HTTP; an
+unmodified ClickHouse query node reads those relations with its built-in `URL`
+engine. ShardTelemetry does not patch, fork, or compile code into ClickHouse.
 
-This boundary makes ClickHouse, rather than a second SQL implementation, the
-semantic authority for expressions, types, aggregate functions, joins,
-subqueries, common table expressions, window functions, JSON functions,
-materialized views, output formats, and query errors. Clients that need this
-surface connect to ClickHouse. Loki, OTLP, and ShardTelemetry-native clients continue
-to connect directly to ShardTelemetry.
+ClickHouse remains the semantic authority for expressions, aggregates, joins,
+subqueries, common table expressions, windows, JSON functions, materialized
+views, output formats, and query errors. ShardTelemetry remains responsible for
+telemetry ingestion, indexing, compression, retention, and tiered storage.
 
-## Versioned columnar source
+The compatibility target is ClickHouse `26.3.17.56` LTS. This design preserves
+the existing ClickHouse client and SQL surface without adding C++ to the
+ShardTelemetry product or requiring a custom ClickHouse binary.
 
-The first executable adapter is a versioned Arrow IPC stream:
+## Rust analytical source
+
+The v1 endpoint is:
 
 ```text
 GET /shardtelemetry/api/v1/clickhouse/scan
 ```
 
-The route is absent by default. It is registered only when
-`shard-telemetry-server` receives `--clickhouse-token-file`. Every request must send
-the exact token as `Authorization: Bearer ...`. The file must contain a
-non-empty token. Treat this as an administrative credential: the holder may
-select a tenant with `X-Scope-OrgID`.
+The route is absent unless `shard-telemetry-server` receives
+`--clickhouse-token-file`. Every request must send the exact token as
+`Authorization: Bearer ...`; `X-Scope-OrgID` selects the authenticated tenant.
+Run the endpoint on loopback or behind an authenticated TLS/mTLS proxy.
 
-Run the endpoint on loopback or behind an authenticated TLS/mTLS proxy. Do not
-send the bearer token over an untrusted plaintext network.
+The endpoint exposes these fixed relations:
 
-The Arrow schema is version 1. The endpoint accepts one fixed `relation`:
-`logs`, `spans`, `span_events`, `span_links`, `metric_points`, or
-`metric_exemplars`. Omitting it selects `logs`. The complete pinned schemas
-and ClickHouse types are executable in `clickhouse/shard-telemetry-engine.sql`.
+- `logs`
+- `spans`
+- `span_events`
+- `span_links`
+- `metric_points`
+- `metric_exemplars`
 
-The log relation begins with:
+The complete ClickHouse schemas and the derived `traces` view are executable in
+`clickhouse/shard-telemetry-engine.sql`.
 
-| Column | Arrow type | ClickHouse type | Meaning |
-| --- | --- | --- | --- |
-| `tenant` | `Utf8` | `String` | Authenticated tenant |
-| `signal` | `Utf8` | `String` | Parent telemetry signal |
-| `timestamp` | `Timestamp(Nanosecond, UTC)` | `DateTime64(9, 'UTC')` | Event time |
-| `observed_timestamp` | nullable nanosecond timestamp | `Nullable(DateTime64(9, 'UTC'))` | Independent OTLP observed time |
-| `partition` | `UInt32` | `UInt32` | Logical partition |
-| `offset` | `UInt64` | `UInt64` | Durable offset |
-| `message` | nullable `Utf8` | `Nullable(String)` | Original log line |
-| `labels` | `Map<Utf8, Utf8>` | `Map(String, String)` | Loki stream labels |
-| `metadata` | `Map<Utf8, Utf8>` | `Map(String, String)` | Structured metadata |
+Two lossless Rust encoders are available:
 
-The response content type is `application/vnd.apache.arrow.stream` and carries
-`X-ShardTelemetry-Schema-Version: 1` plus the pinned ClickHouse target.
+- `wire=rowbinary` streams ClickHouse RowBinary and is used by the persistent
+  stock-ClickHouse tables.
+- `wire=arrow` streams Arrow IPC for columnar clients and ad hoc `url(...)`
+  queries.
 
-Every relation is streamed in bounded 8,192-row batches. The HTTP layer never
-materializes a complete tenant. Durable scans page logical partitions by
-offset and query owner stripes in parallel. Conflict resolution occurs before
-the offset cursor is applied, preventing an older span or metric version from
-reappearing on a later page.
+Responses are emitted in bounded batches. The Rust service never materializes
+an entire tenant. Durable scans query owner stripes in parallel, page by stable
+offset, and resolve span or metric conflicts before applying the cursor.
 
-## Storage pushdown contract
+## Stock ClickHouse tables
 
-The URL query accepts these fail-closed parameters:
+The production relation uses ClickHouse's built-in `URL` engine:
+
+```sql
+CREATE TABLE shardtelemetry.logs
+(
+    tenant String,
+    signal String,
+    timestamp DateTime64(9, 'UTC'),
+    observed_timestamp Nullable(DateTime64(9, 'UTC')),
+    partition UInt32,
+    offset UInt64,
+    resource_id Nullable(String),
+    scope_id Nullable(String),
+    trace_id Nullable(String),
+    span_id Nullable(String),
+    message Nullable(String),
+    body_json Nullable(String),
+    severity_number Nullable(Int32),
+    severity_text Nullable(String),
+    event_name Nullable(String),
+    flags Nullable(UInt32),
+    dropped_attributes_count Nullable(UInt32),
+    labels Map(String, String),
+    metadata Map(String, String),
+    attributes Map(String, String),
+    resource_attributes Map(String, String),
+    scope_attributes Map(String, String),
+    attribute_ids Map(String, String),
+    resource_attribute_ids Map(String, String),
+    scope_attribute_ids Map(String, String),
+    attributes_json Nullable(String),
+    resource_attributes_json Nullable(String),
+    scope_attributes_json Nullable(String)
+)
+ENGINE = URL(
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan?relation=logs&wire=rowbinary',
+    'RowBinary',
+    headers(
+        'Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE',
+        'X-Scope-OrgID' = 'fake'
+    )
+);
+```
+
+ClickHouse stores engine headers in table metadata. Production deployments
+must inject a short-lived token or route through a trusted local proxy rather
+than committing a credential to SQL.
+
+## Explicit Rust pushdown
+
+The endpoint accepts these fail-closed parameters:
 
 | Parameter | Behavior |
 | --- | --- |
 | `start_ns` | Inclusive unsigned Unix-nanosecond timestamp |
 | `end_ns` | Exclusive unsigned Unix-nanosecond timestamp |
-| `term` | Repeatable case-insensitive indexed message token; AND semantics |
+| `term` | Repeatable case-insensitive indexed log token; AND semantics |
 | `label.NAME` | Repeatable exact stream-label equality |
 | `metadata.NAME` | Repeatable exact structured-metadata equality |
 | `attribute.NAME` | Repeatable exact rendered record-attribute equality |
 | `resource.NAME` | Repeatable exact rendered resource-attribute equality |
 | `scope.NAME` | Repeatable exact rendered scope-attribute equality |
-| `trace_id` | Exact lowercase or uppercase 128-bit hex trace ID |
-| `span_id` | Exact lowercase or uppercase 64-bit hex span ID |
+| `trace_id` | Exact 128-bit hexadecimal trace ID |
+| `span_id` | Exact 64-bit hexadecimal span ID |
 | `series_id` | Exact 128-bit metric-series fingerprint |
 | `name` | Exact span, event, or metric name |
-| `columns` | Comma-separated projection in requested output order |
+| `columns` | Comma-separated output order |
 | `limit` | Optional global row limit |
+| `wire` | `rowbinary`, `arrow`, or `arrow_stream` |
 
-Unknown parameters, columns, empty column lists, duplicate columns, and invalid
-ranges are rejected. Safe constraints are translated to `LogQuery`,
-`TraceQuery`, or `MetricQuery`; every decoded row is then checked against the
-complete request before it is emitted. Column selection controls which Arrow
-arrays are allocated and transmitted.
+Unknown parameters, columns, duplicate columns, invalid ranges, and invalid IDs
+are rejected. Safe constraints are translated directly into `LogQuery`,
+`TraceQuery`, or `MetricQuery`, and emitted rows are checked against the full
+request before serialization.
 
-The generic ClickHouse `URL` engine does not infer these parameters from a SQL
-`WHERE` clause. It therefore supports explicit pushdown in the source URL.
+Stock ClickHouse does not translate an arbitrary SQL `WHERE` clause into these
+URL parameters. Persistent URL tables therefore retain exact SQL semantics but
+do not receive automatic storage pushdown. Callers that construct `url(...)`
+sources may include explicit parameters, and ShardTelemetry-native APIs use the
+same indexes directly. Automatic SQL-plan pushdown would require a separate
+Rust SQL gateway and is not claimed by this release.
 
-The pinned `StorageShardTelemetry` adapter in `clickhouse/adapter` subclasses
-ClickHouse's `StorageURL` and overrides only its URI-parameter hook. It obtains
-the physical projection and analyzed filter DAG from `SelectQueryInfo` and
-automatically translates safe timestamp and exact map equalities into the same
-scan contract. The original filter remains in ClickHouse as a residual, so an
-unsupported expression loses performance rather than correctness. See
-`clickhouse/adapter/README.md` for installation, DDL, and the exact pushdown
-rules.
+## Cross-signal analytics
 
-## ClickHouse source
-
-With ShardTelemetry listening locally and the token supplied by a protected secret
-source, ClickHouse can query the stream directly:
+Stable trace/span IDs, series IDs, resource/scope IDs, and typed-attribute
+fingerprints support exact joins across relations:
 
 ```sql
 SELECT
-    labels['service_name'] AS service,
-    count() AS records,
-    quantileTDigest(0.99)(lengthUTF8(message)) AS p99_message_bytes
-FROM shardtelemetry.logs
-GROUP BY service
-ORDER BY records DESC;
+    spans.name,
+    count() AS matching_logs,
+    uniqExact(metric_exemplars.series_id) AS metric_series
+FROM shardtelemetry.logs AS logs
+INNER JOIN shardtelemetry.spans AS spans
+    USING (tenant, trace_id, span_id)
+LEFT JOIN shardtelemetry.metric_exemplars AS metric_exemplars
+    USING (tenant, trace_id, span_id)
+GROUP BY spans.name
+ORDER BY matching_logs DESC;
 ```
 
-`clickhouse/shard-telemetry-url.sql` contains a generic URL example and
-`clickhouse/shard-telemetry-engine.sql` contains every automatic-pushdown
-relation and the derived trace view.
-ClickHouse stores engine headers in table metadata, so production
-deployments should inject a short-lived credential or use a trusted local
-proxy rather than committing a token to SQL.
+`clickhouse/shard-telemetry-engine.sql` defines every persistent URL table and
+the trace summary view. `clickhouse/shard-telemetry-url.sql` contains an ad hoc
+table-function example.
 
-## Differential gate
+## Differential gates
 
-`scripts/run-clickhouse-compatibility.sh` retains the log matrix.
-`scripts/run-clickhouse-telemetry-compatibility.sh` adds every trace/metric
-relation, relation-specific aggregates and windows, topology queries, and
-cross-signal joins by trace/span, exemplar, and resource identity. Both
-evaluate the same deterministic query against:
+`scripts/run-clickhouse-compatibility.sh` validates logs.
+`scripts/run-clickhouse-telemetry-compatibility.sh` adds every trace and metric
+relation plus topology and cross-signal joins. Both compare the same query over:
 
-1. the live ShardTelemetry Arrow source; and
-2. an equivalent ClickHouse `Memory` table populated from that source.
+1. the live Rust RowBinary source through stock ClickHouse `url(...)`; and
+2. a ClickHouse `Memory` table populated from that source.
 
-It compares exact serialized results for filters, native-map grouping,
-conditional and exact aggregates, arrays, windows, CTEs, joins, timestamp/map
-predicates, mixed residual predicates, disjunctions, missing-map default-value
-semantics, aliases, subqueries, and aggregate combinators. The harness refuses
+The matrix covers exact cardinality, maps, missing-map defaults, timestamp and
+message filters, arrays, windows, CTEs, aliases, aggregate combinators, joins,
+events, links, exemplars, and resource/trace correlations. The harness refuses
 a ClickHouse version other than `26.3.17.56` unless
-`STRICT_CLICKHOUSE_VERSION=0` is supplied for developer smoke testing.
+`STRICT_CLICKHOUSE_VERSION=0` is explicitly selected for development.
 
-Set `SHARD_TELEMETRY_ADAPTER_MODE=1`, or run
-`scripts/run-clickhouse-adapter-compatibility.sh`, to create a
-`StorageShardTelemetry` source table and exercise automatic pushdown. Adapter mode
-requires a ClickHouse binary or image built with the pinned adapter.
+`scripts/run-clickhouse-acceptance.sh` creates the correlated fixture, starts
+the Rust server, runs both matrices through a pinned official ClickHouse image,
+and retains hashes, versions, metrics, and exact results in a new evidence
+directory.
 
-This proves the adapter and evaluator path; it does not replace the larger
-compatibility corpus. The release gate is the applicable ClickHouse SQL test
-suite plus generated differential combinations of nullable values, nested
-types, aliases, lambdas, aggregate combinators, joins, windows, and errors.
+The current Adam acceptance run passed all 30 cases against the unmodified
+official ClickHouse `26.3.17.56` image: 18 log cases and 12 trace, metric, and
+cross-signal cases. Retained evidence is:
+
+```text
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-stock-url-20260806-v1/acceptance-3-26.3
+```
+
+The end-to-end comparison is `scripts/run-clickhouse-head-to-head.sh`. It uses
+the official pinned ClickHouse image, equal source bytes, identical physical
+CPUs, exact row counts, and byte-identical result checks. No custom ClickHouse
+binary or ClickHouse source checkout is accepted by the harness.
 
 ## Compatibility status
 
 | Area | Status |
 | --- | --- |
-| ClickHouse `SELECT` evaluator semantics | Supplied by pinned ClickHouse |
-| Bounded typed ShardTelemetry scan | Implemented |
+| ShardTelemetry implementation | Rust only |
+| ClickHouse query node | Unmodified official binary |
 | Logs, spans, events, links, metric points, and exemplars | Implemented in schema v1 |
-| Derived trace summaries and cross-signal joins | Implemented in pinned ClickHouse DDL |
 | Authentication and tenant selection | Implemented; route disabled by default |
-| Explicit timestamp/term/label/metadata pushdown | Implemented |
-| Explicit column selection | Implemented |
-| Automatic plan-to-scan pushdown | Implemented and accepted for columns, timestamp bounds/order, exact ID/name/map equality, exact message tokens, cardinality, and safe limits |
-| ClickHouse native/HTTP client surface | Supplied by ClickHouse query node |
-| All-signal differential SQL matrix | Passed through the custom adapter and pinned evaluator: 30/30 exact-result cases |
-| Full ClickHouse SQL regression corpus | Pending import and classification |
-| Controlled 1 GiB real-log benchmark | Passed with exact results; ShardTelemetry was 2.25x smaller and ingested 1.78x faster |
-| 80 GiB warm analytical benchmark | Passed with exact results: 607,363,459 rows; ShardTelemetry was 2.25x smaller, ClickHouse ingested 1.58x faster; ShardTelemetry won latest/token p50 and lost exact-stream p50 |
-| Cold S3-compatible analytical benchmark | Pending; the current cold-tier result is a local immutable-object/cache ablation |
+| Exact SQL evaluator semantics | Supplied by pinned stock ClickHouse |
+| Derived traces and cross-signal joins | Implemented in stock ClickHouse DDL |
+| Explicit indexed pushdown | Implemented in the Rust scan endpoint |
+| Automatic SQL-plan pushdown | Not claimed; stock URL tables evaluate residual SQL in ClickHouse |
+| Differential SQL matrix | Passed 30/30 through stock URL/RowBinary on ClickHouse 26.3.17.56 |
+| Full upstream ClickHouse SQL corpus | Pending import and classification |
+| Cold object-tier analytical benchmark | Pending |
 
-## Current custom-adapter acceptance
-
-The retained Adam gate is:
-
-```text
-/home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-adapter-20260804-v1/acceptance-17
-```
-
-It passed 30/30 exact-result cases: 18 log queries, nine span/event/link/metric/
-exemplar queries, and three joins through trace, exemplar, and resource
-identity. It includes ordered residual filters, case-sensitive and
-case-insensitive exact token pushdown, cardinality, maps, windows, aggregate
-combinators, topology, and correlations. The custom adapter retains the
-original ClickHouse predicate as a residual; a pushdown miss can add work but
-cannot change results.
-
-The controlled real-log run `benchmark-1g-attempt13` then queried the live
-ShardTelemetry source and MergeTree sequentially on CPUs 0–15. All three
-ordered result files were byte-identical. ShardTelemetry stored 33,958,025
-bytes versus 76,288,534 bytes and ingested at 123.20 MiB/s versus 69.14 MiB/s.
-This is an accepted adapter/storage comparison, but it is not evidence of the
-separate 1 GiB/s-per-core target.
-
-The authoritative full-corpus run is `benchmark-80g-final-attempt3`. Both
-engines accepted 85,899,345,920 bytes and produced exactly 607,363,459 rows.
-ShardTelemetry stored 2,702,973,946 bytes at 31.78x and ingested at 148.60
-MiB/s. ClickHouse stored 6,091,870,726 active-part bytes at 14.10x and ingested
-at 234.80 MiB/s. Across 20 warm iterations, ShardTelemetry versus ClickHouse
-p50/p99 was 70/82 versus 767/807 ms for latest records, 69/76 versus 6/6 ms for
-exact stream, and 100/123 versus 1,715/1,833 ms for a case-insensitive indexed
-token. All three ordered result files were byte-identical.
-
-## Initial acceptance evidence
-
-On 2026-07-31, the differential smoke ran on Adam against the exact official
-ClickHouse `26.3.17.56` image above. The final native-map Arrow stream had
-SHA-256 `be3c7f12f4ecbcee5132c1474521e49008cfd6ea0fee5c96647b1f2b8883c01d`.
-Three synthetic records covered two streams, labels, metadata, multiple
-timestamps, and case-varying error terms. The initial six gates and the
-expanded predicate/semantic gates all produced byte-identical serialized
-results:
-
-```text
-PASS row-count
-PASS group-map
-PASS aggregates
-PASS window
-PASS cte-array
-PASS self-join
-PASS timestamp-map-filter
-PASS mixed-residual
-PASS disjunction
-PASS missing-map-key
-PASS missing-map-equality
-PASS alias-subquery
-PASS aggregate-combinators
-ClickHouse compatibility smoke passed with 26.3.17.56
-```
-
-The exact 26.3 analyzer was also inspected on Adam. It rewrites constant map
-lookups to dynamic inputs such as `labels.key_app` and `metadata.key_code` and
-constant-folds time bounds to `DateTime64(9, 'UTC')` values. The adapter handles
-those canonical forms using ClickHouse's own String text deserializer and
-retains every original filter as a residual.
-
-On 2026-08-04, the expanded schema-v1 matrix ran against a live
-ShardTelemetry fixture containing a correlated log, span, span event, span
-link, metric point, and metric exemplar. The exact official ClickHouse
-`26.3.17.56` evaluator image for the local architecture had manifest digest
-`sha256:422be85ae7344058369cdd366ac0efea9daa8428b55c9cf50258e83a7d12fcb3`.
-All 13 log cases and all 12 signal/correlation cases returned byte-identical
-results against ClickHouse `Memory` snapshots:
-
-```text
-PASS span-aggregates
-PASS span-window
-PASS span-map-filter
-PASS event-group
-PASS link-topology
-PASS metric-aggregates
-PASS metric-window
-PASS metric-map-filter
-PASS exemplar-group
-PASS log-span-correlation
-PASS exemplar-span-correlation
-PASS resource-correlation
-All-signal ClickHouse analytical compatibility passed
-```
-
-The adapter installer was separately applied twice, idempotently, to a shallow
-checkout at exact tag `v26.3.17.56-lts`. The retained custom binary was then
-built from commit `c57540de480d8a501b601163471d3843674378cf`; its SHA-256 is
-`1c8b28af4b209a1cdf127b8eac1220deb63d54f1142d277df1954b58e0bcfd66`.
-The 30-case acceptance and full 80 GiB run above both use that binary.
-
-ShardTelemetry must not claim to be a standalone reimplementation of the
-ClickHouse server. The supported drop-in boundary is a ShardTelemetry storage
-backend beneath the pinned ClickHouse query node: existing ClickHouse clients
-and `SELECT` analytics keep ClickHouse semantics while telemetry data resides
-in ShardTelemetry. The full upstream SQL corpus remains required before a
-broad compatibility release claim. The pinned custom-adapter functional and
-performance gates are complete.
+Historical measurements produced with the removed C++ prototype remain useful
+as storage-codec and native-query evidence, but they are not release evidence
+for the supported stock-ClickHouse boundary. Publish comparative ClickHouse
+URL-table latency only from the stock harness.

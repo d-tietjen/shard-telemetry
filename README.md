@@ -149,20 +149,19 @@ correctness boundary, persistent format, and measured lookup costs.
 
 ## ClickHouse analytical compatibility
 
-ShardTelemetry exposes opt-in authenticated Arrow IPC relations for logs,
-spans, span events, span links, raw metric points, and metric exemplars to the
-pinned ClickHouse 26.3.17.56 LTS evaluator. A derived `traces` view summarizes
-the winning spans of each trace. Stable trace/span IDs, series IDs,
+ShardTelemetry exposes opt-in authenticated RowBinary and Arrow IPC relations
+for logs, spans, span events, span links, raw metric points, and metric exemplars to
+the pinned ClickHouse 26.3.17.56 LTS evaluator. A derived `traces` view
+summarizes the winning spans of each trace. Stable trace/span IDs, series IDs,
 resource/scope IDs, and typed-attribute fingerprints make cross-signal joins
-exact. A stock ClickHouse binary can use generic URL sources; the narrow
-`StorageShardTelemetry` adapter adds automatic column, timestamp, ID, name,
-and map-equality pushdown. ShardTelemetry streams bounded columnar batches while
-ClickHouse remains responsible for expressions, aggregates, joins, windows,
-JSON functions, subqueries, materialized views, protocols, and formats.
+exact. An unmodified ClickHouse binary reads the Rust service through its
+built-in `URL` engine. ShardTelemetry streams bounded batches while ClickHouse
+remains responsible for expressions, aggregates, joins, windows, JSON
+functions, subqueries, materialized views, protocols, and formats.
 
 The scan route is absent unless `--clickhouse-token-file` is supplied. See
 [CLICKHOUSE_COMPATIBILITY.md](CLICKHOUSE_COMPATIBILITY.md) for the schema,
-security requirements, adapter installation, differential harness, and
+security requirements, stock-ClickHouse DDL, differential harness, and
 remaining production acceptance gates.
 
 ## Thread-local compression and dictionary reuse
@@ -403,7 +402,7 @@ immutable corpus, 16 physical cores, and source prewarm. It runs the
 production-default locality-disabled path before ClickHouse:
 
 ```text
-scripts/run-clickhouse-adapter-head-to-head.sh
+scripts/run-clickhouse-head-to-head.sh
 ```
 
 It verifies the 80 GiB source checksum, pins both engines to CPUs `0-15`,
