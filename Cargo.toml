@@ -23,7 +23,7 @@ exclude = [
 [workspace]
 
 [dependencies]
-arrow-array = "58.1"
+arrow-array = "59.2"
 arrow-ipc = "58.1"
 arrow-schema = "58.1"
 axum = { version = "0.8", features = ["ws"] }
