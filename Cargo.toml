@@ -45,7 +45,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 fs2 = "0.4"
 libdeflater = "1.25"
 lz4 = "1.28"
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 lzfse = "0.2"
 lzfse_rust = "0.2"
 lzma-rust2 = "0.16"
