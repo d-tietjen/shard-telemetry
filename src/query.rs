@@ -119,6 +119,21 @@ impl LogQuery {
             || !predicate_is_index_only_conjunction(&self.predicate)
     }
 
+    pub(crate) fn has_residual_predicate(&self) -> bool {
+        !predicate_is_index_only_conjunction(&self.predicate)
+    }
+
+    pub(crate) fn message_candidate_matches(&self, message: &str) -> Option<bool> {
+        if !self
+            .terms
+            .iter()
+            .all(|expected| message_has_term(message, expected))
+        {
+            return Some(false);
+        }
+        message_only_predicate_matches(&self.predicate, message)
+    }
+
     pub(crate) fn matches_index_candidate<R: StructuralRecordView>(&self, record: &R) -> bool {
         self.offset_matches(record.structural_offset())
             && self.timestamp_matches(record.structural_timestamp_unix_nanos())
@@ -189,6 +204,9 @@ fn collect_required_constraints<'a>(
         LogPredicate::MatchAll => {}
         LogPredicate::MatchNone => constraints.impossible = true,
         LogPredicate::Term(term) => constraints.terms.push(term),
+        LogPredicate::MessageToken { value, .. } if clickhouse_token_is_index_safe(value) => {
+            constraints.terms.push(value);
+        }
         LogPredicate::Field { key, matcher }
             if matcher.kind == TextMatchKind::Exact
                 && matcher.case_sensitivity == CaseSensitivity::Sensitive =>
@@ -203,7 +221,8 @@ fn collect_required_constraints<'a>(
         LogPredicate::Message(matcher) => {
             constraints.message_literals.push(matcher.value.as_ref());
         }
-        LogPredicate::MessageRegex(_)
+        LogPredicate::MessageToken { .. }
+        | LogPredicate::MessageRegex(_)
         | LogPredicate::FieldExists(_)
         | LogPredicate::Field { .. }
         | LogPredicate::FieldIn { .. }
@@ -229,7 +248,8 @@ fn predicate_is_index_only_conjunction(predicate: &LogPredicate) -> bool {
             ..
         } => true,
         LogPredicate::And(predicates) => predicates.iter().all(predicate_is_index_only_conjunction),
-        LogPredicate::Message(_)
+        LogPredicate::MessageToken { .. }
+        | LogPredicate::Message(_)
         | LogPredicate::MessageRegex(_)
         | LogPredicate::FieldExists(_)
         | LogPredicate::Field { .. }
@@ -246,6 +266,10 @@ fn predicate_matches<R: StructuralRecordView>(predicate: &LogPredicate, record: 
         LogPredicate::MatchAll => true,
         LogPredicate::MatchNone => false,
         LogPredicate::Term(term) => message_has_term(record.structural_message(), term),
+        LogPredicate::MessageToken {
+            value,
+            case_sensitivity,
+        } => message_has_clickhouse_token(record.structural_message(), value, *case_sensitivity),
         LogPredicate::Message(matcher) => text_matches(record.structural_message(), matcher),
         LogPredicate::MessageRegex(regex) => regex.is_match(record.structural_message()),
         LogPredicate::FieldExists(key) => {
@@ -279,6 +303,46 @@ fn predicate_matches<R: StructuralRecordView>(predicate: &LogPredicate, record: 
     }
 }
 
+fn message_only_predicate_matches(predicate: &LogPredicate, message: &str) -> Option<bool> {
+    match predicate {
+        LogPredicate::MatchAll => Some(true),
+        LogPredicate::MatchNone => Some(false),
+        LogPredicate::Term(term) => Some(message_has_term(message, term)),
+        LogPredicate::MessageToken {
+            value,
+            case_sensitivity,
+        } => Some(message_has_clickhouse_token(
+            message,
+            value,
+            *case_sensitivity,
+        )),
+        LogPredicate::Message(matcher) => Some(text_matches(message, matcher)),
+        LogPredicate::MessageRegex(regex) => Some(regex.is_match(message)),
+        LogPredicate::And(predicates) => {
+            let mut matched = true;
+            for predicate in predicates {
+                matched &= message_only_predicate_matches(predicate, message)?;
+            }
+            Some(matched)
+        }
+        LogPredicate::Or(predicates) => {
+            let mut matched = false;
+            for predicate in predicates {
+                matched |= message_only_predicate_matches(predicate, message)?;
+            }
+            Some(matched)
+        }
+        LogPredicate::Not(predicate) => {
+            message_only_predicate_matches(predicate, message).map(|value| !value)
+        }
+        LogPredicate::FieldExists(_)
+        | LogPredicate::Field { .. }
+        | LogPredicate::FieldIn { .. }
+        | LogPredicate::FieldRegex { .. }
+        | LogPredicate::FieldNumeric { .. } => None,
+    }
+}
+
 fn fields<R: StructuralRecordView>(record: &R) -> impl Iterator<Item = (&str, &str)> {
     (0..record.structural_field_count()).filter_map(|index| record.structural_field(index))
 }
@@ -294,6 +358,42 @@ pub(crate) fn message_has_term(message: &str, expected: &str) -> bool {
         matched |= text_equal(term, expected, CaseSensitivity::Insensitive);
     });
     matched
+}
+
+pub(crate) fn message_has_clickhouse_token(
+    message: &str,
+    expected: &str,
+    case_sensitivity: CaseSensitivity,
+) -> bool {
+    let expected = expected.as_bytes();
+    if expected.is_empty() || expected.iter().copied().any(clickhouse_token_separator) {
+        return false;
+    }
+    let message = message.as_bytes();
+    if expected.len() > message.len() {
+        return false;
+    }
+    message
+        .windows(expected.len())
+        .enumerate()
+        .any(|(start, candidate)| {
+            let bytes_match = match case_sensitivity {
+                CaseSensitivity::Sensitive => candidate == expected,
+                CaseSensitivity::Insensitive => candidate.eq_ignore_ascii_case(expected),
+            };
+            bytes_match
+                && (start == 0 || clickhouse_token_separator(message[start - 1]))
+                && (start + expected.len() == message.len()
+                    || clickhouse_token_separator(message[start + expected.len()]))
+        })
+}
+
+fn clickhouse_token_is_index_safe(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+const fn clickhouse_token_separator(byte: u8) -> bool {
+    byte.is_ascii() && !(byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn text_matches(observed: &str, matcher: &TextMatcher) -> bool {
@@ -369,10 +469,10 @@ mod tests {
     use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
     use super::*;
-    use crate::{CompressionCohortId, DurableLogRecord, LogRegex};
+    use crate::{CompressionCohortId, DurableLog, LogRegex};
 
-    fn record(message: &str) -> DurableLogRecord {
-        DurableLogRecord::new(
+    fn record(message: &str) -> DurableLog {
+        DurableLog::new(
             ShardId::new(1),
             TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(2)),
             LogicalOffset::new(7),
@@ -417,11 +517,50 @@ mod tests {
     fn invalid_regular_expressions_are_rejected_at_query_construction() {
         let error =
             LogRegex::new("(", CaseSensitivity::Sensitive).expect_err("invalid regex is rejected");
-        assert!(matches!(error, crate::LogDbError::InvalidQuery(_)));
+        assert!(matches!(error, crate::TelemetryError::InvalidQuery(_)));
     }
 
     #[test]
     fn empty_literal_contains_matches_without_panicking() {
         assert!(text_contains("anything", "", CaseSensitivity::Insensitive));
+    }
+
+    #[test]
+    fn clickhouse_tokens_preserve_case_and_ascii_boundaries() {
+        assert!(message_has_clickhouse_token(
+            "prefix Cannot suffix",
+            "Cannot",
+            CaseSensitivity::Sensitive
+        ));
+        assert!(!message_has_clickhouse_token(
+            "prefix Cannot suffix",
+            "cannot",
+            CaseSensitivity::Sensitive
+        ));
+        assert!(message_has_clickhouse_token(
+            "prefix Cannot suffix",
+            "cannot",
+            CaseSensitivity::Insensitive
+        ));
+        assert!(!message_has_clickhouse_token(
+            "prefix_cannot suffix",
+            "cannot",
+            CaseSensitivity::Sensitive
+        ));
+        assert!(!message_has_clickhouse_token(
+            "prefix écannot suffix",
+            "cannot",
+            CaseSensitivity::Sensitive
+        ));
+    }
+
+    #[test]
+    fn clickhouse_token_uses_the_case_folded_index_only_as_a_candidate_filter() {
+        let query = LogQuery::new(record("unused").record_ref.topic_partition).where_predicate(
+            LogPredicate::message_token("Cannot", CaseSensitivity::Sensitive),
+        );
+        let constraints = query.required_index_constraints();
+        assert_eq!(constraints.terms, ["Cannot"]);
+        assert!(query.requires_post_decode());
     }
 }

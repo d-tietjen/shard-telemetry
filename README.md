@@ -1,16 +1,18 @@
-# shard-log
+# ShardTelemetry: A Signal-Native Observability Engine
 
-`shard-log` is a log database engine built around shard-stream's ordered,
-durable ingestion stripes. It keeps the durable append log as the source of
-truth and associates every shard-stream physical shard with one single-writer
-log-index stripe.
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+`shard-telemetry` is a signal-native observability database built around
+shard-stream's ordered, durable ingestion stripes. It stores logs, traces, and
+metrics in separate signal-native layouts behind one checksummed `STEL`
+envelope and assigns each physical shard to a single-writer owner stripe.
 
 The initial vertical slice implements:
 
 - post-durability, offset-ordered publication into term and exact-metadata
   postings;
-- a checksummed, multiplexed native TCP protocol with stream-grouped labels,
-  direct durable decoding, indexed query, and 128-bit request correlation;
+- a checksummed, signal-aware native TCP protocol with partitioned `STEL`
+  appends, indexed query, and 128-bit request correlation;
 - selectivity-ordered hot queries with ranges, newest/oldest ordering, bounded
   results, and a record-reference-only path;
 - an immutable block/record query index with delta/run postings, lossless
@@ -26,46 +28,82 @@ The initial vertical slice implements:
 - immutable block-group publication, paged partition catalogs, exact object
   ranges, and a byte-bounded integrity-checked SSD cache.
 
-## OTLP Logs
+## OTLP telemetry
 
-The first ingestion format is binary OTLP Logs: an
-`ExportLogsServiceRequest` sent as `application/x-protobuf`, as defined by the
-OTLP/HTTP specification. `OtlpLogDecoder` preserves each record body, promotes
-the OTLP timestamp, severity, trace and span context, and indexes resource,
-scope, and record attributes as namespaced metadata fields.
+OTLP/gRPC and OTLP/HTTP accept logs, traces, and metrics. Complete requests are
+decoded and validated before records are split into deterministic logical
+partitions. Typed values, resource and scope context, identifiers, dropped
+counts, NaN payload bits, span events and links, and metric exemplars are
+preserved by their signal-native records.
 
-For live ingestion, install `ShardLogSinkFactory` with
-`StreamEngine::open_with_durable_sink`. The engine validates that each append
-is a decodable OTLP export containing exactly the requested `record_count`
-before it reserves an offset. Once the primary log has synchronized the
-append, the matching `shard-log` stripe decodes and publishes every OTLP record
-at its durable offset. This keeps shard-stream's ordered offsets exactly
-aligned with OTLP log records and ensures a successful append is indexable.
+The exact OTLP transport, Prometheus API/PromQL, and Tempo API/TraceQL support
+boundary is documented in
+[TELEMETRY_COMPATIBILITY.md](TELEMETRY_COMPATIBILITY.md). Unsupported query
+features fail with an explicit client error rather than an approximation.
+
+For live ingestion, install `TelemetrySinkFactory` with
+`StreamEngine::open_with_durable_sink`. Every durable append is a checksummed
+`STEL` envelope containing exactly the requested item count. Once shard-stream
+has synchronized the append, the owning stripe applies the signal payload at
+its durable offsets. One offset identifies one log record, span, or metric
+point; nested events, links, and exemplars remain part of their parent item.
 
 ## Native protocol
 
-The standalone server exposes a versioned native binary protocol on TCP port
-`3101` alongside Loki HTTP on `3100`. It stores labels once per stream, uses
-fixed-width integers for timestamps and framing, validates a BLAKE3 frame
-checksum, and supports append, indexed exact-label/token query, and ping.
-Multiple requests may be in flight on one connection; responses retain the
-caller's 128-bit request ID and may complete out of order.
+The standalone server exposes the sole native protocol, v1, on TCP port `3101`. An
+`STB1` request carries one checksummed `STEL` v1 envelope per resulting partition,
+and the response returns one durable acknowledgement per partition. The server
+validates every envelope before any append and executes independent partitions
+in parallel. Multiple frames may be in flight; responses retain the caller's
+128-bit request ID and may complete out of order.
 
-Native appends enter shard-stream in their grouped representation and decode
-directly into normalized indexing events. The durable sink shares stream label
-fields, consecutive exact bodies, and repeated structured metadata across
-records. A non-materializing cursor validates the batch before offset
-reservation, and the durable owner performs the one allocating decode. No
-intermediate JSON, Loki map, or OTLP protobuf tree is created. Loki pushes are
-converted to this same representation before append, keeping one durable
-pre-release format.
+This pre-release codebase has one durable format and one native append format.
+Historical grouped-log append payloads are not decoded. The grouped `STR1`
+encoding is response-only for native log queries.
+
+Native log append batches may include an `SLT1` transient index context. It is
+validated by the owning stripe, used to install the compressor-derived lookup
+index without decompressing the `SLW1` frame, and discarded after indexing. The
+durable `STEL`/`SLW1` bytes remain authoritative for restart and object-tier
+recovery. For a single partition, the server also bypasses multi-partition
+parallel-dispatch overhead; independent partitions still execute in parallel.
 
 See [NATIVE_PROTOCOL.md](NATIVE_PROTOCOL.md) for the wire layout, bounds,
 acknowledgement semantics, query primitive, and initial Adam ablation.
 
+## Cross-signal correlation
+
+Exact resource contexts, instrumentation scopes, and typed attributes have
+stable 128-bit content identities shared by logs, traces, and metrics. Each
+owner stripe keeps bounded postings from those identities and trace IDs to
+durable signal-aware record references. Metric exemplars and span links join
+the same trace graph; string labels use the same typed attribute identity.
+
+`TelemetryService::query_correlations` and
+`DurableTelemetryStore::query_correlations` expose the native Rust lookup. The
+HTTP endpoint
+`GET /api/shard-telemetry/v1/traces/{trace_id}/correlations` provides bounded
+cursor pagination. Optional correlation postings fail open when full: signal
+ingestion, exact reconstruction, and native log/trace/metric indexes do not
+depend on them.
+
+Cold trace and metric catalogs preserve the same behavior with compact
+per-block shared-identity filters. Filters select candidate object ranges;
+decoded records still undergo exact tenant, trace, resource, scope, and typed
+attribute comparison. Span-link and metric-exemplar relationships therefore
+remain queryable after restart without turning a hash collision into a false
+result.
+
+Bounded 8 MiB multi-trace blocks and per-series metric chunks remove repeated
+resource/scope/metadata serialization with local ordinals. Metric numeric lanes
+adapt between Pco integers and bit-exact Gorilla XOR floats; histogram and
+summary lanes use compact MessagePack plus Zstd-1. See
+[BENCHMARKS.md](BENCHMARKS.md) for the reproducible three-signal storage and
+lookup run.
+
 ## Stripe ownership
 
-`ShardLogSinkFactory` creates one bounded, single-writer index worker for each
+`TelemetrySinkFactory` creates one bounded, single-writer index worker for each
 physical shard. shard-stream invokes its corresponding durable sink only after
 the shard append has synchronized; the sink waits for that worker to apply the
 batch before the append acknowledgement is returned. The worker uses the
@@ -87,7 +125,7 @@ ranges, offset or `(timestamp, offset)` sorting, oldest/newest order, stable
 exclusive cursors, and limits.
 
 `LogStripe::query_refs` avoids cloning records when a coordinator only needs
-durable locations. `ShardLogDb::query_all` and `query_stripes` merge physical
+durable locations. `ShardTelemetry::query_all` and `query_stripes` merge physical
 stripes deterministically for one logical partition. The legacy `with_term`
 and `with_field` builders remain the shortest indexed path.
 
@@ -116,18 +154,19 @@ correctness boundary, persistent format, and measured lookup costs.
 
 ## ClickHouse analytical compatibility
 
-ShardLog exposes an opt-in authenticated Arrow IPC scan boundary for the
-pinned ClickHouse 26.3.17.56 LTS query evaluator. A stock ClickHouse binary can
-use the generic URL source with explicit constraints. The narrow
-`StorageShardLog` adapter in `clickhouse/adapter` additionally converts
-analyzed projections, timestamp ranges, and exact map predicates into
-automatic storage pushdown. ShardLog streams bounded columnar batches while
-ClickHouse remains responsible for expressions, aggregates, joins, windows,
-JSON functions, subqueries, materialized views, protocols, and formats.
+ShardTelemetry exposes opt-in authenticated RowBinary and Arrow IPC relations
+for logs, spans, span events, span links, raw metric points, and metric exemplars to
+the pinned ClickHouse 26.3.17.56 LTS evaluator. A derived `traces` view
+summarizes the winning spans of each trace. Stable trace/span IDs, series IDs,
+resource/scope IDs, and typed-attribute fingerprints make cross-signal joins
+exact. An unmodified ClickHouse binary reads the Rust service through its
+built-in `URL` engine. ShardTelemetry streams bounded batches while ClickHouse
+remains responsible for expressions, aggregates, joins, windows, JSON
+functions, subqueries, materialized views, protocols, and formats.
 
 The scan route is absent unless `--clickhouse-token-file` is supplied. See
 [CLICKHOUSE_COMPATIBILITY.md](CLICKHOUSE_COMPATIBILITY.md) for the schema,
-security requirements, adapter installation, differential harness, and
+security requirements, stock-ClickHouse DDL, differential harness, and
 remaining production acceptance gates.
 
 ## Thread-local compression and dictionary reuse
@@ -154,7 +193,7 @@ until an object-tier writer publishes its complete block group and calls
 and releases the staged copies.
 
 For a catalog-backed deployment, create the factory with
-`ShardLogSinkFactory::with_dictionary_catalog`. Publish dictionaries from a
+`TelemetrySinkFactory::with_dictionary_catalog`. Publish dictionaries from a
 background trainer or control-plane service; the worker sees the publication at
 its next append-batch boundary. This preserves stripe-local ingestion while
 allowing the same immutable dictionary generation to be reused across all
@@ -162,7 +201,7 @@ matching shards.
 
 `RealtimeDictionaryTrainer` implements that control plane when online learning
 is desired. Start one trainer with a shared `DictionaryCatalog`, then construct
-the sink with `ShardLogSinkFactory::with_realtime_dictionary`. A stripe offers
+the sink with `TelemetrySinkFactory::with_realtime_dictionary`. A stripe offers
 one bounded sample only after a block seals; a full queue drops that observation
 without delaying or failing ingestion.
 
@@ -221,7 +260,7 @@ gain that repays that cost.
 ## Compression policy and structural roadmap
 
 [Benchmark results and priority-based codec choices](BENCHMARKS.md) record the
-complete 27-engine comparison on the Adam corpus. The implemented online
+complete Apache-compatible 24-engine comparison on the Adam corpus. The implemented online
 default is Pco level 8 for the timestamp column and zstd level 1 for the
 enclosing structural block. LZ4 is a planned low-latency option, and zstd
 level 9 is a future compaction-only cold format. The current pre-release block
@@ -233,7 +272,7 @@ context. The
 the layout, its exact reconstruction rule, and the next measurements needed to
 refine it without introducing a second stored format.
 
-## Deliberate boundaries
+## Durable object tier
 
 The durable object-tier boundary is implemented: immutable artifact upload,
 block-group manifests, 1,024-group catalog pages, conditionally selected roots,
@@ -242,21 +281,35 @@ shallow recovery, exact block ranges, and a recoverable SSD range cache. See
 model, durability states, cold-read path, retention protocol, and capacity
 defaults.
 
-The production stripe still stages compressed payloads in memory. The next
-integration is a shard-stream-style worker coordinator that incrementally
-spools groups and their independent query-index segments to local SSD, then
-drives `LogObjectTier` in sequence order. A concrete cloud-provider adapter
-must implement the generic `LogObjectStore` contract. Until those are wired,
-the structural benchmark's pack writer remains a benchmark path rather than
-the production offloader.
+The stripe worker now closes complete durable append boundaries, synchronizes
+their compressed payload and independent query-index artifacts to the local
+spool, uploads immutable objects, and conditionally publishes the catalog
+root. Resident payload is released only after that catalog commit. Cold
+queries prune catalog pages and groups, load only the selected index segment,
+range-read candidate frames through the bounded SSD cache, verify BLAKE3, and
+reconstruct exact records. Restart begins from the catalog checkpoint without
+loading a corpus-wide posting map.
 
-The durable sink now supports a configured stripe-local transaction journal.
-Each synchronized frame contains the exact indexed native or OTLP appends, the expected
-checkpoint, and the next checkpoint. Startup repairs an incomplete final frame,
-fails closed on committed checksum or checkpoint-chain corruption, reconstructs
-the hot index, and exposes only the recovered checkpoint. Ephemeral tests may
-leave `OtlpSinkConfig::state_directory` unset; production configurations must
-set it and size `max_journal_bytes` as part of their SSD spool budget.
+The standalone binary ships both a synchronized `LocalObjectStore` and an
+all-Rust `S3ObjectStore`. The S3 adapter uses the standard AWS credential chain,
+streams multipart uploads, verifies BLAKE3 content, performs exact-key
+idempotent deletion, and conditionally replaces catalog control objects by
+version token. Other cloud adapters can implement the public
+`TelemetryObjectStore` contract with the same semantics.
+
+Publication records every transaction-owned key in `PENDING` before upload.
+After a crash, an unselected transaction is reclaimed by those exact keys once
+its writer lease expires; a selected transaction is preserved. Superseded
+catalog objects are released after local leases and the cross-process reader
+grace expire. No bucket listing, reachability sweep, or tracing garbage
+collector is used.
+
+The durable sink also supports an optional stripe-local recovery journal for
+deployments without the object tier. Each synchronized frame contains exact
+indexed native or OTLP appends and its checkpoint chain. Startup repairs an
+incomplete final frame and fails closed on committed corruption. Object-tier
+deployments recover from immutable catalog checkpoints and do not need this
+duplicate raw journal.
 
 ## Real-log compression benchmark
 
@@ -265,13 +318,13 @@ dictionary and a prototype template column plus its compressed static-term
 block index. It processes up to 1 GiB by default:
 
 ```text
-cargo run --release --bin shard-log-compress-bench -- /path/to/raw.log
+cargo run --release --bin shard-telemetry-compress-bench -- /path/to/raw.log
 ```
 
 The durable structural benchmark can enable the bounded online learner:
 
 ```text
-cargo run --release --bin shard-log-structural-bench -- \
+cargo run --release --bin shard-telemetry-structural-bench -- \
   /path/to/docker-json.log \
   --block-bytes 512KiB \
   --workers 16 \
@@ -290,7 +343,7 @@ destination; the benchmark spools at most the requested limit once so every
 layout receives exactly the same bytes:
 
 ```text
-remote-log-command | cargo run --release --bin shard-log-compress-bench -- - --spool-stdin-to /tmp/input.log
+remote-log-command | cargo run --release --bin shard-telemetry-compress-bench -- - --spool-stdin-to /tmp/input.log
 ```
 
 Use `--report PATH` to retain the final metrics in a new file; the benchmark
@@ -300,7 +353,7 @@ To compare codec families with independent blocks and first-block round-trip
 verification, run:
 
 ```text
-cargo run --release --bin shard-log-codec-bench -- /path/to/raw.log --limit-bytes 80GiB
+cargo run --release --bin shard-telemetry-codec-bench -- /path/to/raw.log --limit-bytes 80GiB
 ```
 
 The default `screen` profile is designed for a practical 80 GiB throughput
@@ -309,25 +362,26 @@ Snappy, S2, MinLZ, five Deflate implementations, Brotli, native and pure-Rust
 LZFSE, zRip, and zstd levels 1, 3, and 9:
 
 ```text
-cargo run --release --bin shard-log-codec-bench -- /path/to/raw.log --limit-bytes 80GiB --codecs screen --report /path/to/codec-screen-80g.csv
+cargo run --release --bin shard-telemetry-codec-bench -- /path/to/raw.log --limit-bytes 80GiB --codecs screen --report /path/to/codec-screen-80g.csv
 ```
 
 Use `--codecs archive` for the slower ratio-focused sweep: S2-best, Zopfli
 (five iterations), bzip2-9, native XZ-6, pure-Rust XZ-6, Brotli-5, zRip-4,
-and zstd-9. Use `--codecs all` for the complete 27-engine matrix, preferably
+and zstd-9. Use `--codecs all` for the complete 24-engine matrix, preferably
 first at the default 1 GiB limit; Zopfli and the XZ encoders make a full 80 GiB
 all-codec run intentionally long.
 
 Every named implementation can also be selected directly, for example:
 
 ```text
-cargo run --release --bin shard-log-codec-bench -- /path/to/raw.log --limit-bytes 80GiB --codecs lz4_flex,lz4_native,lz4_rust,s2,minlz_balanced,libdeflate-6,zlib_rs-6,zenflate-7,lzfse,lzfse_rust,zrip-1,zstd-1
+cargo run --release --bin shard-telemetry-codec-bench -- /path/to/raw.log --limit-bytes 80GiB --codecs lz4_flex,lz4_native,s2,minlz_balanced,libdeflate-6,zlib_rs-6,lzfse,lzfse_rust,zrip-1,zstd-1
 ```
 
 The full [1 GiB codec screen and 80 GiB validation](BENCHMARKS.md) identify
 zstd-1 as the hot-tier default and zstd-9 as the cold-tier ratio option for the
 tested ClickHouse error-loop corpus. The document also records the complete
-27-codec comparison and its decision guide.
+24-codec comparison and its decision guide. Codecs with GPL, AGPL, or missing
+license metadata are deliberately excluded from the Apache-2.0 distribution.
 
 The final template total includes the template table and block-level static
 term index. It intentionally excludes high-cardinality value postings; those
@@ -338,12 +392,12 @@ prototype, normalize a Docker `json-file` corpus into durable worker packs and
 a manifest:
 
 ```text
-cargo run --release --bin shard-log-structural-bench -- \
+cargo run --release --bin shard-telemetry-structural-bench -- \
   /path/to/docker-json.log \
   --limit-bytes 80GiB \
   --workers 16 \
   --locality disabled \
-  --output-dir /new/path/shard-log-packs \
+  --output-dir /new/path/shard-telemetry-packs \
   --report /new/path/structural-report.txt
 ```
 
@@ -356,48 +410,33 @@ is against accepted Docker source bytes, so it includes the gain from replacing
 JSON syntax with typed log fields; it is not a transparent byte-for-byte JSON
 archive metric.
 
-On Adam, the sequential head-to-head harness gives ShardLog variants and a
-typed ClickHouse `MergeTree` the same immutable corpus, 16 physical cores, and
-source prewarm. By default it runs locality-disabled and locality-enabled legs
-for `SHARD_LOG_BIN` before ClickHouse:
+On Adam, the sequential live head-to-head harness gives the current
+ShardTelemetry server/loader and a typed ClickHouse `MergeTree` the same
+immutable corpus, 16 physical cores, and source prewarm. It runs the
+production-default locality-disabled path before ClickHouse:
 
 ```text
-scripts/run-head-to-head.sh
-```
-
-For a cross-version comparison, set `SHARD_LOG_VARIANTS_FILE` to a
-tab-separated manifest with `label`, filesystem-safe `slug`, `binary`, and
-`enabled|disabled` columns. The harness runs every row sequentially and records
-each binary's SHA-256:
-
-```text
-TinyLFU-disabled	tinylfu-disabled	/path/to/old-bench	disabled
-TinyLFU-enabled	tinylfu-enabled	/path/to/old-bench	enabled
-BlockCollator-disabled	block-disabled	/path/to/new-bench	disabled
-BlockCollator-enabled	block-enabled	/path/to/new-bench	enabled
-```
-
-```text
-SHARD_LOG_VARIANTS_FILE=/path/to/variants.tsv scripts/run-head-to-head.sh
+scripts/run-clickhouse-head-to-head.sh
 ```
 
 It verifies the 80 GiB source checksum, pins both engines to CPUs `0-15`,
 persists each engine into an isolated new result directory, requires equal
-accepted row counts, and records provenance plus a TSV summary.
-The current [80 GiB timestamp-codec and locality acceptance
-result](BENCHMARKS.md) measured the default Pco/zstd layout at 1,104.68 MiB/s
-and 136.68x versus 932.71 MiB/s and 73.09x for ClickHouse. It stored
-628,473,667 bytes, 23.95% less than the previous ShardLog layout. The
-homogeneous corpus remained in base placement; enabling the block collator
-changed no bytes and fell below the strict 1 GiB/s gate, which is why routing
-is now opt-in.
+accepted row counts and exact query results, and records pinned provenance.
+The current [80 GiB acceptance result](BENCHMARKS.md) produced 607,363,459
+rows in both engines. ShardTelemetry stored 2,702,973,946 bytes at 31.78x
+versus ClickHouse's 6,091,870,726 active-part bytes at 14.10x, a 55.63%
+reduction. ClickHouse ingested faster—234.80 versus 148.60 MiB/s—so the live
+path does not yet meet the 1 GiB/s-per-core objective. ShardTelemetry won warm
+latest and indexed-token p50 by 10.96x and 17.15x, while ClickHouse won exact
+stream p50 by 11.50x. The homogeneous corpus remains in base placement, so
+locality routing stays opt-in.
 
 Run component-level fingerprint, tentative-shard probe, block
 score/split/assignment, handoff, throughput, and seal-latency measurements
 with:
 
 ```text
-cargo run --release --bin shard-log-locality-bench
+cargo run --release --bin shard-telemetry-locality-bench
 ```
 
 To construct a deterministic round-robin corpus from multiple real Docker JSON
@@ -440,11 +479,11 @@ server behind a TLS-terminating reverse proxy. Both listeners bind to loopback
 unless explicitly changed:
 
 ```bash
-cargo run --release --bin shard-log-server -- \
-  --auth-token-file /run/secrets/shard-log-token \
+cargo run --release --bin shard-telemetry-server -- \
+  --auth-token-file /run/secrets/shard-telemetry-token \
   --default-tenant production \
-  --data-directory /var/lib/shard-log \
-  --object-store-directory /var/lib/shard-log-objects \
+  --data-directory /var/lib/shard-telemetry \
+  --object-store-directory /var/lib/shard-telemetry-objects \
   --shards 16 \
   --tenant-partitions 256 \
   --append-linger-micros 250
@@ -465,21 +504,54 @@ across fully expired append batches. OS signals and Loki shutdown endpoints
 stop admission, flush the source log and index checkpoint, close tail/native
 connections, and then stop listeners.
 
+Production mode requires one durable object backend; this is where compressed
+checkpointed groups and their segmented indexes become restart-authoritative.
+Use either `--object-store-directory` or an S3 bucket. The two backends are
+mutually exclusive, and the raw recovery journal is opt-in for migration or
+diagnostics.
+
+For S3, use a bucket or prefix dedicated to one deployment and workload
+credentials with only the required prefix permissions:
+
+```bash
+cargo run --release --bin shard-telemetry-server -- \
+  --auth-token-file /run/secrets/shard-telemetry-token \
+  --default-tenant production \
+  --data-directory /var/lib/shard-telemetry \
+  --object-store-s3-bucket company-telemetry \
+  --object-store-s3-prefix production/shard-telemetry \
+  --object-store-s3-region us-east-1 \
+  --shards 16 \
+  --tenant-partitions 256
+```
+
+Production rejects plaintext S3 endpoints. Configure bucket versioning for
+recovery from operator error and a bounded abort-incomplete-multipart lifecycle
+rule for provider-internal multipart fragments left by hard host failure. Do
+not configure an expiration rule for completed objects; ShardTelemetry owns
+their exact-key retention lifecycle.
+
 To opt into the administrative ClickHouse scan route, create a protected token
-file and add `--clickhouse-token-file /run/secrets/shard-log-clickhouse`. Keep
+file and add `--clickhouse-token-file /run/secrets/shard-telemetry-clickhouse`. Keep
 the listener on loopback or behind TLS/mTLS; the route is intentionally not
 registered without that option.
 
 The authoritative shard-stream packs are sufficient for recovery in explicit
-development mode. Production mode currently enables the bounded index-recovery
-journal; physical retention requires that durable checkpoint. Segmenting this
-journal and the resident embedded indexes into the existing immutable object
-tier remains the principal petabyte-scale production gate.
+development mode. With either durable object backend, production flushes
+publish compressed frames and segmented indexes to the immutable
+ShardTelemetry catalog. It then advances each batch-aligned source log start to
+the selected catalog checkpoint and reclaims covered source packs. Restarts and
+cold reads use the catalog; keeping a second permanent raw copy is unnecessary.
 
 See [LOKI_COMPATIBILITY.md](LOKI_COMPATIBILITY.md) for the executable API
-surface, differential target, current release blockers, and wire-path
-benchmarks. The HTTP surface includes lossless stream filters, labels, series,
+surface, differential target, known differences, and wire-path benchmarks. The
+HTTP surface includes lossless stream filters, parser and formatting pipelines,
+unwrapped metric ranges, vector aggregation and matching, labels, series,
 stats, volume, structural patterns, detected JSON/logfmt fields, tailing, and
-durable logical deletion. Full metric LogQL, parser pipelines, Parquet results,
-and ruler APIs remain compatibility gaps, so this is not yet a universal Loki
-binary replacement.
+durable logical deletion. Ruler and multi-tenant control-plane APIs remain
+outside the single-tenant storage engine.
+
+## License
+
+ShardTelemetry is licensed under the [Apache License 2.0](LICENSE). Required
+third-party attributions are retained in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

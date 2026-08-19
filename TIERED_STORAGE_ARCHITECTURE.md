@@ -1,6 +1,6 @@
 # Tiered storage architecture
 
-ShardLog's durable tier is designed so data volume can grow to at least one
+ShardTelemetry's durable tier is designed so data volume can grow to at least one
 pebibyte without requiring a process to load a corpus-wide block catalog,
 enumerate an object-store bucket, or validate every payload at startup.
 
@@ -11,9 +11,10 @@ The implementation follows shard-stream's proven lifecycle:
 - a small `CURRENT` object selects an immutable metadata generation;
 - the final publication is conditional, fencing stale writers;
 - local data is released only after object durability is visible; and
-- retention publishes new metadata before deleting unreachable bytes.
+- retention publishes new metadata before deterministically relinquishing exact
+  object keys.
 
-ShardLog changes the manifest shape. shard-stream's per-shard pack list is
+ShardTelemetry changes the manifest shape. shard-stream's per-shard pack list is
 small enough to keep in one manifest. A petabyte-scale log database needs a
 partition-scoped hierarchy of roots, catalog pages, block groups, query-index
 segments, dictionaries, and payload ranges.
@@ -55,19 +56,22 @@ catalog/
     topic-<32-hex-digit-topic-id>/
       partition-<logical-partition>/
         CURRENT
-        roots/root-<generation>-<checksum>.json
-        pages/page-<sequence>-<checksum>.json
-        groups/<group-sequence>/
-          manifest-<checksum>.json
-          payload-<name>-<checksum>
-          query-index-<name>-<checksum>
-          dictionary-<name>-<checksum>
-          dictionary-catalog-<name>-<checksum>
+        PENDING
+        transactions/<transaction-id>/
+          roots/root-<generation>-<checksum>.json
+          pages/page-<sequence>-<checksum>.json
+          groups/<group-sequence>/
+            manifest-<checksum>.json
+            payload-<name>-<checksum>
+            query-index-<name>-<checksum>
+            dictionary-<name>-<checksum>
+            dictionary-catalog-<name>-<checksum>
 ```
 
-All keys except `CURRENT` are immutable and include a BLAKE3 content checksum.
-Readers never use object listing. They start from a known namespace and follow
-authenticated references.
+`CURRENT` and `PENDING` are the only mutable control keys. Every data key is
+immutable, belongs to one transaction-specific prefix, and includes a BLAKE3
+content checksum. Readers never use object listing. They start from a known
+namespace and follow authenticated references.
 
 A block-group manifest records:
 
@@ -90,36 +94,49 @@ The owning shard worker is the only normal publisher for a
 `(physical shard, topic, partition)` namespace. Publication is:
 
 1. Seal a bounded set of compressed blocks and its independent query index.
-2. Write and synchronize a local payload pack. `write_staged_payload_pack`
+2. Compute the complete, bounded set of transaction-owned object keys and
+   conditionally create `PENDING` with those exact keys, the target root, and a
+   writer-lease deadline.
+3. Write and synchronize a local payload pack. `write_staged_payload_pack`
    records every block's exact range and checksum without buffering the whole
    pack a second time.
-3. Put payload, query index, required dictionaries, and assignment metadata
+4. Put payload, query index, required dictionaries, and assignment metadata
    with immutable put-if-absent semantics.
-4. Put the immutable group manifest.
-5. Append the group entry to an immutable catalog page.
-6. Put a new immutable catalog root that references the new page generation.
-7. Compare-and-swap `CURRENT` from the writer's observed object version token to the new root
+5. Put the immutable group manifest.
+6. Append the group entry to an immutable catalog page.
+7. Put a new immutable catalog root that references the new page generation.
+8. Compare-and-swap `CURRENT` from the writer's observed object version token to the new root
    pointer.
-8. Call `mark_group_offloaded` only after step 7 succeeds. This records object
+9. Delete `PENDING`; if this idempotent cleanup is interrupted, recovery sees
+   that its target is selected and removes only `PENDING`.
+10. Call `mark_group_offloaded` only after step 8 succeeds. This records object
    ranges and releases staged block payloads.
 
-Retries with identical content are accepted. Reusing a sequence with different
-content is corruption. Two writers may upload the same immutable objects, but
-only one can advance `CURRENT`; the other receives `LogDbError::StaleCatalog`
-and must reopen the authoritative root before retrying.
+Retries with identical logical content are accepted. Reusing a sequence with
+different content is corruption. The fixed `PENDING` key serializes conforming
+publishers for one catalog, and conditional `CURRENT` replacement fences stale
+catalog generations.
 
-Crashes before step 7 leave invisible immutable objects. They are harmless and
-can be removed later by an orphan collector after a grace period. Crashes
-after step 7 are recoverable from `CURRENT`, even if local staged-data cleanup
-did not run.
+A crash before `CURRENT` moves leaves an exact ownership record. Once its
+writer lease expires, startup deletes only the keys named by that record and
+then removes `PENDING`. A crash after `CURRENT` moves preserves all selected
+objects and removes only `PENDING`. A fresh lease fails closed, so a second
+process cannot reclaim objects still owned by a live publisher. This is the
+storage equivalent of Rust ownership: transaction keys have one owner, catalog
+roots share immutable reachability through leases, and cleanup occurs when
+ownership ends. It requires no bucket listing, reachability sweep, or tracing
+garbage collector.
 
 `LocalObjectStore` implements these rules with synchronized temporary writes,
 atomic rename, parent-directory synchronization, BLAKE3 verification, and a
-filesystem update lock. A production S3-compatible adapter implements the same
-`LogObjectStore` contract with immutable create, bounded GET, range GET, HEAD,
-and conditional replacement. If an object service cannot conditionally replace
-`CURRENT`, the adapter must provide an equivalent external fencing primitive;
-unconditional last-writer-wins publication is not safe.
+filesystem update lock. The shipped Rust-native `S3ObjectStore` implements
+immutable create, bounded GET, range GET, HEAD, exact-key delete, streaming
+multipart upload, and conditional replacement using object version tokens. If
+an object service cannot conditionally replace `CURRENT`, it is unsafe for this
+catalog. A hard host failure can strand provider-internal, incomplete multipart
+parts before an object key exists; configure the bucket's bounded
+abort-incomplete-multipart lifecycle rule for those hidden parts. That rule is
+not catalog garbage collection and must never expire completed catalog objects.
 
 ## Cold query path
 
@@ -141,7 +158,7 @@ This preserves the existing hot/cold query compatibility contract. Catalog
 and trigram collisions can only create extra reads; reconstruction and exact
 filtering remain authoritative.
 
-`LogObjectTier::open` deliberately validates only `CURRENT` and the immutable
+`TelemetryObjectTier::open` deliberately validates only `CURRENT` and the immutable
 root. A page is verified when its bounds are touched, a group manifest when
 selected, and a full artifact when read. Verifying every referenced payload on
 startup would turn process recovery into a petabyte scan. A separate
@@ -186,7 +203,7 @@ There are three explicit durability states:
 | State | Meaning |
 | --- | --- |
 | Stream durable | shard-stream has synchronized the source append |
-| SSD staged | ShardLog block, query index, and group files can be retried locally |
+| SSD staged | ShardTelemetry block, query index, and group files can be retried locally |
 | Object durable | `CURRENT` selects a root that reaches every required immutable artifact |
 
 An object-durable acknowledgement, when requested, must wait through the
@@ -197,29 +214,35 @@ data and query index.
 
 On restart:
 
-1. Recover shard-stream and replay any source offsets beyond ShardLog's durable
+1. Resolve `PENDING`: preserve a selected transaction, reject a fresh active
+   writer, or exact-delete an expired uncommitted transaction.
+2. Recover shard-stream and replay any source offsets beyond ShardTelemetry's durable
    index checkpoint.
-2. Open each known catalog directly; do not list the bucket.
-3. Reconcile synchronized local spool groups against the selected root.
-4. Retry unpublished groups idempotently.
-5. Remove a local spool group only after its catalog generation is selected.
+3. Open each known catalog directly; do not list the bucket.
+4. Reconcile synchronized local spool groups against the selected root.
+5. Retry unpublished groups idempotently.
+6. Remove a local spool group and advance shard-stream's batch-aligned log start
+   only after its catalog generation is selected.
 
 Historical physical-shard ownership is part of the query coordinator's routing
 metadata. A logical partition that moved between physical shards may have
 catalogs in more than one shard namespace; the coordinator merges them by the
 same durable offset and timestamp order used by hot queries.
 
-## Retention and garbage collection
+## Retention and deterministic reclamation
 
 Retention is metadata first:
 
 1. Build new immutable pages excluding groups wholly below the retention
    boundary.
 2. Publish a new root and conditionally advance `CURRENT`.
-3. Wait for the configured reader/version grace period.
-4. Delete unreachable group artifacts, manifests, superseded pages, and roots
-   asynchronously.
-5. Evict matching SSD cache chunks opportunistically; correctness does not
+3. Record every superseded exact key in the selected root with a reclamation
+   deadline.
+4. Wait for all in-process `CatalogLease` references and the configured
+   cross-process reader grace period.
+5. Delete the recorded group artifacts, manifests, superseded pages, and roots
+   by exact key during bounded maintenance passes.
+6. Evict matching SSD cache chunks opportunistically; correctness does not
    depend on immediate eviction.
 
 Boundary groups remain intact until every block in them expires. Optional
@@ -228,30 +251,36 @@ must publish the replacement before removing the original. Legal hold is a
 root-selection policy: held groups remain reachable regardless of the normal
 time cutoff.
 
-Deletion is intentionally outside `LogObjectStore`'s online query/publication
-contract. The garbage collector should use a separately authorized object
-client so an ingest or query process cannot erase durable data.
+The newest group remains as a bounded checkpoint anchor even when every record
+in it is older than the cutoff. Reclamation state is capped by
+`max_retired_objects`; a writer fails closed rather than create an unbounded
+delete backlog. `TelemetryObjectStore::delete` accepts only validated exact
+keys, is idempotent, and is used by the ownership protocol itself. It never
+lists a namespace and never infers liveness from object reachability.
 
 ## Worker integration
 
-The next worker-level integration mirrors shard-stream's existing pack
-offloader:
+The worker-level integration mirrors shard-stream's pack offloader:
 
 - one mutable group builder belongs to each shard worker;
 - block compression, query-index construction, and local spool writes remain
   worker local;
-- a group closes on target bytes, block count, maximum age, explicit object
-  durability, or shutdown;
+- a group closes on target bytes, block count, explicit flush, or shutdown;
 - publication runs in sequence order for each shard/partition namespace;
 - backpressure is based on unpublished SSD spool bytes, never total retained
   object bytes; and
 - local spool retention advances only from authoritative catalog generations.
 
-The implemented `BlockCatalog` range fields, `write_staged_payload_pack`,
-`LogObjectTier`, `mark_group_offloaded`, and `SsdObjectCache` are the durable
-boundaries for that coordinator. The automatic worker coordinator and concrete
-cloud-provider adapter are not connected yet; the structural benchmark's
-pack writer remains a benchmark path until that integration is complete.
+`LogStripe::offload_indexed_groups` constructs append-aligned payload and query
+artifacts, publishes them through `TelemetryObjectTier`, and releases resident frames
+only after the new `CURRENT` generation is selected. On restart, catalog
+checkpoints skip already-published recovery transactions. Queries load a group
+index before payload and verify each selected frame checksum after range read.
+
+The standalone binary ships both `LocalObjectStore` and the Rust-native
+`S3ObjectStore`. The public `TelemetryObjectStore` trait remains the integration
+point for other backends; adapters must preserve immutable create, bounded
+reads, exact idempotent deletion, and conditional `CURRENT` replacement.
 
 ## Required operational metrics
 
@@ -263,11 +292,12 @@ At minimum, report these per shard and partition:
 - `CURRENT` generation and conditional-publication failures;
 - catalog root/page/group cache hit rates;
 - payload-cache hit bytes, miss bytes, evictions, and integrity failures;
-- object PUT, GET, range-GET, HEAD, bytes, latency, and retry counts;
+- object PUT, GET, range-GET, HEAD, compare-and-swap, exact-delete, transferred
+  bytes, and failure counts;
 - query pages and groups pruned before index fetch;
 - index bytes fetched and blocks range-read per query;
 - checksum, decompression, and reconstruction failures; and
-- retention watermark, unreachable bytes, and garbage-collection lag.
+- retention runs, retired groups/bytes/exact keys, and source offsets reclaimed.
 
 Alerts should fire on a non-advancing object-durable sequence, spool growth
 approaching its budget, repeated stale-writer failures, or any immutable object

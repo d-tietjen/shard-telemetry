@@ -1,0 +1,5 @@
+<clickhouse>
+    <http_port>18123</http_port>
+    <tcp_port>19000</tcp_port>
+    <interserver_http_port>19009</interserver_http_port>
+</clickhouse>

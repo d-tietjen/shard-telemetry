@@ -1,0 +1,45 @@
+[Unit]
+Description=ShardTelemetry single-tenant log database
+Documentation=https://github.com/d-tietjen/shard-telemetry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shard-telemetry
+Group=shard-telemetry
+UMask=0077
+StateDirectory=shard-telemetry shard-telemetry-objects
+RuntimeDirectory=shard-telemetry
+ExecStart=/usr/local/bin/shard-telemetry-server \
+  --auth-token-file=/etc/shard-telemetry/auth-token \
+  --default-tenant=production \
+  --data-directory=/var/lib/shard-telemetry \
+  --object-store-directory=/var/lib/shard-telemetry-objects \
+  --listen=127.0.0.1:3100 \
+  --native-listen=127.0.0.1:3101 \
+  --shards=16 \
+  --tenant-partitions=256
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=330s
+LimitNOFILE=1048576
+TasksMax=16384
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/shard-telemetry /var/lib/shard-telemetry-objects
+
+[Install]
+WantedBy=multi-user.target

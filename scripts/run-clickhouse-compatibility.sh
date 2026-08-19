@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
+shopt -u patsub_replacement 2>/dev/null || true
 
-if [[ -z ${SHARDLOG_CLICKHOUSE_TOKEN:-} ]]; then
-    : "${SHARDLOG_CLICKHOUSE_TOKEN_FILE:?set SHARDLOG_CLICKHOUSE_TOKEN or SHARDLOG_CLICKHOUSE_TOKEN_FILE}"
-    [[ -f $SHARDLOG_CLICKHOUSE_TOKEN_FILE ]] || {
-        echo "token file does not exist: $SHARDLOG_CLICKHOUSE_TOKEN_FILE" >&2
+if [[ -z ${SHARD_TELEMETRY_CLICKHOUSE_TOKEN:-} ]]; then
+    : "${SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE:?set SHARD_TELEMETRY_CLICKHOUSE_TOKEN or SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE}"
+    [[ -f $SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE ]] || {
+        echo "token file does not exist: $SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE" >&2
         exit 2
     }
-    SHARDLOG_CLICKHOUSE_TOKEN=$(<"$SHARDLOG_CLICKHOUSE_TOKEN_FILE")
+    SHARD_TELEMETRY_CLICKHOUSE_TOKEN=$(<"$SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE")
 fi
-[[ -n $SHARDLOG_CLICKHOUSE_TOKEN ]] || {
-    echo "ShardLog ClickHouse token must not be empty" >&2
+[[ -n $SHARD_TELEMETRY_CLICKHOUSE_TOKEN ]] || {
+    echo "ShardTelemetry ClickHouse token must not be empty" >&2
     exit 2
 }
 
 CLICKHOUSE_BIN=${CLICKHOUSE_BIN:-clickhouse}
 CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-}
 CLICKHOUSE_NETWORK=${CLICKHOUSE_NETWORK:-host}
-SHARDLOG_URL=${SHARDLOG_URL:-http://127.0.0.1:3100/shardlog/api/v1/clickhouse/scan}
-SHARDLOG_TENANT=${SHARDLOG_TENANT:-fake}
+SHARD_TELEMETRY_URL=${SHARD_TELEMETRY_URL:-http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan}
+SHARD_TELEMETRY_TENANT=${SHARD_TELEMETRY_TENANT:-fake}
 EXPECTED_CLICKHOUSE_VERSION=${EXPECTED_CLICKHOUSE_VERSION:-26.3.17.56}
 STRICT_CLICKHOUSE_VERSION=${STRICT_CLICKHOUSE_VERSION:-1}
-SHARDLOG_ADAPTER_MODE=${SHARDLOG_ADAPTER_MODE:-0}
 
 if [[ -n $CLICKHOUSE_IMAGE ]]; then
     command -v docker >/dev/null || {
@@ -47,6 +47,9 @@ OBSERVED_CLICKHOUSE_VERSION=$(
     run_clickhouse local --version |
         awk '{ for (field = 1; field <= NF; field++) if ($field == "version") print $(field + 1) }'
 )
+# Locally built ClickHouse binaries end the version sentence immediately after
+# the numeric version, so the extracted field carries the final period.
+OBSERVED_CLICKHOUSE_VERSION=${OBSERVED_CLICKHOUSE_VERSION%.}
 if [[ $STRICT_CLICKHOUSE_VERSION -eq 1 && $OBSERVED_CLICKHOUSE_VERSION != "$EXPECTED_CLICKHOUSE_VERSION" ]]; then
     echo "ClickHouse version mismatch: expected $EXPECTED_CLICKHOUSE_VERSION, observed $OBSERVED_CLICKHOUSE_VERSION" >&2
     exit 2
@@ -59,20 +62,17 @@ escape_sql() {
     printf '%s' "$value"
 }
 
-URL_SQL=$(escape_sql "$SHARDLOG_URL")
-TOKEN_SQL=$(escape_sql "$SHARDLOG_CLICKHOUSE_TOKEN")
-TENANT_SQL=$(escape_sql "$SHARDLOG_TENANT")
-STRUCTURE="tenant String, timestamp DateTime64(9, 'UTC'), partition UInt32, offset UInt64, message String, labels Map(String, String), metadata Map(String, String)"
+URL_SQL=$(escape_sql "$SHARD_TELEMETRY_URL")
+TOKEN_SQL=$(escape_sql "$SHARD_TELEMETRY_CLICKHOUSE_TOKEN")
+TENANT_SQL=$(escape_sql "$SHARD_TELEMETRY_TENANT")
+STRUCTURE="tenant String, signal String, timestamp DateTime64(9, 'UTC'), observed_timestamp Nullable(DateTime64(9, 'UTC')), partition UInt32, offset UInt64, resource_id Nullable(String), scope_id Nullable(String), trace_id Nullable(String), span_id Nullable(String), message Nullable(String), body_json Nullable(String), severity_number Nullable(Int32), severity_text Nullable(String), event_name Nullable(String), flags Nullable(UInt32), dropped_attributes_count Nullable(UInt32), labels Map(String, String), metadata Map(String, String), attributes Map(String, String), resource_attributes Map(String, String), scope_attributes Map(String, String), attribute_ids Map(String, String), resource_attribute_ids Map(String, String), scope_attribute_ids Map(String, String), attributes_json Nullable(String), resource_attributes_json Nullable(String), scope_attributes_json Nullable(String)"
 STRUCTURE_SQL=$(escape_sql "$STRUCTURE")
-if [[ $SHARDLOG_ADAPTER_MODE -eq 1 ]]; then
-    SOURCE=shardlog_source
-    SOURCE_SETUP="CREATE TABLE shardlog_source ($STRUCTURE) ENGINE = ShardLog('$URL_SQL', 'ArrowStream', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'));"
-else
-    SOURCE="url('$URL_SQL', 'ArrowStream', '$STRUCTURE_SQL', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'))"
-    SOURCE_SETUP=
-fi
+ROWBINARY_SEPARATOR='?'
+[[ $URL_SQL == *\?* ]] && ROWBINARY_SEPARATOR='&'
+ROWBINARY_URL_SQL="${URL_SQL}${ROWBINARY_SEPARATOR}wire=rowbinary"
+SOURCE="url('$ROWBINARY_URL_SQL', 'RowBinary', '$STRUCTURE_SQL', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'))"
 
-RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/shard-log-clickhouse-compat.XXXXXX")
+RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/shard-telemetry-clickhouse-compat.XXXXXX")
 cleanup() {
     rm -rf -- "$RESULT_DIR"
 }
@@ -86,6 +86,11 @@ queries=(
     "cte-array|WITH parsed AS (SELECT labels['app'] AS app, metadata['code'] AS code FROM __TABLE__) SELECT app, arraySort(groupArray(code)) AS codes FROM parsed GROUP BY app ORDER BY app"
     "self-join|SELECT count() AS matching_rows FROM __TABLE__ AS left_logs INNER JOIN __TABLE__ AS right_logs ON left_logs.partition = right_logs.partition AND left_logs.offset = right_logs.offset"
     "timestamp-map-filter|SELECT partition, offset, message FROM __TABLE__ WHERE timestamp >= toDateTime64(0, 9, 'UTC') AND timestamp < toDateTime64(4102444800, 9, 'UTC') AND labels['app'] = 'api' AND metadata['code'] = '500' ORDER BY partition, offset"
+    "ordered-limit|SELECT timestamp, partition, offset, message FROM __TABLE__ ORDER BY timestamp DESC LIMIT 1"
+    "ordered-map-limit|SELECT timestamp, partition, offset, message FROM __TABLE__ WHERE metadata['code'] = '500' ORDER BY timestamp DESC LIMIT 1"
+    "ordered-residual-limit|SELECT timestamp, partition, offset, message FROM __TABLE__ WHERE positionCaseInsensitive(ifNull(message, ''), 'error') > 0 ORDER BY timestamp DESC LIMIT 1"
+    "ordered-token-limit|SELECT timestamp, partition, offset, message FROM __TABLE__ WHERE hasToken(ifNull(message, ''), 'error') ORDER BY timestamp DESC LIMIT 1"
+    "ordered-token-ci-limit|SELECT timestamp, partition, offset, message FROM __TABLE__ WHERE hasTokenCaseInsensitive(ifNull(message, ''), 'ERROR') ORDER BY timestamp DESC LIMIT 1"
     "mixed-residual|SELECT partition, offset FROM __TABLE__ WHERE labels['app'] = 'api' AND positionCaseInsensitive(message, 'error') > 0 ORDER BY partition, offset"
     "disjunction|SELECT partition, offset FROM __TABLE__ WHERE labels['app'] = 'api' OR metadata['code'] = '200' ORDER BY partition, offset"
     "missing-map-key|SELECT labels['missing'] AS missing, count() AS rows FROM __TABLE__ GROUP BY missing ORDER BY missing"
@@ -103,12 +108,10 @@ for entry in "${queries[@]}"; do
     reference_output=$RESULT_DIR/$name.reference
 
     {
-        [[ -z $SOURCE_SETUP ]] || printf '%s\n' "$SOURCE_SETUP"
         printf '%s FORMAT JSONCompactEachRow\n' "$external_query"
     } | run_clickhouse local --multiquery >"$external_output"
 
     {
-        [[ -z $SOURCE_SETUP ]] || printf '%s\n' "$SOURCE_SETUP"
         printf '%s\n' "CREATE TABLE reference ($STRUCTURE) ENGINE = Memory;"
         printf '%s\n' "INSERT INTO reference SELECT * FROM $SOURCE;"
         printf '%s FORMAT JSONCompactEachRow\n' "$reference_query"
@@ -122,8 +125,4 @@ for entry in "${queries[@]}"; do
     echo "PASS $name"
 done
 
-if [[ $SHARDLOG_ADAPTER_MODE -eq 1 ]]; then
-    echo "StorageShardLog compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
-else
-    echo "ClickHouse compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
-fi
+echo "Stock ClickHouse URL/RowBinary compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"

@@ -1,27 +1,42 @@
 use std::borrow::Cow;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use shard_stream_core::{LogicalOffset, ShardId, TopicPartition};
+use shard_stream_engine::DurableSinkCheckpoint;
 
 use crate::ingest_pack::{
     IndexedIngestFrame, decode_indexed_ingest_frames, decode_indexed_ingest_records,
+    decompress_indexed_ingest_frame,
+};
+use crate::tier_ingest::{
+    TierIngestAppendSource, TierIngestFrameSource, decode_tier_ingest_group,
+    write_tier_ingest_group,
 };
 use crate::{
     BlockCatalog, BlockDescriptor, BlockId, CompressionBlockCollator, CompressionBlockScore,
     CompressionCodec, CompressionCohortId, CompressionLocalityConfig, CompressionLocalityRecord,
     CompressionLocalityStats, CompressionPlacement, CompressionPlacementId, CompressionTemperature,
     DictionaryCache, DictionaryCatalog, DictionaryCatalogSnapshot, DictionaryId, DictionaryInsert,
-    DurableLogRecord, LogDbError, LogDbResult, LogMatch, LogQuery, MessageFingerprint,
-    OtlpLogDecoder, OtlpLogEvent, QueryOrder, RealtimeDictionaryObserver,
-    RealtimeDictionaryTrainer, RecordRef, fingerprint_message, scan_message_terms,
-    structural::{encode_structural_block, row_source_bytes},
+    DurableLog, EmbeddedFrameIndex, LogMatch, LogQuery, MessageFingerprint, ObjectMetadata,
+    ObjectTierConfig, OtlpLogDecoder, OtlpLogEvent, QueryOrder, RealtimeDictionaryObserver,
+    RealtimeDictionaryTrainer, SharedTelemetryObjectStore, SsdObjectCache, TelemetryError,
+    TelemetryObjectTier, TelemetryRecordRef, TelemetryResult, TierArtifactKind, TierArtifactSource,
+    TierCheckpoint, TierGroupSource, TierQueryRange, TierRetentionReport, fingerprint_message,
+    scan_message_terms,
+    structural::{
+        decode_structural_messages, decode_structural_positions, decode_structural_records,
+        encode_structural_block, row_source_bytes,
+    },
 };
 
 const MAX_REBALANCE_PASSES: u8 = 3;
 const MESSAGE_TERM_CACHE_ENTRIES: usize = 1_024;
 const FIELD_CACHE_ENTRIES: usize = 1_024;
+const MAX_TIER_QUERY_INDEX_READ_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 type PartitionTermIds = HashMap<Arc<str>, usize>;
 type PartitionFieldIds = HashMap<Arc<str>, HashMap<Arc<str>, usize>>;
@@ -119,6 +134,92 @@ impl HotPostingList {
         }
         ordinals
     }
+
+    fn contains(&self, ordinal: u32) -> bool {
+        self.runs
+            .binary_search_by(|run| {
+                if run.last < ordinal {
+                    std::cmp::Ordering::Less
+                } else if run.first > ordinal {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+
+    fn visit_in(
+        &self,
+        start: u32,
+        end: u32,
+        order: QueryOrder,
+        mut visit: impl FnMut(u32) -> bool,
+    ) {
+        match order {
+            QueryOrder::OldestFirst => {
+                for run in &self.runs {
+                    if run.last < start {
+                        continue;
+                    }
+                    if run.first >= end {
+                        break;
+                    }
+                    let first = run.first.max(start);
+                    let last = run.last.min(end.saturating_sub(1));
+                    for ordinal in first..=last {
+                        if !visit(ordinal) {
+                            return;
+                        }
+                    }
+                }
+            }
+            QueryOrder::NewestFirst => {
+                for run in self.runs.iter().rev() {
+                    if run.first >= end {
+                        continue;
+                    }
+                    if run.last < start {
+                        break;
+                    }
+                    let first = run.first.max(start);
+                    let last = run.last.min(end.saturating_sub(1));
+                    for ordinal in (first..=last).rev() {
+                        if !visit(ordinal) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_hot_posting_intersection(
+    postings: &[&HotPostingList],
+    start: u32,
+    end: u32,
+    order: QueryOrder,
+    limit: Option<usize>,
+) -> Vec<u32> {
+    let Some(first) = postings.first() else {
+        return Vec::new();
+    };
+    let take = limit.unwrap_or(usize::MAX);
+    if take == 0 {
+        return Vec::new();
+    }
+    let mut ordinals = Vec::with_capacity(take.min(first.cardinality));
+    first.visit_in(start, end, order, |ordinal| {
+        if postings[1..]
+            .iter()
+            .all(|postings| postings.contains(ordinal))
+        {
+            ordinals.push(ordinal);
+        }
+        ordinals.len() < take
+    });
+    ordinals
 }
 
 /// Resource limits for one shard-aligned log stripe.
@@ -146,25 +247,25 @@ impl Default for StripeConfig {
 }
 
 impl StripeConfig {
-    fn validate(&self) -> LogDbResult<()> {
+    fn validate(&self) -> TelemetryResult<()> {
         if self.target_block_bytes == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "target_block_bytes must be nonzero",
             ));
         }
         if self.dictionary_cache_bytes == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "dictionary_cache_bytes must be nonzero",
             ));
         }
         if !zstd::compression_level_range().contains(&self.compression_level) {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "compression_level is outside zstd's supported range",
             ));
         }
         self.compression_locality
             .validate()
-            .map_err(LogDbError::InvalidConfig)?;
+            .map_err(TelemetryError::InvalidConfig)?;
         Ok(())
     }
 }
@@ -185,7 +286,7 @@ struct DictionarySelection {
 
 #[derive(Debug, Clone)]
 struct IndexedRecord {
-    record: DurableLogRecord,
+    record: DurableLog,
     tentative_placement: CompressionPlacement,
     temperature: CompressionTemperature,
     final_placement: Option<CompressionPlacement>,
@@ -217,16 +318,27 @@ struct PartitionIndex {
 
 #[derive(Debug)]
 struct IndexedFrameAppend {
+    tenant: Arc<str>,
     first_offset: LogicalOffset,
     last_offset: LogicalOffset,
     record_count: u32,
     frames: Vec<IndexedIngestFrame>,
+    next_checkpoint: Option<DurableSinkCheckpoint>,
 }
 
 #[derive(Debug, Default)]
 struct IndexedFramePartition {
     appends: Vec<IndexedFrameAppend>,
     indexed_through: Option<LogicalOffset>,
+}
+
+#[derive(Debug)]
+struct StripeTierState {
+    tiers: HashMap<TopicPartition, TelemetryObjectTier<SharedTelemetryObjectStore>>,
+    spool_directory: PathBuf,
+    control_cache: Arc<SsdObjectCache>,
+    payload_cache: Arc<SsdObjectCache>,
+    config: ObjectTierConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -260,7 +372,7 @@ impl PartitionIndex {
 
 #[derive(Debug, Clone)]
 struct PendingRecord {
-    record: DurableLogRecord,
+    record: DurableLog,
     source_bytes: u64,
     fingerprint: MessageFingerprint,
 }
@@ -396,12 +508,12 @@ impl std::fmt::Debug for StripeCompressor {
 }
 
 impl StripeCompressor {
-    fn new(zstd_level: i32) -> LogDbResult<Self> {
+    fn new(zstd_level: i32) -> TelemetryResult<Self> {
         Ok(Self {
             zstd_level,
             active_dictionary: None,
             zstd: zstd::bulk::Compressor::new(zstd_level)
-                .map_err(|error| LogDbError::CompressionFailed(error.to_string()))?,
+                .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?,
         })
     }
 
@@ -410,23 +522,23 @@ impl StripeCompressor {
         source: &[u8],
         dictionary_id: Option<DictionaryId>,
         dictionary_payload: Option<&[u8]>,
-    ) -> LogDbResult<Vec<u8>> {
+    ) -> TelemetryResult<Vec<u8>> {
         if self.active_dictionary != dictionary_id {
             let dictionary = match (dictionary_id, dictionary_payload) {
                 (Some(_), Some(payload)) => payload,
                 (Some(dictionary_id), None) => {
-                    return Err(LogDbError::MissingDictionary(dictionary_id));
+                    return Err(TelemetryError::MissingDictionary(dictionary_id));
                 }
                 (None, _) => &[],
             };
             self.zstd
                 .set_dictionary(self.zstd_level, dictionary)
-                .map_err(|error| LogDbError::CompressionFailed(error.to_string()))?;
+                .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
             self.active_dictionary = dictionary_id;
         }
         self.zstd
             .compress(source)
-            .map_err(|error| LogDbError::CompressionFailed(error.to_string()))
+            .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))
     }
 }
 
@@ -434,7 +546,7 @@ impl StripeCompressor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexReceipt {
     /// Record made visible to term and metadata queries.
-    pub record_ref: RecordRef,
+    pub record_ref: TelemetryRecordRef,
     /// Indexed watermark after the publication.
     pub indexed_through: LogicalOffset,
     /// Per-record temperature used for block scoring.
@@ -459,7 +571,7 @@ struct AppliedRecord {
 /// replaying records from the last sealed index-block watermark.
 pub trait ShardStreamDurableSink {
     /// Publishes a durable log event into the shard-local hot index.
-    fn on_durable_append(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt>;
+    fn on_durable_append(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt>;
 }
 
 /// A lock-free-by-ownership hot index for one shard-stream physical shard.
@@ -487,11 +599,13 @@ pub struct LogStripe {
     realtime_dictionary: Option<RealtimeDictionaryObserver>,
     block_collator: CompressionBlockCollator,
     compressor: StripeCompressor,
+    tier: Option<StripeTierState>,
+    next_frame_id: u64,
 }
 
 impl LogStripe {
     /// Creates a stripe owned by one physical shard-stream shard.
-    pub fn new(stream_shard_id: ShardId, config: StripeConfig) -> LogDbResult<Self> {
+    pub fn new(stream_shard_id: ShardId, config: StripeConfig) -> TelemetryResult<Self> {
         config.validate()?;
         let compression_level = config.compression_level;
         let block_collator = CompressionBlockCollator::new(
@@ -519,6 +633,8 @@ impl LogStripe {
             realtime_dictionary: None,
             block_collator,
             compressor: StripeCompressor::new(compression_level)?,
+            tier: None,
+            next_frame_id: 0,
         })
     }
 
@@ -528,7 +644,7 @@ impl LogStripe {
         stream_shard_id: ShardId,
         config: StripeConfig,
         dictionary_catalog: Arc<DictionaryCatalog>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let mut stripe = Self::new(stream_shard_id, config)?;
         stripe.dictionary_catalog = Some(dictionary_catalog);
         stripe.refresh_dictionary_catalog()?;
@@ -541,7 +657,7 @@ impl LogStripe {
         stream_shard_id: ShardId,
         config: StripeConfig,
         trainer: &RealtimeDictionaryTrainer,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let mut stripe = Self::with_dictionary_catalog(stream_shard_id, config, trainer.catalog())?;
         stripe.realtime_dictionary = Some(trainer.observer());
         Ok(stripe)
@@ -581,6 +697,74 @@ impl LogStripe {
         &self.catalog
     }
 
+    /// Attaches partition-scoped immutable object catalogs and returns their
+    /// durable recovery watermarks.
+    pub(crate) fn attach_object_tier(
+        &mut self,
+        store: SharedTelemetryObjectStore,
+        spool_directory: PathBuf,
+        control_cache: Arc<SsdObjectCache>,
+        payload_cache: Arc<SsdObjectCache>,
+        partitions: impl IntoIterator<Item = TopicPartition>,
+        config: ObjectTierConfig,
+    ) -> TelemetryResult<Vec<DurableSinkCheckpoint>> {
+        if self.tier.is_some() {
+            return Err(TelemetryError::InvalidConfig(
+                "an object tier is already attached to this stripe",
+            ));
+        }
+        let spool_directory = spool_directory.join(format!("shard-{}", self.stream_shard_id.get()));
+        fs::create_dir_all(&spool_directory)
+            .map_err(|error| TelemetryError::StorageIo(format!("create tier spool: {error}")))?;
+        let mut tiers = HashMap::new();
+        let mut checkpoints = Vec::new();
+        let mut next_frame_id = self.next_frame_id;
+        for partition in partitions {
+            let object_tier =
+                TelemetryObjectTier::open(store.clone(), self.stream_shard_id, partition, config)?;
+            next_frame_id = next_frame_id.max(object_tier.root().next_block_id);
+            if let Some(checkpoint) = object_tier.root().latest_checkpoint {
+                checkpoints.push(DurableSinkCheckpoint {
+                    topic_partition: partition,
+                    next_placement_sequence: shard_stream_core::PlacementSequence::new(
+                        checkpoint.next_placement_sequence,
+                    ),
+                    next_offset: LogicalOffset::new(checkpoint.next_offset),
+                });
+            }
+            if tiers.insert(partition, object_tier).is_some() {
+                return Err(TelemetryError::InvalidConfig(
+                    "object tier contains a duplicate partition",
+                ));
+            }
+        }
+        if tiers.is_empty() {
+            return Err(TelemetryError::InvalidConfig(
+                "object tier requires at least one partition",
+            ));
+        }
+        self.next_frame_id = next_frame_id;
+        self.tier = Some(StripeTierState {
+            tiers,
+            spool_directory,
+            control_cache,
+            payload_cache,
+            config,
+        });
+        Ok(checkpoints)
+    }
+
+    /// Returns compressed payload bytes that have not reached immutable object storage.
+    #[must_use]
+    pub(crate) fn retained_payload_bytes(&self) -> u64 {
+        self.indexed_frame_partitions
+            .values()
+            .flat_map(|partition| &partition.appends)
+            .flat_map(|append| &append.frames)
+            .map(|frame| u64::try_from(frame.compressed.len()).unwrap_or(u64::MAX))
+            .sum()
+    }
+
     /// Returns the local catalog of sealed data blocks for offload bookkeeping.
     pub fn catalog_mut(&mut self) -> &mut BlockCatalog {
         &mut self.catalog
@@ -613,7 +797,7 @@ impl LogStripe {
     #[must_use]
     pub fn final_compression_placement(
         &self,
-        record_ref: RecordRef,
+        record_ref: TelemetryRecordRef,
     ) -> Option<CompressionPlacement> {
         self.partitions
             .get(&record_ref.topic_partition)
@@ -622,7 +806,7 @@ impl LogStripe {
     }
 
     /// Adopts control-plane state at an append boundary.
-    pub fn begin_append_batch(&mut self) -> LogDbResult<bool> {
+    pub fn begin_append_batch(&mut self) -> TelemetryResult<bool> {
         self.refresh_dictionary_catalog()
     }
 
@@ -632,7 +816,7 @@ impl LogStripe {
     /// stripe-owned assignment map and LRU. The durable sink invokes it once
     /// before each append batch, while embedded callers can choose their own
     /// safe batch boundary.
-    pub fn refresh_dictionary_catalog(&mut self) -> LogDbResult<bool> {
+    pub fn refresh_dictionary_catalog(&mut self) -> TelemetryResult<bool> {
         let Some(dictionary_catalog) = &self.dictionary_catalog else {
             return Ok(false);
         };
@@ -660,7 +844,7 @@ impl LogStripe {
         placement_id: CompressionPlacementId,
         dictionary_id: DictionaryId,
         payload: Arc<[u8]>,
-    ) -> LogDbResult<DictionaryInsert> {
+    ) -> TelemetryResult<DictionaryInsert> {
         if let Some(dictionary_catalog) = &self.dictionary_catalog {
             dictionary_catalog.publish(placement_id, dictionary_id, Arc::clone(&payload))?;
             self.refresh_dictionary_catalog()?;
@@ -677,9 +861,9 @@ impl LogStripe {
     /// Index postings are written before the visible watermark advances. A
     /// query constrained to [`Self::indexed_through`] consequently cannot see
     /// an incomplete posting update.
-    pub fn apply_durable(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    pub fn apply_durable(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         if record.stream_shard_id != self.stream_shard_id {
-            return Err(LogDbError::WrongStripe {
+            return Err(TelemetryError::WrongStripe {
                 expected: self.stream_shard_id,
                 observed: record.stream_shard_id,
             });
@@ -690,7 +874,7 @@ impl LogStripe {
             .and_then(|partition| partition.record(record.record_ref.offset))
             .is_some()
         {
-            return Err(LogDbError::DuplicateRecord {
+            return Err(TelemetryError::DuplicateRecord {
                 partition: record.record_ref.topic_partition,
                 offset: record.record_ref.offset,
             });
@@ -698,16 +882,16 @@ impl LogStripe {
         self.apply_durable_new(record)
     }
 
-    fn apply_durable_new(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    fn apply_durable_new(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         self.apply_durable_new_inner(record, true)
             .map(|applied| applied.receipt)
     }
 
     fn apply_durable_new_inner(
         &mut self,
-        record: DurableLogRecord,
+        record: DurableLog,
         index_record: bool,
-    ) -> LogDbResult<AppliedRecord> {
+    ) -> TelemetryResult<AppliedRecord> {
         self.validate_offset(&record)?;
 
         let record_source_bytes = row_source_bytes(&record)?;
@@ -741,8 +925,8 @@ impl LogStripe {
                 .partitions
                 .entry(reference.topic_partition)
                 .or_default();
-            let record_ordinal =
-                u32::try_from(partition.records.len()).map_err(|_| LogDbError::RecordTooLarge)?;
+            let record_ordinal = u32::try_from(partition.records.len())
+                .map_err(|_| TelemetryError::RecordTooLarge)?;
             partition.records.push(IndexedRecord {
                 record: record.clone(),
                 tentative_placement: tentative_compression_placement,
@@ -829,7 +1013,7 @@ impl LogStripe {
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         events: impl IntoIterator<Item = OtlpLogEvent>,
-    ) -> LogDbResult<Vec<IndexReceipt>> {
+    ) -> TelemetryResult<Vec<IndexReceipt>> {
         self.begin_append_batch()?;
         let events = events.into_iter().collect::<Vec<_>>();
         validate_batch_offset_range(topic_partition, first_offset, events.len())?;
@@ -857,49 +1041,113 @@ impl LogStripe {
     /// The authoritative compressed cohort frames remain resident and the
     /// compressor-derived indexes select candidates. Exact bodies and fields
     /// are reconstructed only for candidate records during lookup.
+    #[cfg(test)]
     pub(crate) fn apply_indexed_ingest_pack(
         &mut self,
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         record_count: u32,
         payload: Bytes,
+    ) -> TelemetryResult<()> {
+        self.apply_indexed_ingest_pack_inner(
+            Arc::from("test-tenant"),
+            topic_partition,
+            first_offset,
+            record_count,
+            payload,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_checkpointed_ingest_pack(
+        &mut self,
+        tenant: Arc<str>,
+        topic_partition: TopicPartition,
+        first_offset: LogicalOffset,
+        record_count: u32,
+        payload: Bytes,
         transient_context: Option<&[u8]>,
-    ) -> LogDbResult<()> {
-        if record_count == 0 {
-            return Err(LogDbError::InvalidConfig(
-                "compressed ingest append must contain records",
+        checkpoints: (DurableSinkCheckpoint, DurableSinkCheckpoint),
+    ) -> TelemetryResult<()> {
+        let (expected_checkpoint, next_checkpoint) = checkpoints;
+        if expected_checkpoint.topic_partition != topic_partition
+            || next_checkpoint.topic_partition != topic_partition
+        {
+            return Err(TelemetryError::CorruptSinkJournal(
+                "indexed append checkpoints refer to another partition".into(),
+            ));
+        }
+        self.apply_indexed_ingest_pack_inner(
+            tenant,
+            topic_partition,
+            first_offset,
+            record_count,
+            payload,
+            transient_context,
+            Some(next_checkpoint),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_indexed_ingest_pack_inner(
+        &mut self,
+        tenant: Arc<str>,
+        topic_partition: TopicPartition,
+        first_offset: LogicalOffset,
+        record_count: u32,
+        payload: Bytes,
+        transient_context: Option<&[u8]>,
+        next_checkpoint: Option<DurableSinkCheckpoint>,
+    ) -> TelemetryResult<()> {
+        if tenant.is_empty() || record_count == 0 {
+            return Err(TelemetryError::InvalidConfig(
+                "compressed ingest append must have a tenant and contain records",
             ));
         }
         let last_offset = batch_offset(
             topic_partition,
             first_offset,
             usize::try_from(record_count - 1)
-                .map_err(|_| LogDbError::OffsetExhausted(topic_partition))?,
+                .map_err(|_| TelemetryError::OffsetExhausted(topic_partition))?,
         )?;
         if let Some(previous) = self.indexed_through(topic_partition)
             && first_offset <= previous
         {
+            if last_offset <= previous {
+                return Ok(());
+            }
             let expected = previous
                 .get()
                 .checked_add(1)
                 .map(LogicalOffset::new)
-                .ok_or(LogDbError::OffsetExhausted(topic_partition))?;
-            return Err(LogDbError::OffsetOutOfOrder {
+                .ok_or(TelemetryError::OffsetExhausted(topic_partition))?;
+            return Err(TelemetryError::OffsetOutOfOrder {
                 partition: topic_partition,
                 expected,
                 observed: first_offset,
             });
         }
-        let frames = decode_indexed_ingest_frames(payload, transient_context, record_count)?;
+        let mut frames = decode_indexed_ingest_frames(payload, transient_context, record_count)?;
+        for frame in &mut frames {
+            frame.frame_id = self.next_frame_id;
+            self.next_frame_id = self
+                .next_frame_id
+                .checked_add(1)
+                .ok_or(TelemetryError::RecordTooLarge)?;
+        }
         let partition = self
             .indexed_frame_partitions
             .entry(topic_partition)
             .or_default();
         partition.appends.push(IndexedFrameAppend {
+            tenant,
             first_offset,
             last_offset,
             record_count,
             frames,
+            next_checkpoint,
         });
         // Publication barrier: readers never observe a watermark before all
         // frame metadata and embedded index views are installed.
@@ -918,7 +1166,7 @@ impl LogStripe {
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         payload: &[u8],
-    ) -> LogDbResult<Vec<IndexReceipt>> {
+    ) -> TelemetryResult<Vec<IndexReceipt>> {
         self.apply_otlp_events(
             topic_partition,
             first_offset,
@@ -927,7 +1175,7 @@ impl LogStripe {
     }
 
     /// Seals every active block and returns their immutable descriptors.
-    pub fn seal_active_blocks(&mut self) -> LogDbResult<Vec<BlockDescriptor>> {
+    pub fn seal_active_blocks(&mut self) -> TelemetryResult<Vec<BlockDescriptor>> {
         let active_blocks = std::mem::take(&mut self.active_blocks);
         let mut sealed = Vec::new();
         for (key, active) in active_blocks {
@@ -936,12 +1184,203 @@ impl LogStripe {
         Ok(sealed)
     }
 
+    /// Publishes complete indexed append boundaries to immutable object storage.
+    ///
+    /// When `force` is false, only groups at the configured target size are
+    /// published. A forced pass seals every remaining checkpointed append.
+    pub(crate) fn offload_indexed_groups(&mut self, force: bool) -> TelemetryResult<usize> {
+        let Some(state) = self.tier.as_ref() else {
+            return Ok(0);
+        };
+        let partitions = state.tiers.keys().copied().collect::<Vec<_>>();
+        let mut published = 0usize;
+        for partition in partitions {
+            loop {
+                if !self.offload_one_indexed_group(partition, force)? {
+                    break;
+                }
+                published = published.saturating_add(1);
+            }
+        }
+        Ok(published)
+    }
+
+    pub(crate) fn reclaim_retired_object_generations(&mut self) -> TelemetryResult<()> {
+        let Some(state) = self.tier.as_mut() else {
+            return Ok(());
+        };
+        for tier in state.tiers.values_mut() {
+            tier.reclaim_retired_objects()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_object_tier_since(
+        &mut self,
+        cutoff_timestamp_unix_nanos: u64,
+    ) -> TelemetryResult<TierRetentionReport> {
+        let Some(state) = self.tier.as_mut() else {
+            return Ok(TierRetentionReport::default());
+        };
+        let mut total = TierRetentionReport::default();
+        for tier in state.tiers.values_mut() {
+            let report = tier.retain_since_timestamp(cutoff_timestamp_unix_nanos)?;
+            total.retired_groups = total.retired_groups.saturating_add(report.retired_groups);
+            total.retired_payload_bytes = total
+                .retired_payload_bytes
+                .saturating_add(report.retired_payload_bytes);
+            total.retired_objects = total.retired_objects.saturating_add(report.retired_objects);
+        }
+        Ok(total)
+    }
+
+    fn offload_one_indexed_group(
+        &mut self,
+        partition: TopicPartition,
+        force: bool,
+    ) -> TelemetryResult<bool> {
+        let state = self
+            .tier
+            .as_ref()
+            .ok_or(TelemetryError::InvalidConfig("object tier is not attached"))?;
+        let config = state.config;
+        let Some(resident) = self.indexed_frame_partitions.get(&partition) else {
+            return Ok(false);
+        };
+        let mut selected_appends = 0usize;
+        let mut selected_payload_bytes = 0u64;
+        let mut selected_frames = 0usize;
+        for append in &resident.appends {
+            if append.next_checkpoint.is_none() {
+                break;
+            }
+            let append_payload_bytes = append.frames.iter().try_fold(0u64, |total, frame| {
+                total
+                    .checked_add(
+                        u64::try_from(frame.compressed.len())
+                            .map_err(|_| TelemetryError::RecordTooLarge)?,
+                    )
+                    .ok_or(TelemetryError::RecordTooLarge)
+            })?;
+            let append_frames = append.frames.len();
+            if append_payload_bytes > config.max_group_payload_bytes
+                || append_frames > config.max_blocks_per_group
+            {
+                return Err(TelemetryError::ObjectStore(
+                    "one durable append exceeds the object-tier group limit".into(),
+                ));
+            }
+            if selected_appends > 0
+                && (selected_payload_bytes.saturating_add(append_payload_bytes)
+                    > config.max_group_payload_bytes
+                    || selected_frames.saturating_add(append_frames) > config.max_blocks_per_group)
+            {
+                break;
+            }
+            selected_appends += 1;
+            selected_payload_bytes = selected_payload_bytes
+                .checked_add(append_payload_bytes)
+                .ok_or(TelemetryError::RecordTooLarge)?;
+            selected_frames = selected_frames
+                .checked_add(append_frames)
+                .ok_or(TelemetryError::RecordTooLarge)?;
+            if selected_payload_bytes >= config.target_group_payload_bytes {
+                break;
+            }
+        }
+        if selected_appends == 0
+            || (!force && selected_payload_bytes < config.target_group_payload_bytes)
+        {
+            return Ok(false);
+        }
+
+        let sources = resident.appends[..selected_appends]
+            .iter()
+            .map(|append| TierIngestAppendSource {
+                tenant: append.tenant.to_string(),
+                first_offset: append.first_offset,
+                last_offset: append.last_offset,
+                record_count: append.record_count,
+                frames: append
+                    .frames
+                    .iter()
+                    .map(|frame| TierIngestFrameSource {
+                        frame_id: frame.frame_id,
+                        cohort: frame.cohort,
+                        record_count: frame.record_count,
+                        structural_bytes: frame.structural_bytes,
+                        min_timestamp_unix_nanos: frame.min_timestamp_unix_nanos,
+                        max_timestamp_unix_nanos: frame.max_timestamp_unix_nanos,
+                        compressed: frame.compressed.clone(),
+                        index: frame.index.clone(),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let checkpoint = resident.appends[selected_appends - 1]
+            .next_checkpoint
+            .expect("selected checkpointed append has a next checkpoint");
+        let state = self
+            .tier
+            .as_mut()
+            .expect("object tier was checked before group selection");
+        let tier = state
+            .tiers
+            .get_mut(&partition)
+            .expect("selected partition has an object tier");
+        let group_sequence = tier
+            .root()
+            .pages
+            .last()
+            .map_or(0, |page| page.last_group_sequence.saturating_add(1));
+        let group_directory = state.spool_directory.join(format!(
+            "topic-{}-partition-{}/group-{group_sequence:020}",
+            partition.topic_id.get(),
+            partition.partition_id.get()
+        ));
+        let payload_path = group_directory.join("payload.pack");
+        let query_index_path = group_directory.join("query-index.sltqix");
+        let blocks = write_tier_ingest_group(&sources, &payload_path, &query_index_path)?;
+        tier.publish_group(TierGroupSource {
+            group_sequence,
+            checkpoint: TierCheckpoint {
+                next_placement_sequence: checkpoint.next_placement_sequence.get(),
+                next_offset: checkpoint.next_offset.get(),
+            },
+            blocks,
+            artifacts: vec![
+                TierArtifactSource {
+                    kind: TierArtifactKind::PayloadPack,
+                    name: "payload.pack".into(),
+                    path: payload_path.clone(),
+                },
+                TierArtifactSource {
+                    kind: TierArtifactKind::QueryIndex,
+                    name: "query-index.sltqix".into(),
+                    path: query_index_path.clone(),
+                },
+            ],
+        })?;
+        self.indexed_frame_partitions
+            .get_mut(&partition)
+            .expect("resident partition remains present")
+            .appends
+            .drain(..selected_appends);
+        remove_published_spool_file(&payload_path);
+        remove_published_spool_file(&query_index_path);
+        let _ = fs::remove_dir(&group_directory);
+        if let Some(parent) = group_directory.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+        Ok(true)
+    }
+
     /// Marks a sealed block as durably written to the object tier.
     pub fn mark_block_offloaded(
         &mut self,
         block_id: BlockId,
         object_key: impl Into<Arc<str>>,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         self.catalog.mark_offloaded(block_id, object_key)
     }
 
@@ -951,7 +1390,7 @@ impl LogStripe {
         block_id: BlockId,
         object_key: impl Into<Arc<str>>,
         object_offset: u64,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         self.catalog
             .mark_offloaded_range(block_id, object_key, object_offset)
     }
@@ -966,7 +1405,7 @@ impl LogStripe {
         self.query_checked(query).unwrap_or_default()
     }
 
-    pub(crate) fn query_checked(&self, query: &LogQuery) -> LogDbResult<Vec<LogMatch>> {
+    pub(crate) fn query_checked(&self, query: &LogQuery) -> TelemetryResult<Vec<LogMatch>> {
         if query.limit == Some(0) || query.has_invalid_range() {
             return Ok(Vec::new());
         }
@@ -974,6 +1413,7 @@ impl LogStripe {
         if let Some(partition) = self.indexed_frame_partitions.get(&query.topic_partition) {
             matches.extend(self.query_indexed_frames(query, partition)?);
         }
+        matches.extend(self.query_tiered_groups(query)?);
         matches.sort_unstable_by(|left, right| query.compare(&left.record, &right.record));
         if let Some(limit) = query.limit {
             matches.truncate(limit);
@@ -984,10 +1424,23 @@ impl LogStripe {
     pub(crate) fn query_partitions_checked(
         &self,
         queries: &[LogQuery],
-    ) -> LogDbResult<Vec<LogMatch>> {
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let Some(ordering_query) = queries.first() else {
             return Ok(Vec::new());
         };
+        if self.tier.is_some() {
+            let mut matches = queries.iter().try_fold(Vec::new(), |mut matches, query| {
+                matches.extend(self.query_checked(query)?);
+                Ok::<_, TelemetryError>(matches)
+            })?;
+            matches.sort_unstable_by(|left, right| {
+                ordering_query.compare(&left.record, &right.record)
+            });
+            if let Some(limit) = ordering_query.limit {
+                matches.truncate(limit);
+            }
+            return Ok(matches);
+        }
         let Some(limit) = ordering_query.limit else {
             return queries.iter().try_fold(Vec::new(), |mut matches, query| {
                 matches.extend(self.query_checked(query)?);
@@ -1071,6 +1524,114 @@ impl LogStripe {
         Ok(matches)
     }
 
+    /// Counts one tenant's records without reading or reconstructing payloads.
+    ///
+    /// Tenant identity is exact append metadata for compressed and tiered
+    /// frames. The legacy hot-record path uses its exact (non-hashed) posting
+    /// table. Consequently fingerprint collisions can never change this count.
+    pub(crate) fn count_tenant_records(
+        &self,
+        tenant: &str,
+        partitions: &[TopicPartition],
+    ) -> TelemetryResult<u64> {
+        let mut total = 0_u64;
+        for topic_partition in partitions {
+            if let Some(partition) = self.partitions.get(topic_partition)
+                && let Some(posting) = partition
+                    .field_ids
+                    .get("resource.loki.tenant")
+                    .and_then(|values| values.get(tenant))
+                    .and_then(|field_id| partition.field_postings.get(*field_id))
+            {
+                total = total
+                    .checked_add(
+                        u64::try_from(posting.cardinality)
+                            .map_err(|_| TelemetryError::RecordTooLarge)?,
+                    )
+                    .ok_or(TelemetryError::RecordTooLarge)?;
+            }
+            if let Some(partition) = self.indexed_frame_partitions.get(topic_partition) {
+                for append in &partition.appends {
+                    if append.tenant.as_ref() == tenant {
+                        total = total
+                            .checked_add(u64::from(append.record_count))
+                            .ok_or(TelemetryError::RecordTooLarge)?;
+                    }
+                }
+            }
+            total = total
+                .checked_add(self.count_tiered_tenant_records(*topic_partition, tenant)?)
+                .ok_or(TelemetryError::RecordTooLarge)?;
+        }
+        Ok(total)
+    }
+
+    /// Returns only logical partitions that currently contain this tenant.
+    ///
+    /// The directory is reconstructed from hot postings, compressed-frame
+    /// append metadata, and object-tier catalogs, so callers do not need to
+    /// enumerate every configured logical partition after restart or offload.
+    pub(crate) fn tenant_partitions(&self, tenant: &str) -> TelemetryResult<Vec<TopicPartition>> {
+        let mut candidates = self.partitions.keys().copied().collect::<Vec<_>>();
+        candidates.extend(self.indexed_frame_partitions.keys().copied());
+        if let Some(state) = &self.tier {
+            candidates.extend(state.tiers.keys().copied());
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        let mut matches = Vec::with_capacity(candidates.len());
+        for partition in candidates {
+            if self.count_tenant_records(tenant, std::slice::from_ref(&partition))? > 0 {
+                matches.push(partition);
+            }
+        }
+        Ok(matches)
+    }
+
+    fn count_tiered_tenant_records(
+        &self,
+        topic_partition: TopicPartition,
+        tenant: &str,
+    ) -> TelemetryResult<u64> {
+        let Some(state) = &self.tier else {
+            return Ok(0);
+        };
+        let Some(tier) = state.tiers.get(&topic_partition) else {
+            return Ok(0);
+        };
+        let groups = tier.candidate_groups_cached(
+            TierQueryRange {
+                first_offset: None,
+                last_offset: None,
+                min_timestamp_unix_nanos: None,
+                max_timestamp_unix_nanos: None,
+                signal_identity: None,
+            },
+            &state.control_cache,
+        )?;
+        let mut total = 0_u64;
+        for group in groups {
+            let manifest = tier.load_group_cached(&group, &state.control_cache)?;
+            let query_artifact = manifest
+                .artifact(TierArtifactKind::QueryIndex)
+                .ok_or_else(|| TelemetryError::CorruptTier("group has no query index".into()))?;
+            let query_index = tier.read_artifact_cached(
+                query_artifact,
+                MAX_TIER_QUERY_INDEX_READ_BYTES,
+                &state.control_cache,
+            )?;
+            for append in decode_tier_ingest_group(&query_index, &manifest.blocks)? {
+                if append.tenant == tenant {
+                    total = total
+                        .checked_add(u64::from(append.record_count))
+                        .ok_or(TelemetryError::RecordTooLarge)?;
+                }
+            }
+        }
+        Ok(total)
+    }
+
     fn query_hot_matches(&self, query: &LogQuery) -> Vec<LogMatch> {
         self.partitions
             .get(&query.topic_partition)
@@ -1096,7 +1657,7 @@ impl LogStripe {
     /// list and intersects each remaining list with a linear merge, making
     /// constraint order irrelevant to the asymptotic cost.
     #[must_use]
-    pub fn query_refs(&self, query: &LogQuery) -> Vec<RecordRef> {
+    pub fn query_refs(&self, query: &LogQuery) -> Vec<TelemetryRecordRef> {
         self.query(query)
             .into_iter()
             .map(|matched| matched.record.record_ref)
@@ -1107,7 +1668,7 @@ impl LogStripe {
         &self,
         query: &LogQuery,
         partition: &IndexedFramePartition,
-    ) -> LogDbResult<Vec<LogMatch>> {
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let constraints = query.required_index_constraints();
         if constraints.impossible {
             return Ok(Vec::new());
@@ -1127,60 +1688,356 @@ impl LogStripe {
         Ok(matches)
     }
 
+    fn query_tiered_groups(&self, query: &LogQuery) -> TelemetryResult<Vec<LogMatch>> {
+        let Some(state) = &self.tier else {
+            return Ok(Vec::new());
+        };
+        let Some(tier) = state.tiers.get(&query.topic_partition) else {
+            return Ok(Vec::new());
+        };
+        let mut groups = tier.candidate_groups_cached(
+            TierQueryRange {
+                first_offset: query.start_offset.map(LogicalOffset::get),
+                last_offset: query.end_offset.map(LogicalOffset::get),
+                min_timestamp_unix_nanos: query.start_timestamp_unix_nanos,
+                max_timestamp_unix_nanos: query.end_timestamp_unix_nanos,
+                signal_identity: None,
+            },
+            &state.control_cache,
+        )?;
+        match query.order {
+            QueryOrder::NewestFirst => groups.sort_unstable_by(|left, right| {
+                right
+                    .max_timestamp_unix_nanos
+                    .cmp(&left.max_timestamp_unix_nanos)
+            }),
+            QueryOrder::OldestFirst => groups.sort_unstable_by(|left, right| {
+                left.min_timestamp_unix_nanos
+                    .cmp(&right.min_timestamp_unix_nanos)
+            }),
+        }
+        let mut matches = Vec::new();
+        for group in groups {
+            let manifest = tier.load_group_cached(&group, &state.control_cache)?;
+            let query_artifact = manifest
+                .artifact(TierArtifactKind::QueryIndex)
+                .ok_or_else(|| TelemetryError::CorruptTier("group has no query index".into()))?;
+            let query_index = tier.read_artifact_cached(
+                query_artifact,
+                MAX_TIER_QUERY_INDEX_READ_BYTES,
+                &state.control_cache,
+            )?;
+            let appends = decode_tier_ingest_group(&query_index, &manifest.blocks)?;
+            let payload_artifact = manifest
+                .artifact(TierArtifactKind::PayloadPack)
+                .ok_or_else(|| TelemetryError::CorruptTier("group has no payload pack".into()))?;
+            let payload_metadata = ObjectMetadata {
+                bytes: payload_artifact.bytes,
+                version_token: payload_artifact.checksum.clone(),
+                content_digest: payload_artifact.checksum.clone(),
+            };
+            let mut selected = Vec::new();
+            let mut ranges = Vec::new();
+            for append in appends {
+                let bounds = IndexedFrameAppend {
+                    tenant: Arc::from(append.tenant.as_str()),
+                    first_offset: append.first_offset,
+                    last_offset: append.last_offset,
+                    record_count: append.record_count,
+                    frames: Vec::new(),
+                    next_checkpoint: None,
+                };
+                if !append_matches_query_bounds(query, &bounds) {
+                    continue;
+                }
+                for cold_frame in append.frames {
+                    let candidates =
+                        indexed_frame_candidates(query, &cold_frame.index, cold_frame.record_count);
+                    if candidates.is_empty()
+                        || !timestamp_bounds_overlap(
+                            query,
+                            cold_frame.min_timestamp_unix_nanos,
+                            cold_frame.max_timestamp_unix_nanos,
+                        )
+                    {
+                        continue;
+                    }
+                    let range_end = cold_frame
+                        .payload_offset
+                        .checked_add(cold_frame.payload_bytes)
+                        .ok_or(TelemetryError::RecordTooLarge)?;
+                    ranges.push(cold_frame.payload_offset..range_end);
+                    selected.push((
+                        Arc::clone(&bounds.tenant),
+                        bounds.first_offset,
+                        bounds.last_offset,
+                        bounds.record_count,
+                        cold_frame,
+                        candidates,
+                    ));
+                }
+            }
+            let payloads = state.payload_cache.read_ranges_with_metadata(
+                tier.object_store(),
+                &payload_artifact.object_key,
+                &payload_metadata,
+                &ranges,
+            )?;
+            for (
+                (tenant, first_offset, last_offset, record_count, cold_frame, candidates),
+                compressed,
+            ) in selected.into_iter().zip(payloads)
+            {
+                if blake3::hash(&compressed).to_hex().as_str() != cold_frame.payload_checksum {
+                    return Err(TelemetryError::CorruptTier(format!(
+                        "tiered frame {} payload checksum failed",
+                        cold_frame.frame_id
+                    )));
+                }
+                let frame = IndexedIngestFrame {
+                    frame_id: cold_frame.frame_id,
+                    cohort: cold_frame.cohort,
+                    record_count: cold_frame.record_count,
+                    structural_bytes: cold_frame.structural_bytes,
+                    min_timestamp_unix_nanos: cold_frame.min_timestamp_unix_nanos,
+                    max_timestamp_unix_nanos: cold_frame.max_timestamp_unix_nanos,
+                    compressed: Bytes::from(compressed),
+                    index: cold_frame.index,
+                };
+                let bounds = IndexedFrameAppend {
+                    tenant,
+                    first_offset,
+                    last_offset,
+                    record_count,
+                    frames: Vec::new(),
+                    next_checkpoint: None,
+                };
+                matches.extend(self.decode_indexed_frame_candidates(
+                    query,
+                    &bounds,
+                    &frame,
+                    &candidates,
+                )?);
+            }
+        }
+        Ok(matches)
+    }
+
     fn query_indexed_frame(
         &self,
         query: &LogQuery,
         append: &IndexedFrameAppend,
         frame: &IndexedIngestFrame,
-    ) -> LogDbResult<Vec<LogMatch>> {
-        let constraints = query.required_index_constraints();
-        if constraints.impossible {
+    ) -> TelemetryResult<Vec<LogMatch>> {
+        let candidates = indexed_frame_candidates(query, &frame.index, frame.record_count);
+        if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let mut candidates = None::<Vec<u32>>;
-        for term in &constraints.terms {
-            intersect_frame_candidates(&mut candidates, frame.index.term_candidate_ordinals(term));
-            if candidates.as_ref().is_some_and(Vec::is_empty) {
-                return Ok(Vec::new());
+        self.decode_indexed_frame_candidates(query, append, frame, &candidates)
+    }
+
+    fn decode_indexed_frame_candidates(
+        &self,
+        query: &LogQuery,
+        append: &IndexedFrameAppend,
+        frame: &IndexedIngestFrame,
+        candidates: &[u32],
+    ) -> TelemetryResult<Vec<LogMatch>> {
+        let message_filterable = query.message_candidate_matches("").is_some();
+        if query.sort == crate::QuerySort::Timestamp
+            && (!query.has_residual_predicate() || message_filterable)
+            && let Some(limit) = query.limit
+            && candidates.len() > limit.saturating_mul(2).max(256)
+        {
+            let structural = decompress_indexed_ingest_frame(frame)?;
+            if frame.index.timestamp_offset_ordinal_ordered() {
+                let filter_messages_first = query.has_residual_predicate() && message_filterable;
+                let batch_len = if filter_messages_first {
+                    limit.saturating_mul(4).max(1_024)
+                } else {
+                    limit.saturating_mul(2).max(256)
+                };
+                let mut matches = Vec::new();
+                let mut consumed = 0usize;
+                while matches.len() < limit && consumed < candidates.len() {
+                    let mut batch = match query.order {
+                        QueryOrder::OldestFirst => {
+                            let start = consumed;
+                            let end = candidates.len().min(start.saturating_add(batch_len));
+                            consumed = end;
+                            candidates[start..end].to_vec()
+                        }
+                        QueryOrder::NewestFirst => {
+                            let end = candidates.len().saturating_sub(consumed);
+                            let start = end.saturating_sub(batch_len);
+                            consumed = consumed.saturating_add(end - start);
+                            candidates[start..end].to_vec()
+                        }
+                    };
+                    if filter_messages_first {
+                        let messages = decode_structural_messages(&structural, &batch)?;
+                        batch = batch
+                            .into_iter()
+                            .zip(messages)
+                            .filter_map(|(ordinal, message)| {
+                                query
+                                    .message_candidate_matches(&message)
+                                    .unwrap_or(false)
+                                    .then_some(ordinal)
+                            })
+                            .collect();
+                    }
+                    if !batch.is_empty() {
+                        matches.extend(self.decode_decompressed_frame_candidates(
+                            query,
+                            append,
+                            frame,
+                            &structural,
+                            &batch,
+                        )?);
+                    }
+                }
+                sort_and_limit_matches(&mut matches, query, limit);
+                return Ok(matches);
             }
-        }
-        for (key, value) in &constraints.fields {
-            intersect_frame_candidates(
-                &mut candidates,
-                frame.index.field_candidate_ordinals(key, value),
-            );
-            if candidates.as_ref().is_some_and(Vec::is_empty) {
-                return Ok(Vec::new());
+            let (offsets, timestamps) = decode_structural_positions(&structural)?;
+            let mut ranked = candidates.to_vec();
+            for ordinal in &ranked {
+                let index = usize::try_from(*ordinal).map_err(|_| {
+                    TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+                })?;
+                if index >= offsets.len() || index >= timestamps.len() {
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "compressed ingest candidate ordinal is out of range",
+                    ));
+                }
             }
-        }
-        let candidates = candidates.unwrap_or_else(|| (0..frame.record_count).collect::<Vec<_>>());
-        let mut matches = Vec::new();
-        for decoded in decode_indexed_ingest_records(frame, &candidates)? {
-            let relative_offset = decoded.offset.get();
-            if relative_offset >= u64::from(append.record_count) {
-                return Err(LogDbError::InvalidBlockEncoding(
-                    "compressed ingest record ordinal is out of range",
-                ));
-            }
-            let absolute_offset = append
-                .first_offset
-                .get()
-                .checked_add(relative_offset)
-                .map(LogicalOffset::new)
-                .ok_or(LogDbError::OffsetExhausted(query.topic_partition))?;
-            let record = DurableLogRecord {
-                stream_shard_id: self.stream_shard_id,
-                record_ref: RecordRef::new(query.topic_partition, absolute_offset),
-                timestamp_unix_nanos: decoded.timestamp_unix_nanos,
-                message: decoded.message,
-                fields: decoded.fields,
-                compression_cohort: frame.cohort,
+            let compare_positions = |left: &u32, right: &u32| {
+                let left = usize::try_from(*left).expect("candidate ordinal was validated");
+                let right = usize::try_from(*right).expect("candidate ordinal was validated");
+                (timestamps[left], offsets[left]).cmp(&(timestamps[right], offsets[right]))
             };
-            if query.matches(&record) {
-                matches.push(LogMatch { record });
+            let already_ascending = ranked
+                .windows(2)
+                .all(|pair| compare_positions(&pair[0], &pair[1]).is_le());
+            if already_ascending {
+                if query.order == QueryOrder::NewestFirst {
+                    ranked.reverse();
+                }
+            } else {
+                ranked.sort_unstable_by(|left, right| {
+                    let ordering = compare_positions(left, right);
+                    match query.order {
+                        QueryOrder::OldestFirst => ordering,
+                        QueryOrder::NewestFirst => ordering.reverse(),
+                    }
+                });
             }
+            let filter_messages_first = query.has_residual_predicate() && message_filterable;
+            let batch_len = if filter_messages_first {
+                limit.saturating_mul(4).max(1_024)
+            } else {
+                limit.saturating_mul(2).max(256)
+            };
+            let mut matches = Vec::new();
+            let mut consumed = 0usize;
+            while matches.len() < limit && consumed < ranked.len() {
+                let end = ranked.len().min(consumed.saturating_add(batch_len));
+                let mut batch = ranked[consumed..end].to_vec();
+                batch.sort_unstable();
+                if filter_messages_first {
+                    let messages = decode_structural_messages(&structural, &batch)?;
+                    batch = batch
+                        .into_iter()
+                        .zip(messages)
+                        .filter_map(|(ordinal, message)| {
+                            query
+                                .message_candidate_matches(&message)
+                                .unwrap_or(false)
+                                .then_some(ordinal)
+                        })
+                        .collect();
+                }
+                if !batch.is_empty() {
+                    matches.extend(self.decode_decompressed_frame_candidates(
+                        query,
+                        append,
+                        frame,
+                        &structural,
+                        &batch,
+                    )?);
+                }
+                consumed = end;
+            }
+            sort_and_limit_matches(&mut matches, query, limit);
+            return Ok(matches);
+        }
+        let mut matches = Vec::new();
+        for decoded in decode_indexed_ingest_records(frame, candidates)? {
+            self.push_decoded_frame_match(query, append, frame, decoded, &mut matches)?;
         }
         Ok(matches)
+    }
+
+    fn decode_decompressed_frame_candidates(
+        &self,
+        query: &LogQuery,
+        append: &IndexedFrameAppend,
+        frame: &IndexedIngestFrame,
+        structural: &[u8],
+        candidates: &[u32],
+    ) -> TelemetryResult<Vec<LogMatch>> {
+        let mut matches = Vec::new();
+        for decoded in decode_structural_records(structural, candidates)? {
+            self.push_decoded_frame_match(query, append, frame, decoded, &mut matches)?;
+        }
+        Ok(matches)
+    }
+
+    fn push_decoded_frame_match(
+        &self,
+        query: &LogQuery,
+        append: &IndexedFrameAppend,
+        frame: &IndexedIngestFrame,
+        decoded: crate::DecodedStructuralRecord,
+        matches: &mut Vec<LogMatch>,
+    ) -> TelemetryResult<()> {
+        let relative_offset = decoded.offset.get();
+        if relative_offset >= u64::from(append.record_count) {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "compressed ingest record ordinal is out of range",
+            ));
+        }
+        let absolute_offset = append
+            .first_offset
+            .get()
+            .checked_add(relative_offset)
+            .map(LogicalOffset::new)
+            .ok_or(TelemetryError::OffsetExhausted(query.topic_partition))?;
+        let record = DurableLog {
+            stream_shard_id: self.stream_shard_id,
+            record_ref: TelemetryRecordRef::new(query.topic_partition, absolute_offset),
+            timestamp_unix_nanos: decoded.timestamp_unix_nanos,
+            observed_timestamp_unix_nanos: decoded.observed_timestamp_unix_nanos,
+            body: decoded.body,
+            message: decoded.message,
+            fields: decoded.fields,
+            attributes: decoded.attributes,
+            resource: decoded.resource,
+            scope: decoded.scope,
+            severity_number: decoded.severity_number,
+            severity_text: decoded.severity_text,
+            dropped_attributes_count: decoded.dropped_attributes_count,
+            flags: decoded.flags,
+            trace_id: decoded.trace_id,
+            span_id: decoded.span_id,
+            event_name: decoded.event_name,
+            compression_cohort: frame.cohort,
+        };
+        if query.matches(&record) {
+            matches.push(LogMatch { record });
+        }
+        Ok(())
     }
 
     fn query_ordinals(&self, query: &LogQuery, partition: &PartitionIndex) -> Vec<u32> {
@@ -1251,19 +2108,19 @@ impl LogStripe {
                     query.limit,
                 );
             }
-            let mut ordinals = posting_lists[0].collect_in(
+            let can_limit_intersection =
+                !needs_record_filter && query.sort == crate::QuerySort::Offset;
+            collect_hot_posting_intersection(
+                &posting_lists,
                 posting_start,
                 posting_end,
-                QueryOrder::OldestFirst,
-                None,
-            );
-            for postings in &posting_lists[1..] {
-                intersect_ordinal_runs(&mut ordinals, &postings.runs, posting_start, posting_end);
-                if ordinals.is_empty() {
-                    break;
-                }
-            }
-            ordinals
+                if can_limit_intersection {
+                    query.order
+                } else {
+                    QueryOrder::OldestFirst
+                },
+                can_limit_intersection.then_some(query.limit).flatten(),
+            )
         };
         if needs_record_filter {
             ordinals.retain(|ordinal| {
@@ -1285,7 +2142,9 @@ impl LogStripe {
                     .expect("indexed reference has a visible record");
                 query.compare(&left.record, &right.record)
             });
-        } else if query.order == QueryOrder::NewestFirst {
+        } else if query.order == QueryOrder::NewestFirst
+            && (needs_record_filter || posting_lists.len() <= 1)
+        {
             ordinals.reverse();
         }
         if let Some(limit) = query.limit {
@@ -1294,7 +2153,7 @@ impl LogStripe {
         ordinals
     }
 
-    fn validate_offset(&self, record: &DurableLogRecord) -> LogDbResult<()> {
+    fn validate_offset(&self, record: &DurableLog) -> TelemetryResult<()> {
         let Some(previous) = self
             .partitions
             .get(&record.record_ref.topic_partition)
@@ -1306,11 +2165,11 @@ impl LogStripe {
             .get()
             .checked_add(1)
             .map(LogicalOffset::new)
-            .ok_or(LogDbError::OffsetExhausted(
+            .ok_or(TelemetryError::OffsetExhausted(
                 record.record_ref.topic_partition,
             ))?;
         if record.record_ref.offset <= previous {
-            return Err(LogDbError::OffsetOutOfOrder {
+            return Err(TelemetryError::OffsetOutOfOrder {
                 partition: record.record_ref.topic_partition,
                 expected,
                 observed: record.record_ref.offset,
@@ -1319,7 +2178,7 @@ impl LogStripe {
         Ok(())
     }
 
-    fn apply_durable_idempotent(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    fn apply_durable_idempotent(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         let topic_partition = record.record_ref.topic_partition;
         let offset = record.record_ref.offset;
         let existing = self.partitions.get(&topic_partition).and_then(|partition| {
@@ -1332,7 +2191,7 @@ impl LogStripe {
         });
         if let Some(existing) = existing {
             if existing.record != record {
-                return Err(LogDbError::ConflictingRecord {
+                return Err(TelemetryError::ConflictingRecord {
                     partition: topic_partition,
                     offset,
                 });
@@ -1379,7 +2238,7 @@ impl LogStripe {
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         events: Vec<OtlpLogEvent>,
-    ) -> LogDbResult<Vec<IndexReceipt>> {
+    ) -> TelemetryResult<Vec<IndexReceipt>> {
         let mut events = events.into_iter().enumerate();
         let (first_index, first_event) = events
             .next()
@@ -1477,7 +2336,7 @@ impl LogStripe {
         partition.indexed_through = Some(last_offset);
     }
 
-    fn index_terms(&mut self, record: &DurableLogRecord, record_ordinal: u32) -> Arc<[usize]> {
+    fn index_terms(&mut self, record: &DurableLog, record_ordinal: u32) -> Arc<[usize]> {
         let topic_partition = record.record_ref.topic_partition;
         let cache_slot = message_term_cache_slot(topic_partition, record.message.as_bytes());
         let term_ids = if let Some(cached) = &self.message_term_cache[cache_slot]
@@ -1532,7 +2391,7 @@ impl LogStripe {
         term_ids
     }
 
-    fn index_fields(&mut self, record: &DurableLogRecord, record_ordinal: u32) -> Arc<[usize]> {
+    fn index_fields(&mut self, record: &DurableLog, record_ordinal: u32) -> Arc<[usize]> {
         let topic_partition = record.record_ref.topic_partition;
         let cache_slot = field_cache_slot(topic_partition, &record.fields);
         let field_ids = if let Some(cached) = &self.field_cache[cache_slot]
@@ -1598,7 +2457,7 @@ impl LogStripe {
     fn resolve_dictionary(
         &mut self,
         placement_id: CompressionPlacementId,
-    ) -> LogDbResult<DictionarySelection> {
+    ) -> TelemetryResult<DictionarySelection> {
         let Some(dictionary_id) = self.placement_dictionaries.get(&placement_id).copied() else {
             return Ok(DictionarySelection {
                 dictionary_id: None,
@@ -1616,7 +2475,7 @@ impl LogStripe {
             .dictionary_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.dictionary(dictionary_id))
-            .ok_or(LogDbError::MissingDictionary(dictionary_id))?;
+            .ok_or(TelemetryError::MissingDictionary(dictionary_id))?;
         self.dictionary_cache
             .insert(dictionary_id, Arc::clone(&payload))?;
         Ok(DictionarySelection {
@@ -1630,7 +2489,7 @@ impl LogStripe {
         initial_key: ActiveBlockKey,
         initial_block: ActiveBlock,
         force_seal: bool,
-    ) -> LogDbResult<Vec<BlockDescriptor>> {
+    ) -> TelemetryResult<Vec<BlockDescriptor>> {
         if !self.block_collator.is_enabled() {
             let temperature = CompressionTemperature::new(0);
             let placement =
@@ -1736,7 +2595,7 @@ impl LogStripe {
         active: &ActiveBlock,
         placement: CompressionPlacement,
         score: CompressionBlockScore,
-    ) -> LogDbResult<BlockDescriptor> {
+    ) -> TelemetryResult<BlockDescriptor> {
         let durable_records = active
             .records
             .iter()
@@ -1793,28 +2652,28 @@ impl LogStripe {
 }
 
 impl ShardStreamDurableSink for LogStripe {
-    fn on_durable_append(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    fn on_durable_append(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         self.apply_durable(record)
     }
 }
 
-/// Container for independently owned shard-logdb stripes.
+/// Container for independently owned ShardTelemetry log stripes.
 ///
 /// A deployment should hand each [`LogStripe`] to the matching shard-stream
 /// worker and invoke [`Self::apply_durable`] in that worker. This container is
 /// useful for single-process tests and embedded deployments; it never creates a
 /// shared global hot index.
 #[derive(Debug)]
-pub struct ShardLogDb {
+pub struct ShardTelemetry {
     stripes: HashMap<ShardId, LogStripe>,
 }
 
-impl ShardLogDb {
+impl ShardTelemetry {
     /// Creates one log stripe for each supplied shard-stream shard.
     pub fn new(
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: StripeConfig,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         Self::new_with_optional_dictionary_catalog(shard_ids, config, None)
     }
 
@@ -1824,7 +2683,7 @@ impl ShardLogDb {
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: StripeConfig,
         dictionary_catalog: Arc<DictionaryCatalog>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         Self::new_with_optional_dictionary_catalog(shard_ids, config, Some(dictionary_catalog))
     }
 
@@ -1834,7 +2693,7 @@ impl ShardLogDb {
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: StripeConfig,
         trainer: &RealtimeDictionaryTrainer,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let mut database = Self::with_dictionary_catalog(shard_ids, config, trainer.catalog())?;
         for stripe in database.stripes.values_mut() {
             stripe.attach_realtime_dictionary(trainer.observer());
@@ -1846,11 +2705,11 @@ impl ShardLogDb {
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: StripeConfig,
         dictionary_catalog: Option<Arc<DictionaryCatalog>>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let mut stripes = HashMap::new();
         for shard_id in shard_ids {
             if stripes.contains_key(&shard_id) {
-                return Err(LogDbError::DuplicateStripe(shard_id));
+                return Err(TelemetryError::DuplicateStripe(shard_id));
             }
             let stripe = match &dictionary_catalog {
                 Some(dictionary_catalog) => LogStripe::with_dictionary_catalog(
@@ -1863,7 +2722,9 @@ impl ShardLogDb {
             stripes.insert(shard_id, stripe);
         }
         if stripes.is_empty() {
-            return Err(LogDbError::InvalidConfig("at least one stripe is required"));
+            return Err(TelemetryError::InvalidConfig(
+                "at least one stripe is required",
+            ));
         }
         Ok(Self { stripes })
     }
@@ -1880,19 +2741,23 @@ impl ShardLogDb {
     }
 
     /// Routes an already durable shard-stream record to its matching log stripe.
-    pub fn apply_durable(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    pub fn apply_durable(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         self.stripes
             .get_mut(&record.stream_shard_id)
-            .ok_or(LogDbError::UnknownStripe(record.stream_shard_id))?
+            .ok_or(TelemetryError::UnknownStripe(record.stream_shard_id))?
             .apply_durable(record)
     }
 
     /// Runs a partition-local query through one stripe.
-    pub fn query(&self, stream_shard_id: ShardId, query: &LogQuery) -> LogDbResult<Vec<LogMatch>> {
+    pub fn query(
+        &self,
+        stream_shard_id: ShardId,
+        query: &LogQuery,
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let stripe = self
             .stripes
             .get(&stream_shard_id)
-            .ok_or(LogDbError::UnknownStripe(stream_shard_id))?;
+            .ok_or(TelemetryError::UnknownStripe(stream_shard_id))?;
         Ok(stripe.query(query))
     }
 
@@ -1909,7 +2774,7 @@ impl ShardLogDb {
         &self,
         stream_shard_ids: impl IntoIterator<Item = ShardId>,
         query: &LogQuery,
-    ) -> LogDbResult<Vec<LogMatch>> {
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let mut seen = HashSet::new();
         let mut stripes = Vec::new();
         for stream_shard_id in stream_shard_ids {
@@ -1917,7 +2782,7 @@ impl ShardLogDb {
                 stripes.push(
                     self.stripes
                         .get(&stream_shard_id)
-                        .ok_or(LogDbError::UnknownStripe(stream_shard_id))?,
+                        .ok_or(TelemetryError::UnknownStripe(stream_shard_id))?,
                 );
             }
         }
@@ -1947,8 +2812,8 @@ impl ShardLogDb {
     }
 }
 
-impl ShardStreamDurableSink for ShardLogDb {
-    fn on_durable_append(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+impl ShardStreamDurableSink for ShardTelemetry {
+    fn on_durable_append(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         self.apply_durable(record)
     }
 }
@@ -1965,7 +2830,7 @@ fn validate_batch_offset_range(
     topic_partition: TopicPartition,
     first_offset: LogicalOffset,
     record_count: usize,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     let Some(last_index) = record_count.checked_sub(1) else {
         return Ok(());
     };
@@ -1976,14 +2841,14 @@ fn batch_offset(
     topic_partition: TopicPartition,
     first_offset: LogicalOffset,
     index: usize,
-) -> LogDbResult<LogicalOffset> {
+) -> TelemetryResult<LogicalOffset> {
     let relative_offset =
-        u64::try_from(index).map_err(|_| LogDbError::OffsetExhausted(topic_partition))?;
+        u64::try_from(index).map_err(|_| TelemetryError::OffsetExhausted(topic_partition))?;
     first_offset
         .get()
         .checked_add(relative_offset)
         .map(LogicalOffset::new)
-        .ok_or(LogDbError::OffsetExhausted(topic_partition))
+        .ok_or(TelemetryError::OffsetExhausted(topic_partition))
 }
 
 #[inline]
@@ -2083,12 +2948,56 @@ fn append_matches_query_bounds(query: &LogQuery, append: &IndexedFrameAppend) ->
 }
 
 fn frame_matches_query_bounds(query: &LogQuery, frame: &IndexedIngestFrame) -> bool {
+    timestamp_bounds_overlap(
+        query,
+        frame.min_timestamp_unix_nanos,
+        frame.max_timestamp_unix_nanos,
+    )
+}
+
+fn timestamp_bounds_overlap(query: &LogQuery, minimum: u64, maximum: u64) -> bool {
     query
         .end_timestamp_unix_nanos
-        .is_none_or(|end| end > frame.min_timestamp_unix_nanos)
+        .is_none_or(|end| end > minimum)
         && query
             .start_timestamp_unix_nanos
-            .is_none_or(|start| start <= frame.max_timestamp_unix_nanos)
+            .is_none_or(|start| start <= maximum)
+}
+
+fn indexed_frame_candidates(
+    query: &LogQuery,
+    index: &EmbeddedFrameIndex,
+    record_count: u32,
+) -> Vec<u32> {
+    let constraints = query.required_index_constraints();
+    if constraints.impossible {
+        return Vec::new();
+    }
+    let mut candidates = None::<Vec<u32>>;
+    for term in &constraints.terms {
+        intersect_frame_candidates(&mut candidates, index.term_candidate_ordinals(term));
+        if candidates.as_ref().is_some_and(Vec::is_empty) {
+            return Vec::new();
+        }
+    }
+    for (key, value) in &constraints.fields {
+        intersect_frame_candidates(&mut candidates, index.field_candidate_ordinals(key, value));
+        if candidates.as_ref().is_some_and(Vec::is_empty) {
+            return Vec::new();
+        }
+    }
+    candidates.unwrap_or_else(|| (0..record_count).collect())
+}
+
+fn remove_published_spool_file(path: &std::path::Path) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "shard-telemetry retained published tier spool {} after cleanup failed: {error}",
+            path.display()
+        );
+    }
 }
 
 fn sort_and_limit_matches(matches: &mut Vec<LogMatch>, query: &LogQuery, limit: usize) {
@@ -2122,6 +3031,7 @@ fn intersect_frame_candidates(current: &mut Option<Vec<u32>>, mut incoming: Vec<
     existing.truncate(write_index);
 }
 
+#[cfg(test)]
 fn intersect_ordinal_runs(candidates: &mut Vec<u32>, runs: &[OrdinalRun], start: u32, end: u32) {
     let mut candidate_index = 0usize;
     let mut run_index = runs.partition_point(|run| run.last < start);
@@ -2159,18 +3069,21 @@ mod tests {
     use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
     use super::*;
-    use crate::{LocalityGranularity, MetadataField, ingest_pack::prepare_ingest_pack};
+    use crate::{
+        CaseSensitivity, LocalityGranularity, LogPredicate, MetadataField,
+        ingest_pack::prepare_ingest_pack,
+    };
 
     fn partition() -> TopicPartition {
         TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(3))
     }
 
-    fn record(offset: u64, message: &str) -> DurableLogRecord {
+    fn record(offset: u64, message: &str) -> DurableLog {
         record_on(ShardId::new(7), offset, message)
     }
 
-    fn record_on(stream_shard_id: ShardId, offset: u64, message: &str) -> DurableLogRecord {
-        DurableLogRecord::new(
+    fn record_on(stream_shard_id: ShardId, offset: u64, message: &str) -> DurableLog {
+        DurableLog::new(
             stream_shard_id,
             partition(),
             LogicalOffset::new(offset),
@@ -2221,8 +3134,8 @@ mod tests {
 
     #[test]
     fn durable_records_become_visible_to_term_and_metadata_queries() {
-        let mut database =
-            ShardLogDb::new([ShardId::new(7)], StripeConfig::default()).expect("database opens");
+        let mut database = ShardTelemetry::new([ShardId::new(7)], StripeConfig::default())
+            .expect("database opens");
         database
             .apply_durable(record(0, "ERROR cannot connect").with_field("service", "api"))
             .expect("first append indexes");
@@ -2264,6 +3177,7 @@ mod tests {
                     MetadataField::new("trace", format!("trace-{ordinal}")),
                 ]),
                 compression_cohort: CompressionCohortId::new(ordinal % 3),
+                ..OtlpLogEvent::default()
             })
             .collect::<Vec<_>>();
         let prepared = prepare_ingest_pack(&events).expect("indexed ingest pack prepares");
@@ -2276,19 +3190,22 @@ mod tests {
             first_offset,
             events.len() as u32,
             payload.clone(),
-            Some(&prepared.transient_context),
         )
         .expect("live frame indexes install");
+        assert_eq!(
+            live.count_tenant_records("test-tenant", &[partition()])
+                .expect("resident count"),
+            events.len() as u64
+        );
+        assert_eq!(
+            live.count_tenant_records("another-tenant", &[partition()])
+                .expect("other tenant count"),
+            0
+        );
         let mut recovered = LogStripe::new(ShardId::new(7), StripeConfig::default())
             .expect("recovered stripe opens");
         recovered
-            .apply_indexed_ingest_pack(
-                partition(),
-                first_offset,
-                events.len() as u32,
-                payload,
-                None,
-            )
+            .apply_indexed_ingest_pack(partition(), first_offset, events.len() as u32, payload)
             .expect("durable frame indexes recover");
 
         let queries = [
@@ -2349,6 +3266,7 @@ mod tests {
                     message: Arc::from(format!("ERROR request {timestamp} failed")),
                     fields: Arc::new(vec![MetadataField::new("service", "api")]),
                     compression_cohort: CompressionCohortId::new(1),
+                    ..OtlpLogEvent::default()
                 });
                 let prepared = prepare_ingest_pack(&events).expect("pack prepares");
                 stripe
@@ -2357,7 +3275,6 @@ mod tests {
                         LogicalOffset::new((batch * 2) as u64),
                         events.len() as u32,
                         Bytes::from(prepared.payload),
-                        Some(&prepared.transient_context),
                     )
                     .expect("frame append indexes");
             }
@@ -2396,6 +3313,82 @@ mod tests {
     }
 
     #[test]
+    fn compressed_frame_timestamp_top_k_selects_before_full_record_decode() {
+        let fields = Arc::new(vec![crate::MetadataField::new("docker_stream", "stderr")]);
+        let events = (0..1_024u64)
+            .map(|ordinal| OtlpLogEvent {
+                timestamp_unix_nanos: ordinal,
+                message: Arc::from(if matches!(ordinal, 10 | 20 | 30) {
+                    "prefix target suffix".to_owned()
+                } else {
+                    "prefix_target suffix".to_owned()
+                }),
+                fields: Arc::clone(&fields),
+                compression_cohort: CompressionCohortId::new(1),
+                ..OtlpLogEvent::default()
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_ingest_pack(&events).expect("pack prepares");
+        let mut stripe =
+            LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe opens");
+        stripe
+            .apply_indexed_ingest_pack(
+                partition(),
+                LogicalOffset::new(0),
+                events.len() as u32,
+                Bytes::from(prepared.payload),
+            )
+            .expect("frame append indexes");
+
+        let latest = LogQuery::new(partition())
+            .sort_by_timestamp()
+            .newest_first()
+            .with_limit(3);
+        assert_eq!(
+            stripe
+                .query_checked(&latest)
+                .expect("latest query")
+                .into_iter()
+                .map(|matched| matched.record.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            vec![1_023, 1_022, 1_021]
+        );
+
+        let latest_stream = LogQuery::new(partition())
+            .with_field("docker_stream", "stderr")
+            .sort_by_timestamp()
+            .newest_first()
+            .with_limit(3);
+        assert_eq!(
+            stripe
+                .query_checked(&latest_stream)
+                .expect("latest exact-stream query")
+                .into_iter()
+                .map(|matched| matched.record.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            vec![1_023, 1_022, 1_021]
+        );
+
+        let sparse_residual = LogQuery::new(partition())
+            .where_predicate(LogPredicate::message_token(
+                "target",
+                CaseSensitivity::Sensitive,
+            ))
+            .sort_by_timestamp()
+            .newest_first()
+            .with_limit(2);
+        assert_eq!(
+            stripe
+                .query_checked(&sparse_residual)
+                .expect("sparse residual query")
+                .into_iter()
+                .map(|matched| matched.record.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            vec![30, 20]
+        );
+    }
+
+    #[test]
     fn homogeneous_event_batches_publish_one_posting_range_per_value() {
         let message: Arc<str> = Arc::from("repeated request completed");
         let fields = Arc::new(vec![crate::MetadataField::new("service", "api")]);
@@ -2404,6 +3397,7 @@ mod tests {
             message,
             fields,
             compression_cohort: CompressionCohortId::new(4),
+            ..OtlpLogEvent::default()
         };
         let mut stripe =
             LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe opens");
@@ -2456,6 +3450,7 @@ mod tests {
             message: Arc::from(message),
             fields: Arc::clone(&fields),
             compression_cohort: CompressionCohortId::new(4),
+            ..OtlpLogEvent::default()
         };
         let mut stripe =
             LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe opens");
@@ -2496,7 +3491,7 @@ mod tests {
     #[test]
     fn database_fanout_merges_selected_stripes_without_duplicate_results() {
         let mut database =
-            ShardLogDb::new([ShardId::new(7), ShardId::new(8)], StripeConfig::default())
+            ShardTelemetry::new([ShardId::new(7), ShardId::new(8)], StripeConfig::default())
                 .expect("database opens");
         for offset in 0..10 {
             let shard = if offset < 5 {
@@ -2534,7 +3529,7 @@ mod tests {
         );
         assert!(matches!(
             database.query_stripes([ShardId::new(99)], &query),
-            Err(LogDbError::UnknownStripe(shard)) if shard == ShardId::new(99)
+            Err(TelemetryError::UnknownStripe(shard)) if shard == ShardId::new(99)
         ));
     }
 
@@ -2677,6 +3672,37 @@ mod tests {
     }
 
     #[test]
+    fn bounded_hot_posting_intersection_stops_in_requested_order() {
+        let mut dense = HotPostingList::default();
+        dense.push_range(0, 999_999);
+        let mut every_thousand = HotPostingList::default();
+        for ordinal in (0..1_000_000).step_by(1_000) {
+            every_thousand.push(ordinal);
+        }
+        let postings = [&dense, &every_thousand];
+        assert_eq!(
+            collect_hot_posting_intersection(
+                &postings,
+                0,
+                1_000_000,
+                QueryOrder::OldestFirst,
+                Some(3),
+            ),
+            [0, 1_000, 2_000]
+        );
+        assert_eq!(
+            collect_hot_posting_intersection(
+                &postings,
+                0,
+                1_000_000,
+                QueryOrder::NewestFirst,
+                Some(3),
+            ),
+            [999_000, 998_000, 997_000]
+        );
+    }
+
+    #[test]
     fn lane_global_offset_gaps_are_accepted_but_regressions_are_rejected() {
         let mut stripe =
             LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe opens");
@@ -2691,7 +3717,7 @@ mod tests {
             .expect_err("offset regression is rejected");
         assert_eq!(
             error,
-            LogDbError::OffsetOutOfOrder {
+            TelemetryError::OffsetOutOfOrder {
                 partition: partition(),
                 expected: LogicalOffset::new(8),
                 observed: LogicalOffset::new(6),
@@ -2823,7 +3849,7 @@ mod tests {
         .expect("stripe opens");
         let source = CompressionCohortId::new(4);
         let records = [
-            DurableLogRecord::new(
+            DurableLog::new(
                 ShardId::new(7),
                 partition(),
                 LogicalOffset::new(0),
@@ -2832,7 +3858,7 @@ mod tests {
                 source,
             )
             .with_field("service", "paiements"),
-            DurableLogRecord::new(
+            DurableLog::new(
                 ShardId::new(7),
                 partition(),
                 LogicalOffset::new(1),
@@ -2841,7 +3867,7 @@ mod tests {
                 source,
             )
             .with_field("service", "paiements"),
-            DurableLogRecord::new(
+            DurableLog::new(
                 ShardId::new(7),
                 partition(),
                 LogicalOffset::new(2),
@@ -2850,7 +3876,7 @@ mod tests {
                 source,
             )
             .with_field("service", "paiements"),
-            DurableLogRecord::new(
+            DurableLog::new(
                 ShardId::new(7),
                 partition(),
                 LogicalOffset::new(3),
@@ -2999,7 +4025,7 @@ mod tests {
             .collect::<Vec<_>>();
         for (index, message) in messages.iter().enumerate() {
             stripe
-                .apply_durable(DurableLogRecord::new(
+                .apply_durable(DurableLog::new(
                     ShardId::new(7),
                     partition(),
                     LogicalOffset::new(u64::try_from(index).expect("offset fits")),
