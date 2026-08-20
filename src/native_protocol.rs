@@ -18,6 +18,11 @@ const LOG_QUERY_RESULT_MAGIC: [u8; 4] = *b"STR1";
 const TELEMETRY_BATCH_MAGIC: [u8; 4] = *b"STB1";
 const TELEMETRY_ACK_MAGIC: [u8; 4] = *b"STM1";
 const QUERY_MAGIC: [u8; 4] = *b"STQ1";
+const METRIC_QUERY_MAGIC: [u8; 4] = *b"STQ2";
+const TRACE_QUERY_MAGIC: [u8; 4] = *b"STQ3";
+const METRIC_QUERY_RESULT_MAGIC: [u8; 4] = *b"STR2";
+const TRACE_QUERY_RESULT_MAGIC: [u8; 4] = *b"STR3";
+const CAPABILITIES_MAGIC: [u8; 4] = *b"STC1";
 const LOG_QUERY_RESULT_HEADER_BYTES: usize = 16;
 const QUERY_HEADER_BYTES: usize = 32;
 const MAX_TENANT_BYTES: usize = 1_024;
@@ -39,6 +44,12 @@ pub enum NativeOpcode {
     Ping = 3,
     /// Authenticates a connection before any tenant operation is accepted.
     Authenticate = 4,
+    /// Executes a bounded signal-native metric query.
+    QueryMetrics = 5,
+    /// Executes a bounded signal-native trace query.
+    QueryTraces = 6,
+    /// Returns negotiated protocol, signal, and query capabilities.
+    Describe = 7,
 }
 
 impl NativeOpcode {
@@ -48,6 +59,9 @@ impl NativeOpcode {
             2 => Ok(Self::Query),
             3 => Ok(Self::Ping),
             4 => Ok(Self::Authenticate),
+            5 => Ok(Self::QueryMetrics),
+            6 => Ok(Self::QueryTraces),
+            7 => Ok(Self::Describe),
             _ => Err(NativeProtocolError::new(format!(
                 "unsupported native opcode {value}"
             ))),
@@ -295,6 +309,22 @@ pub struct NativeTelemetryBatch {
 }
 
 impl NativeTelemetryBatch {
+    /// Encodes a retryable native v1 append.
+    ///
+    /// Native v1 deliberately accepts one partition per request. A single
+    /// durable retry identity cannot make a parallel multi-partition append
+    /// atomic when a later partition fails, so callers fan out one request per
+    /// routed partition instead. In-process store APIs retain their grouped
+    /// fast path and do not use this wire-level constraint.
+    pub fn encode_native_append(&self) -> Result<Vec<u8>, NativeProtocolError> {
+        if self.partitions.len() != 1 {
+            return Err(NativeProtocolError::new(
+                "retryable native v1 append requires exactly one partition",
+            ));
+        }
+        self.encode()
+    }
+
     /// Encodes the bounded signal-aware native v1 payload.
     pub fn encode(&self) -> Result<Vec<u8>, NativeProtocolError> {
         if self.partitions.is_empty() || self.partitions.len() > 256 {
@@ -408,6 +438,18 @@ impl NativeTelemetryBatch {
         cursor.finish()?;
         Ok(Self { partitions })
     }
+
+    /// Decodes a retryable native v1 append after enforcing its single
+    /// partition atomicity boundary.
+    pub fn decode_native_append(payload: &[u8]) -> Result<Self, NativeProtocolError> {
+        let batch = Self::decode(payload)?;
+        if batch.partitions.len() != 1 {
+            return Err(NativeProtocolError::new(
+                "retryable native v1 append requires exactly one partition",
+            ));
+        }
+        Ok(batch)
+    }
 }
 
 /// Returns true when a native append payload uses the signal-aware v1 batch format.
@@ -417,7 +459,7 @@ pub fn is_native_telemetry_batch(payload: &[u8]) -> bool {
 }
 
 /// Per-partition acknowledgement returned by native protocol v1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativePartitionAck {
     /// Appended topic and partition.
     pub topic_partition: TopicPartition,
@@ -428,7 +470,7 @@ pub struct NativePartitionAck {
 }
 
 /// Atomic native v1 response containing one acknowledgement per partition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeTelemetryAppendAck {
     /// Partition acknowledgements in request order.
     pub partitions: Vec<NativePartitionAck>,
@@ -732,6 +774,129 @@ pub struct NativeQuery {
     pub limit: u32,
     /// Timestamp result order.
     pub direction: NativeQueryDirection,
+}
+
+/// Capabilities negotiated before a remote producer is allowed to mark its
+/// telemetry integration ready.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NativeCapabilities {
+    /// Maximum native protocol version understood by this peer.
+    pub protocol_version: u8,
+    /// Whether native v1 accepts signal-aware append envelopes.
+    pub append_v1: bool,
+    /// Logical partition counts for logs, traces, and metrics respectively.
+    pub logical_partitions: [u16; 3],
+    /// Whether indexed log queries are available.
+    pub query_logs: bool,
+    /// Whether signal-native metric queries are available.
+    pub query_metrics: bool,
+    /// Whether signal-native trace queries are available.
+    pub query_traces: bool,
+    /// Whether the bucketed normalized series contract is available.
+    pub query_series: bool,
+    /// Whether append acknowledgements wait for local query visibility.
+    pub append_queryable: bool,
+}
+
+/// Encodes one bounded native metric query.
+pub fn encode_native_metric_query(
+    query: &crate::MetricQuery,
+) -> Result<Vec<u8>, NativeProtocolError> {
+    encode_messagepack(METRIC_QUERY_MAGIC, query, "metric query")
+}
+
+/// Decodes one bounded native metric query.
+pub fn decode_native_metric_query(
+    payload: &[u8],
+) -> Result<crate::MetricQuery, NativeProtocolError> {
+    decode_messagepack(METRIC_QUERY_MAGIC, payload, "metric query")
+}
+
+/// Encodes native metric query results.
+pub fn encode_native_metric_query_result(
+    points: &[crate::DurableMetricPoint],
+) -> Result<Vec<u8>, NativeProtocolError> {
+    encode_messagepack(METRIC_QUERY_RESULT_MAGIC, points, "metric query result")
+}
+
+/// Decodes native metric query results.
+pub fn decode_native_metric_query_result(
+    payload: &[u8],
+) -> Result<Vec<crate::DurableMetricPoint>, NativeProtocolError> {
+    decode_messagepack(METRIC_QUERY_RESULT_MAGIC, payload, "metric query result")
+}
+
+/// Encodes one bounded native trace query.
+pub fn encode_native_trace_query(
+    query: &crate::TraceQuery,
+) -> Result<Vec<u8>, NativeProtocolError> {
+    encode_messagepack(TRACE_QUERY_MAGIC, query, "trace query")
+}
+
+/// Decodes one bounded native trace query.
+pub fn decode_native_trace_query(payload: &[u8]) -> Result<crate::TraceQuery, NativeProtocolError> {
+    decode_messagepack(TRACE_QUERY_MAGIC, payload, "trace query")
+}
+
+/// Encodes native trace query results.
+pub fn encode_native_trace_query_result(
+    spans: &[crate::DurableSpan],
+) -> Result<Vec<u8>, NativeProtocolError> {
+    encode_messagepack(TRACE_QUERY_RESULT_MAGIC, spans, "trace query result")
+}
+
+/// Decodes native trace query results.
+pub fn decode_native_trace_query_result(
+    payload: &[u8],
+) -> Result<Vec<crate::DurableSpan>, NativeProtocolError> {
+    decode_messagepack(TRACE_QUERY_RESULT_MAGIC, payload, "trace query result")
+}
+
+/// Encodes native server capabilities.
+pub fn encode_native_capabilities(
+    capabilities: &NativeCapabilities,
+) -> Result<Vec<u8>, NativeProtocolError> {
+    encode_messagepack(CAPABILITIES_MAGIC, capabilities, "capabilities")
+}
+
+/// Decodes native server capabilities.
+pub fn decode_native_capabilities(
+    payload: &[u8],
+) -> Result<NativeCapabilities, NativeProtocolError> {
+    decode_messagepack(CAPABILITIES_MAGIC, payload, "capabilities")
+}
+
+fn encode_messagepack<T: serde::Serialize + ?Sized>(
+    magic: [u8; 4],
+    value: &T,
+    kind: &str,
+) -> Result<Vec<u8>, NativeProtocolError> {
+    let encoded = rmp_serde::to_vec(value).map_err(|error| {
+        NativeProtocolError::new(format!("native {kind} encoding failed: {error}"))
+    })?;
+    if encoded.len().saturating_add(magic.len()) > MAX_NATIVE_FRAME_BYTES {
+        return Err(NativeProtocolError::new(format!(
+            "native {kind} exceeds the frame limit"
+        )));
+    }
+    let mut payload = Vec::with_capacity(magic.len() + encoded.len());
+    payload.extend_from_slice(&magic);
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+fn decode_messagepack<T: serde::de::DeserializeOwned>(
+    magic: [u8; 4],
+    payload: &[u8],
+    kind: &str,
+) -> Result<T, NativeProtocolError> {
+    let Some(encoded) = payload.strip_prefix(&magic) else {
+        return Err(NativeProtocolError::new(format!(
+            "invalid native {kind} magic"
+        )));
+    };
+    rmp_serde::from_slice(encoded)
+        .map_err(|error| NativeProtocolError::new(format!("invalid native {kind}: {error}")))
 }
 
 /// Encodes an indexed native query.
@@ -1156,6 +1321,47 @@ mod tests {
         assert_eq!(
             decode_native_query(&encode_native_query(&query).expect("encode")).expect("decode"),
             query
+        );
+    }
+
+    #[test]
+    fn signal_native_queries_and_capabilities_round_trip() {
+        let metric = crate::MetricQuery {
+            tenant: std::sync::Arc::from("tenant-a"),
+            name: Some(std::sync::Arc::from("requests_total")),
+            limit: 10,
+            ..crate::MetricQuery::default()
+        };
+        assert_eq!(
+            decode_native_metric_query(&encode_native_metric_query(&metric).expect("encode"))
+                .expect("decode"),
+            metric
+        );
+        let trace = crate::TraceQuery {
+            tenant: std::sync::Arc::from("tenant-a"),
+            name: Some(std::sync::Arc::from("checkout")),
+            limit: 10,
+            ..crate::TraceQuery::default()
+        };
+        assert_eq!(
+            decode_native_trace_query(&encode_native_trace_query(&trace).expect("encode"))
+                .expect("decode"),
+            trace
+        );
+        let capabilities = NativeCapabilities {
+            protocol_version: 1,
+            append_v1: true,
+            logical_partitions: [8, 8, 8],
+            query_logs: true,
+            query_metrics: true,
+            query_traces: true,
+            query_series: false,
+            append_queryable: true,
+        };
+        assert_eq!(
+            decode_native_capabilities(&encode_native_capabilities(&capabilities).expect("encode"))
+                .expect("decode"),
+            capabilities
         );
     }
 }

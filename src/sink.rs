@@ -881,6 +881,44 @@ impl TelemetryService {
         Ok(spans)
     }
 
+    /// Executes a bounded trace scan in deterministic stripe order without
+    /// paying the all-stripe top-k merge cost.
+    ///
+    /// This is valid only for callers that do not request a global ordering,
+    /// such as an analytical scan whose evaluator performs any later sort.
+    pub(crate) fn query_traces_unordered(
+        &self,
+        query: &TraceQuery,
+    ) -> TelemetryResult<Vec<DurableSpan>> {
+        let limit = query.limit.max(1);
+        let mut spans = Vec::with_capacity(limit);
+        for (shard_id, sender) in self.worker_senders()? {
+            let mut stripe_query = query.clone();
+            stripe_query.limit = limit.saturating_sub(spans.len());
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::QueryTraces {
+                    query: stripe_query,
+                    response,
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting an unordered trace query"
+                    ))
+                })?;
+            spans.extend(receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped while querying unordered traces"
+                ))
+            })??);
+            if spans.len() >= limit {
+                spans.truncate(limit);
+                break;
+            }
+        }
+        Ok(spans)
+    }
+
     /// Fans a native raw metric query across all owner stripes and merges by time/offset.
     pub fn query_metrics(&self, query: &MetricQuery) -> TelemetryResult<Vec<DurableMetricPoint>> {
         let workers = self.worker_senders()?;

@@ -280,6 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_config = LokiApiConfig {
         default_tenant: Arc::from(arguments.default_tenant.as_str()),
         max_query_limit: arguments.max_query_limit,
+        max_request_bytes: 16 * 1024 * 1024,
     };
     let logical_partitions = u16::try_from(arguments.tenant_partitions)
         .ok()

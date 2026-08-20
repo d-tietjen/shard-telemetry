@@ -100,16 +100,39 @@ pub fn prepare_log_envelope(
     tenant: &str,
     events: &[OtlpLogEvent],
 ) -> TelemetryResult<TelemetryEnvelope> {
+    prepare_log_envelope_with_context(tenant, events).map(|(envelope, _)| envelope)
+}
+
+/// Builds one durable STEL log envelope plus the process-local index context
+/// consumed by a live owner stripe.
+///
+/// The sidecar is derived from the same structural encoding as the durable
+/// payload. It avoids decompressing a frame immediately after append and is
+/// deliberately absent from recovery, where the durable payload remains the
+/// sole source of truth.
+pub fn prepare_log_envelope_with_context(
+    tenant: &str,
+    events: &[OtlpLogEvent],
+) -> TelemetryResult<(TelemetryEnvelope, Arc<[u8]>)> {
+    prepare_log_envelope_owned_with_context(tenant, events.to_vec())
+}
+
+/// Builds one durable STEL log envelope plus index context from an owned batch.
+///
+/// This keeps the embedded ingestion path zero-copy for uniquely owned field
+/// vectors while preserving the same payload and sidecar as the borrowed API.
+pub(crate) fn prepare_log_envelope_owned_with_context(
+    tenant: &str,
+    mut events: Vec<OtlpLogEvent>,
+) -> TelemetryResult<(TelemetryEnvelope, Arc<[u8]>)> {
     if tenant.is_empty() {
         return Err(TelemetryError::InvalidNativePayload(
             "log tenant must not be empty".into(),
         ));
     }
-    let mut tenant_bound = Vec::with_capacity(events.len());
-    for event in events {
-        let mut event = event.clone();
-        let mut fields = event.fields.as_ref().clone();
-        match fields
+    for event in &mut events {
+        match event
+            .fields
             .iter()
             .find(|field| field.key.as_ref() == TENANT_FIELD)
         {
@@ -119,19 +142,33 @@ pub fn prepare_log_envelope(
                 ));
             }
             Some(_) => {}
-            None => fields.push(MetadataField::new(TENANT_FIELD, tenant)),
+            None => Arc::make_mut(&mut event.fields).push(MetadataField::new(TENANT_FIELD, tenant)),
         }
-        event.fields = Arc::new(fields);
-        tenant_bound.push(event);
+        for (key, value) in [
+            (
+                "otel.trace_id",
+                event.trace_id.map(|value| value.to_string()),
+            ),
+            ("otel.span_id", event.span_id.map(|value| value.to_string())),
+        ] {
+            if let Some(value) = value
+                && !event.fields.iter().any(|field| {
+                    field.key.as_ref() == key && field.value.as_ref() == value.as_str()
+                })
+            {
+                Arc::make_mut(&mut event.fields).push(MetadataField::new(key, value));
+            }
+        }
     }
-    let prepared = prepare_ingest_pack(&tenant_bound)?;
-    TelemetryEnvelope::new(
+    let prepared = prepare_ingest_pack(&events)?;
+    let envelope = TelemetryEnvelope::new(
         TelemetrySignal::Logs,
         tenant,
         u32::try_from(events.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         Arc::<[u8]>::from([]),
         Arc::<[u8]>::from(prepared.payload),
-    )
+    )?;
+    Ok((envelope, Arc::<[u8]>::from(prepared.transient_context)))
 }
 
 /// Decodes and verifies the exact log records in one durable v1 envelope.
@@ -483,17 +520,48 @@ mod tests {
         let event = OtlpLogEvent {
             timestamp_unix_nanos: 1,
             message: Arc::from("hello"),
+            trace_id: Some(crate::TraceId::from_bytes([1; 16]).unwrap()),
+            span_id: Some(crate::SpanId::from_bytes([2; 8]).unwrap()),
             ..OtlpLogEvent::default()
         };
+        let (envelope_with_context, transient_context) =
+            prepare_log_envelope_with_context("tenant-a", std::slice::from_ref(&event)).unwrap();
         let envelope = prepare_log_envelope("tenant-a", std::slice::from_ref(&event)).unwrap();
+        assert_eq!(envelope, envelope_with_context);
+        assert!(!transient_context.is_empty());
         let decoded = decode_log_envelope(&envelope).unwrap();
         assert!(decoded[0].fields.iter().any(|field| {
             field.key.as_ref() == TENANT_FIELD && field.value.as_ref() == "tenant-a"
+        }));
+        assert!(decoded[0].fields.iter().any(|field| {
+            field.key.as_ref() == "otel.trace_id"
+                && field.value.as_ref() == "01010101010101010101010101010101"
+        }));
+        assert!(decoded[0].fields.iter().any(|field| {
+            field.key.as_ref() == "otel.span_id" && field.value.as_ref() == "0202020202020202"
         }));
 
         let mut conflicting = event;
         conflicting.fields = Arc::new(vec![MetadataField::new(TENANT_FIELD, "tenant-b")]);
         assert!(prepare_log_envelope("tenant-a", &[conflicting]).is_err());
+    }
+
+    #[test]
+    fn owned_log_envelope_matches_the_borrowed_path_byte_for_byte() {
+        let event = OtlpLogEvent {
+            timestamp_unix_nanos: 42,
+            message: Arc::from("direct embedded event"),
+            fields: Arc::new(vec![MetadataField::new("service.name", "eden-node")]),
+            ..OtlpLogEvent::default()
+        };
+        let borrowed = prepare_log_envelope("tenant-a", std::slice::from_ref(&event))
+            .expect("borrowed envelope");
+        let (owned, _) = prepare_log_envelope_owned_with_context("tenant-a", vec![event])
+            .expect("owned envelope");
+        assert_eq!(
+            borrowed.encode().expect("borrowed encode"),
+            owned.encode().expect("owned encode")
+        );
     }
 
     #[test]

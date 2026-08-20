@@ -9,15 +9,18 @@ ready for review when these commands pass:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
-cargo build --workspace --all-targets --release
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo build --workspace --all-targets --all-features --release --locked
+scripts/release-gate.sh
 ```
 
 Add regression tests for behavioral changes. Storage-format, recovery, query,
 and protocol changes require malformed-input and restart-boundary coverage.
-Benchmark claims must include the command, corpus identity, machine, CPU
-allocation, build profile, and verification mode.
+Benchmark claims must follow BENCHMARKS.md: include the command, corpus
+identity, machine, CPU allocation, build revision and profile, verification
+mode, and retained result artifact. Do not include private host names, paths,
+or non-redistributable data in a public pull request.
 
 ## Pull requests
 

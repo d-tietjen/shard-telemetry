@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.93.0 --profile minimal --component rustfmt,clippy
       - name: Verify formatting
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.93.0 --profile minimal
       - name: Install audit tools
@@ -64,8 +64,76 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install minimum supported Rust
         run: rustup toolchain install 1.93.0 --profile minimal
       - name: Check with declared MSRV
         run: cargo check --workspace --all-targets --all-features --locked
+
+  s3-contract:
+    name: S3-compatible object-store contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal
+      - name: Start disposable MinIO
+        run: |
+          docker run --detach --rm --name shard-telemetry-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER=shard-telemetry-ci \
+            --env MINIO_ROOT_PASSWORD=shard-telemetry-ci-secret \
+            minio/minio@sha256:3f97c5651cb6662b880c787a232b6b34fec8d8922e08d6617b25d241a21164bb \
+            server /data --console-address :9001
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:9000/minio/health/live; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs shard-telemetry-minio
+          exit 1
+      - name: Create disposable MinIO bucket
+        env:
+          AWS_ACCESS_KEY_ID: shard-telemetry-ci
+          AWS_SECRET_ACCESS_KEY: shard-telemetry-ci-secret
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://shard-telemetry-contract
+      - name: Run real S3 immutable-object and catalog-CAS contract
+        env:
+          AWS_ACCESS_KEY_ID: shard-telemetry-ci
+          AWS_SECRET_ACCESS_KEY: shard-telemetry-ci-secret
+          AWS_REGION: us-east-1
+          AWS_DEFAULT_REGION: us-east-1
+          SHARD_TELEMETRY_S3_TEST_BUCKET: shard-telemetry-contract
+          SHARD_TELEMETRY_S3_TEST_PREFIX: ci
+          SHARD_TELEMETRY_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+        run: cargo test --locked --test s3_object_store -- --ignored
+
+  competitive-oracles:
+    name: Pinned external-oracle campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal
+      - name: Build campaign binaries
+        run: |
+          cargo build --release --locked \
+            --bin shard-telemetry-server \
+            --bin shard-telemetry-clickhouse-fixture
+      - name: Run pinned Prometheus, Loki, Tempo, ClickHouse, and DuckDB oracles
+        env:
+          RESULT_ROOT: ${{ runner.temp }}/shard-telemetry-competitive
+        run: scripts/run-competitive-oracles.sh
+      - name: Retain external-oracle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: competitive-oracle-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/shard-telemetry-competitive
+          if-no-files-found: warn
+          retention-days: 30

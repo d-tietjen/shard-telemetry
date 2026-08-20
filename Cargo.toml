@@ -19,15 +19,15 @@ exclude = [
 ]
 
 # Keep this standalone repository independent when it is checked out beneath
-# an unrelated Cargo workspace (as it is on the Adam benchmark host).
+# an unrelated Cargo workspace (as on a dedicated benchmark host).
 [workspace]
 
 [dependencies]
-arrow-array = "58.1"
-arrow-ipc = "58.1"
-arrow-schema = "58.1"
+arrow-array = "59.2"
+arrow-ipc = "59.2"
+arrow-schema = "59.2"
 axum = { version = "0.8", features = ["ws"] }
-base64 = "0.22"
+base64 = "0.23"
 blake3 = "1"
 brotli = "8"
 bzip2 = "0.6"
@@ -37,6 +37,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 crc32c = "0.6"
 foldhash = "0.2"
+futures-util = "0.3"
 form_urlencoded = "1.2"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
 object_store = { version = "0.14", default-features = false, features = ["aws"] }
@@ -45,10 +46,10 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 fs2 = "0.4"
 libdeflater = "1.25"
 lz4 = "1.28"
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 lzfse = "0.2"
 lzfse_rust = "0.2"
-lzma-rust2 = "0.16"
+lzma-rust2 = "0.18"
 memchr = "2.8"
 memmap2 = "0.9"
 minlz = "1.2"
@@ -62,9 +63,9 @@ rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
-shard-stream-core = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "8eca7d9311b2b738f85f79d0f59a003d1f6c3752", version = "=0.1.0" }
-shard-stream-engine = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "8eca7d9311b2b738f85f79d0f59a003d1f6c3752", version = "=0.1.0" }
-shard-stream-protocol = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "8eca7d9311b2b738f85f79d0f59a003d1f6c3752", version = "=0.1.0" }
+shard-stream-core = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "799f9775c694ec2b35299f7d84412eb3f827e6d4", version = "=0.1.0" }
+shard-stream-engine = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "799f9775c694ec2b35299f7d84412eb3f827e6d4", version = "=0.1.0" }
+shard-stream-protocol = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "799f9775c694ec2b35299f7d84412eb3f827e6d4", version = "=0.1.0" }
 snap = "1"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"

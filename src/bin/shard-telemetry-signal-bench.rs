@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::hint::black_box;
 use std::io::{BufWriter, Write};
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rayon::prelude::*;
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicPartition};
 use shard_telemetry::{
     AnalyticsColumn, AnalyticsRelation, AnalyticsScanRequest, CompressionCohortId,
@@ -31,7 +32,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut durable_output_dir = None::<PathBuf>;
     let mut server_data_directory = None::<PathBuf>;
     let mut server_shards = 1usize;
+    let mut server_partitions = 256usize;
+    let mut server_append_linger_micros = 250u64;
     let mut server_scan_iterations = None::<usize>;
+    let mut server_only = false;
+    let mut server_open_only = false;
+    let mut generate_only = false;
+    let mut server_recovery_journal = false;
+    let mut server_hold_seconds = 0u64;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -55,21 +63,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             "--server-shards" => server_shards = parse_usize(args.next(), "--server-shards")?,
+            "--server-partitions" => {
+                server_partitions = parse_usize(args.next(), "--server-partitions")?;
+            }
+            "--server-append-linger-micros" => {
+                server_append_linger_micros = args
+                    .next()
+                    .ok_or("missing value for --server-append-linger-micros")?
+                    .parse()?;
+            }
             "--server-scan-iterations" => {
                 server_scan_iterations =
                     Some(parse_usize(args.next(), "--server-scan-iterations")?);
             }
+            "--server-only" => server_only = true,
+            "--server-open-only" => server_open_only = true,
+            "--generate-only" => generate_only = true,
+            "--server-recovery-journal" => server_recovery_journal = true,
+            "--server-hold-seconds" => {
+                server_hold_seconds = args
+                    .next()
+                    .ok_or("missing value for --server-hold-seconds")?
+                    .parse()?;
+            }
             _ => return Err(format!("unknown argument {argument}").into()),
         }
     }
-    if records < 128 || iterations == 0 || server_shards == 0 || server_shards > 256 {
+    if records < 128
+        || iterations == 0
+        || server_shards == 0
+        || server_shards > 256
+        || server_partitions == 0
+        || server_partitions > usize::from(u16::MAX)
+        || server_shards > server_partitions
+    {
         return Err(
-            "--records must be at least 128, --iterations must be nonzero, and --server-shards must be in 1..=256"
+            "--records must be at least 128, --iterations must be nonzero, --server-shards must be in 1..=256, and --server-partitions must fit u16 and be at least the shard count"
                 .into(),
         );
     }
 
     let corpus = Corpus::generate(records)?;
+    println!(
+        "fixture records={} resident_kib={}",
+        records.saturating_mul(3),
+        resident_set_kib().unwrap_or_default()
+    );
+    if generate_only {
+        black_box((
+            corpus.durable_logs.len(),
+            corpus.spans.len(),
+            corpus.points.len(),
+        ));
+        println!(
+            "generated records_per_signal={} total_records={}",
+            records,
+            records.saturating_mul(3)
+        );
+        return Ok(());
+    }
     if let Some(output_dir) = clickhouse_dir.as_deref() {
         export_clickhouse_corpus(&corpus, output_dir)?;
     }
@@ -77,16 +129,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(output_dir)?;
     }
     if let Some(data_directory) = server_data_directory.as_deref() {
-        let started = Instant::now();
-        persist_server_store(&corpus, data_directory, server_shards)?;
-        println!(
-            "server_store records={} shards={} elapsed_seconds={:.6}",
-            corpus.spans.len().saturating_add(corpus.points.len()),
-            server_shards,
-            started.elapsed().as_secs_f64()
-        );
+        let store = if server_open_only {
+            let open_started = Instant::now();
+            let store = DurableTelemetryStore::open(server_store_config(
+                data_directory,
+                server_shards,
+                server_partitions,
+                server_append_linger_micros,
+                server_recovery_journal,
+            )?)?;
+            println!(
+                "embedded_open_only shards={} partitions={} recovery_journal={} open_seconds={:.6} resident_kib={}",
+                server_shards,
+                server_partitions,
+                server_recovery_journal,
+                open_started.elapsed().as_secs_f64(),
+                resident_set_kib().unwrap_or_default()
+            );
+            store
+        } else {
+            let started = Instant::now();
+            let (store, phases) = persist_server_store(
+                &corpus,
+                data_directory,
+                server_shards,
+                server_partitions,
+                server_append_linger_micros,
+                server_recovery_journal,
+            )?;
+            println!(
+                "embedded_store records={} shards={} partitions={} append_linger_micros={} recovery_journal={} open_seconds={:.6} logs_seconds={:.6} traces_seconds={:.6} metrics_seconds={:.6} metric_batches={} open_resident_kib={} logs_resident_kib={} traces_resident_kib={} metrics_resident_kib={} elapsed_seconds={:.6}",
+                corpus
+                    .durable_logs
+                    .len()
+                    .saturating_add(corpus.spans.len())
+                    .saturating_add(corpus.points.len()),
+                server_shards,
+                server_partitions,
+                server_append_linger_micros,
+                server_recovery_journal,
+                phases.open.as_secs_f64(),
+                phases.logs.as_secs_f64(),
+                phases.traces.as_secs_f64(),
+                phases.metrics.as_secs_f64(),
+                phases.metric_batches,
+                phases.open_resident_kib,
+                phases.logs_resident_kib,
+                phases.traces_resident_kib,
+                phases.metrics_resident_kib,
+                started.elapsed().as_secs_f64()
+            );
+            store
+        };
         if let Some(scan_iterations) = server_scan_iterations {
-            benchmark_server_scans(&corpus, data_directory, server_shards, scan_iterations)?;
+            benchmark_server_scans(&corpus, &store, scan_iterations)?;
+        }
+        if server_hold_seconds > 0 {
+            std::thread::sleep(Duration::from_secs(server_hold_seconds));
+            println!("embedded_idle seconds={server_hold_seconds}");
+        }
+        let drop_started = Instant::now();
+        drop(store);
+        println!(
+            "embedded_shutdown elapsed_seconds={:.6} resident_kib={}",
+            drop_started.elapsed().as_secs_f64(),
+            resident_set_kib().unwrap_or_default()
+        );
+        if server_only {
+            return Ok(());
         }
     }
     println!("ShardTelemetry signal benchmark (v1)");
@@ -111,27 +221,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn benchmark_server_scans(
     corpus: &Corpus,
-    data_directory: &Path,
-    shard_count: usize,
+    store: &DurableTelemetryStore,
     iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if iterations == 0 {
         return Err("--server-scan-iterations must be nonzero".into());
     }
-    let store = DurableTelemetryStore::open(DurableTelemetryConfig {
-        data_directory: data_directory.to_path_buf(),
-        object_store_directory: None,
-        s3_object_store: None,
-        recovery_journal: true,
-        retention: None,
-        shard_count: u32::try_from(shard_count)?,
-        tenant_partitions: 256,
-        append_linger: Duration::ZERO,
-        stripe: StripeConfig::default(),
-        indexed_ack_timeout: Duration::from_secs(300),
-    })?;
     let selected_trace = corpus.spans[corpus.spans.len() / 2].trace_id;
     let selected_series = corpus.points[corpus.points.len() / 2].series_fingerprint();
+    let mut log = AnalyticsScanRequest::for_relation(TENANT, AnalyticsRelation::Logs);
+    log.trace_id = Some(selected_trace);
+    log.limit = Some(32);
+    log.columns = vec![AnalyticsColumn::Timestamp, AnalyticsColumn::Message];
     let mut trace = AnalyticsScanRequest::for_relation(TENANT, AnalyticsRelation::Spans);
     trace.trace_id = Some(selected_trace);
     trace.limit = Some(32);
@@ -149,7 +250,12 @@ fn benchmark_server_scans(
         .push(MetadataField::new("service.name", "checkout-api"));
     resource.limit = Some(1_000);
     resource.columns = vec![AnalyticsColumn::Timestamp, AnalyticsColumn::Name];
-    for (name, request) in [("trace", trace), ("metric", metric), ("resource", resource)] {
+    for (name, request) in [
+        ("log", log),
+        ("trace", trace),
+        ("metric", metric),
+        ("resource", resource),
+    ] {
         let (rows, ops, p50, p99) = measure_lookup(iterations, || {
             let mut count = 0;
             store
@@ -241,11 +347,26 @@ fn export_clickhouse_corpus(
     Ok(())
 }
 
+struct EmbeddedPhases {
+    open: Duration,
+    logs: Duration,
+    traces: Duration,
+    metrics: Duration,
+    metric_batches: usize,
+    open_resident_kib: u64,
+    logs_resident_kib: u64,
+    traces_resident_kib: u64,
+    metrics_resident_kib: u64,
+}
+
 fn persist_server_store(
     corpus: &Corpus,
     data_directory: &Path,
     shard_count: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+    partition_count: usize,
+    append_linger_micros: u64,
+    recovery_journal: bool,
+) -> Result<(DurableTelemetryStore, EmbeddedPhases), Box<dyn std::error::Error>> {
     if data_directory.exists() {
         return Err(format!(
             "server data directory already exists: {}",
@@ -253,21 +374,69 @@ fn persist_server_store(
         )
         .into());
     }
-    let shard_count = u32::try_from(shard_count)?;
-    let store = DurableTelemetryStore::open(DurableTelemetryConfig {
-        data_directory: data_directory.to_path_buf(),
-        object_store_directory: None,
-        s3_object_store: None,
-        recovery_journal: true,
-        retention: None,
+    let open_started = Instant::now();
+    let store = DurableTelemetryStore::open(server_store_config(
+        data_directory,
         shard_count,
-        tenant_partitions: 256,
-        append_linger: Duration::ZERO,
-        stripe: StripeConfig::default(),
-        indexed_ack_timeout: Duration::from_secs(300),
-    })?;
+        partition_count,
+        append_linger_micros,
+        recovery_journal,
+    )?)?;
+    let open = open_started.elapsed();
+    let open_resident_kib = resident_set_kib().unwrap_or_default();
 
-    let router = TelemetryRouter::new(NonZeroU16::new(256).expect("constant is nonzero"));
+    let router = TelemetryRouter::new(
+        NonZeroU16::new(u16::try_from(partition_count)?).expect("validated nonzero partitions"),
+    );
+    let logs_started = Instant::now();
+    let mut log_partitions = BTreeMap::<TopicPartition, Vec<OtlpLogEvent>>::new();
+    for record in &corpus.durable_logs {
+        let resource_id = record.resource_id().get().to_le_bytes();
+        log_partitions
+            .entry(router.log(TENANT, record.trace_id, &resource_id))
+            .or_default()
+            .push(OtlpLogEvent {
+                timestamp_unix_nanos: record.timestamp_unix_nanos,
+                observed_timestamp_unix_nanos: record.observed_timestamp_unix_nanos,
+                body: record.body.clone(),
+                message: Arc::clone(&record.message),
+                fields: Arc::clone(&record.fields),
+                attributes: Arc::clone(&record.attributes),
+                resource: Arc::clone(&record.resource),
+                scope: Arc::clone(&record.scope),
+                severity_number: record.severity_number,
+                severity_text: Arc::clone(&record.severity_text),
+                dropped_attributes_count: record.dropped_attributes_count,
+                flags: record.flags,
+                trace_id: record.trace_id,
+                span_id: record.span_id,
+                event_name: Arc::clone(&record.event_name),
+                compression_cohort: record.compression_cohort,
+            });
+    }
+    let mut log_appends = log_partitions
+        .into_par_iter()
+        .map(|(topic_partition, events)| {
+            let (envelope, transient_context) =
+                shard_telemetry::prepare_log_envelope_with_context(TENANT, &events)?;
+            Ok(NativePartitionAppend {
+                topic_partition,
+                envelope,
+                transient_context: Some(transient_context),
+            })
+        })
+        .collect::<shard_telemetry::TelemetryResult<Vec<_>>>()?;
+    log_appends.sort_unstable_by_key(|append| append.topic_partition);
+    store.append_telemetry_batch(
+        &NativeTelemetryBatch {
+            partitions: log_appends,
+        },
+        true,
+    )?;
+    let logs = logs_started.elapsed();
+    let logs_resident_kib = resident_set_kib().unwrap_or_default();
+
+    let traces_started = Instant::now();
     let mut trace_partitions = BTreeMap::<TopicPartition, Vec<DurableSpan>>::new();
     for span in &corpus.spans {
         trace_partitions
@@ -275,38 +444,57 @@ fn persist_server_store(
             .or_default()
             .push(span.clone());
     }
-    for (trace_partition, partition_records) in trace_partitions {
-        for chunk in partition_records.chunks(32_768) {
-            let mut records = chunk.to_vec();
-            for (ordinal, record) in records.iter_mut().enumerate() {
-                record.stream_shard_id = ShardId::new(0);
-                record.record_ref = TelemetryRecordRef::for_signal(
-                    TelemetrySignal::Traces,
-                    trace_partition,
-                    LogicalOffset::new(u64::try_from(ordinal)?),
-                );
-            }
-            let payload = encode_trace_block(&records)?;
-            let envelope = TelemetryEnvelope::new(
-                TelemetrySignal::Traces,
-                TENANT,
-                u32::try_from(records.len())?,
-                trace_partition.partition_id.get().to_le_bytes().as_slice(),
-                Arc::<[u8]>::from(payload),
-            )?;
-            store.append_telemetry_batch(
-                &NativeTelemetryBatch {
-                    partitions: vec![NativePartitionAppend {
+    let trace_append_groups = trace_partitions
+        .into_par_iter()
+        .map(|(trace_partition, partition_records)| {
+            partition_records
+                .chunks(32_768)
+                .map(|chunk| {
+                    let mut records = chunk.to_vec();
+                    for (ordinal, record) in records.iter_mut().enumerate() {
+                        record.stream_shard_id = ShardId::new(0);
+                        record.record_ref = TelemetryRecordRef::for_signal(
+                            TelemetrySignal::Traces,
+                            trace_partition,
+                            LogicalOffset::new(
+                                u64::try_from(ordinal)
+                                    .map_err(|_| shard_telemetry::TelemetryError::RecordTooLarge)?,
+                            ),
+                        );
+                    }
+                    let payload = encode_trace_block(&records)?;
+                    let envelope = TelemetryEnvelope::new(
+                        TelemetrySignal::Traces,
+                        TENANT,
+                        u32::try_from(records.len())
+                            .map_err(|_| shard_telemetry::TelemetryError::RecordTooLarge)?,
+                        trace_partition.partition_id.get().to_le_bytes().as_slice(),
+                        Arc::<[u8]>::from(payload),
+                    )?;
+                    Ok(NativePartitionAppend {
                         topic_partition: trace_partition,
                         envelope,
                         transient_context: None,
-                    }],
-                },
-                true,
-            )?;
-        }
-    }
+                    })
+                })
+                .collect::<shard_telemetry::TelemetryResult<Vec<_>>>()
+        })
+        .collect::<shard_telemetry::TelemetryResult<Vec<_>>>()?;
+    let mut trace_appends = trace_append_groups
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    trace_appends.sort_unstable_by_key(|append| append.topic_partition);
+    store.append_telemetry_batch(
+        &NativeTelemetryBatch {
+            partitions: trace_appends,
+        },
+        true,
+    )?;
+    let traces = traces_started.elapsed();
+    let traces_resident_kib = resident_set_kib().unwrap_or_default();
 
+    let metrics_started = Instant::now();
     let mut series =
         BTreeMap::<(TopicPartition, SeriesFingerprint), Vec<DurableMetricPoint>>::new();
     for point in &corpus.points {
@@ -316,39 +504,111 @@ fn persist_server_store(
             .or_default()
             .push(point.clone());
     }
-    for ((metric_partition, _), mut records) in series {
-        for (ordinal, record) in records.iter_mut().enumerate() {
-            record.stream_shard_id = ShardId::new(0);
-            record.record_ref = TelemetryRecordRef::for_signal(
+    let mut metric_appends = series
+        .into_par_iter()
+        .map(|((metric_partition, fingerprint), mut records)| {
+            for (ordinal, record) in records.iter_mut().enumerate() {
+                record.stream_shard_id = ShardId::new(0);
+                record.record_ref = TelemetryRecordRef::for_signal(
+                    TelemetrySignal::Metrics,
+                    metric_partition,
+                    LogicalOffset::new(
+                        u64::try_from(ordinal)
+                            .map_err(|_| shard_telemetry::TelemetryError::RecordTooLarge)?,
+                    ),
+                );
+            }
+            let payload = encode_metric_chunk(&records)?;
+            let mut routing_metadata = [0_u8; 5];
+            routing_metadata[..4]
+                .copy_from_slice(&metric_partition.partition_id.get().to_le_bytes());
+            routing_metadata[4] = 1;
+            let envelope = TelemetryEnvelope::new(
                 TelemetrySignal::Metrics,
+                TENANT,
+                u32::try_from(records.len())
+                    .map_err(|_| shard_telemetry::TelemetryError::RecordTooLarge)?,
+                routing_metadata.as_slice(),
+                Arc::<[u8]>::from(payload),
+            )?;
+            Ok((
                 metric_partition,
-                LogicalOffset::new(u64::try_from(ordinal)?),
-            );
-        }
-        let payload = encode_metric_chunk(&records)?;
-        let mut routing_metadata = [0_u8; 5];
-        routing_metadata[..4].copy_from_slice(&metric_partition.partition_id.get().to_le_bytes());
-        routing_metadata[4] = 1;
-        let envelope = TelemetryEnvelope::new(
-            TelemetrySignal::Metrics,
-            TENANT,
-            u32::try_from(records.len())?,
-            routing_metadata.as_slice(),
-            Arc::<[u8]>::from(payload),
-        )?;
-        store.append_telemetry_batch(
-            &NativeTelemetryBatch {
-                partitions: vec![NativePartitionAppend {
+                fingerprint,
+                NativePartitionAppend {
                     topic_partition: metric_partition,
                     envelope,
                     transient_context: None,
-                }],
-            },
-            true,
-        )?;
+                },
+            ))
+        })
+        .collect::<shard_telemetry::TelemetryResult<Vec<_>>>()?;
+    metric_appends.sort_unstable_by_key(|(partition, fingerprint, _)| (*partition, *fingerprint));
+    let mut metric_rounds = Vec::<(BTreeSet<TopicPartition>, Vec<NativePartitionAppend>)>::new();
+    for (metric_partition, _, append) in metric_appends {
+        if let Some((partitions, appends)) = metric_rounds
+            .iter_mut()
+            .find(|(partitions, _)| !partitions.contains(&metric_partition))
+        {
+            partitions.insert(metric_partition);
+            appends.push(append);
+        } else {
+            metric_rounds.push((BTreeSet::from([metric_partition]), vec![append]));
+        }
     }
-    drop(store);
-    Ok(())
+    let metric_batches = metric_rounds.len();
+    for (_, partitions) in metric_rounds {
+        store.append_telemetry_batch(&NativeTelemetryBatch { partitions }, true)?;
+    }
+    let metrics = metrics_started.elapsed();
+    let metrics_resident_kib = resident_set_kib().unwrap_or_default();
+    Ok((
+        store,
+        EmbeddedPhases {
+            open,
+            logs,
+            traces,
+            metrics,
+            metric_batches,
+            open_resident_kib,
+            logs_resident_kib,
+            traces_resident_kib,
+            metrics_resident_kib,
+        },
+    ))
+}
+
+fn server_store_config(
+    data_directory: &Path,
+    shard_count: usize,
+    partition_count: usize,
+    append_linger_micros: u64,
+    recovery_journal: bool,
+) -> Result<DurableTelemetryConfig, Box<dyn std::error::Error>> {
+    Ok(DurableTelemetryConfig {
+        data_directory: data_directory.to_path_buf(),
+        object_store_directory: None,
+        s3_object_store: None,
+        recovery_journal,
+        retention: None,
+        shard_count: u32::try_from(shard_count)?,
+        tenant_partitions: u32::try_from(partition_count)?,
+        append_linger: Duration::from_micros(append_linger_micros),
+        stripe: StripeConfig::default(),
+        indexed_ack_timeout: Duration::from_secs(300),
+    })
+}
+
+fn resident_set_kib() -> Option<u64> {
+    fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")?
+                .split_ascii_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
 }
 
 fn write_trace_row(

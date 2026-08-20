@@ -4,7 +4,7 @@ set -euo pipefail
 SHARD_TELEMETRY_REPOSITORY=${SHARD_TELEMETRY_REPOSITORY:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
 SHARD_TELEMETRY_BIN=${SHARD_TELEMETRY_BIN:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-signal-bench}
 SHARD_TELEMETRY_SERVER=${SHARD_TELEMETRY_SERVER:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-server}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-signal-clickhouse-head-to-head}
+RESULT_ROOT=${RESULT_ROOT:-$SHARD_TELEMETRY_REPOSITORY/benchmark-results/signal-clickhouse-head-to-head}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 RECORDS=${RECORDS:-262144}
 LOOKUP_ITERATIONS=${LOOKUP_ITERATIONS:-2000}

@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SOURCE=${SOURCE:-/home/dtietjen/log-compression-samples/clickhouse-docker-json-error-loop-tail-80g-20260729.log}
-EXPECTED_SHA256=${EXPECTED_SHA256:-4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508}
-EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-85899345920}
-LOADER_BIN=${LOADER_BIN:-target/release/shard-telemetry-loki-load}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SHARD_TELEMETRY_REPOSITORY=${SHARD_TELEMETRY_REPOSITORY:-$(cd -- "$SCRIPT_DIR/.." && pwd)}
+SOURCE=${SOURCE:?set SOURCE to an immutable Docker json-file input}
+EXPECTED_SHA256=${EXPECTED_SHA256:-}
+EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-}
+LOADER_BIN=${LOADER_BIN:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-loki-load}
 LOKI_IMAGE=${LOKI_IMAGE:-sha256:191d4fdfb7264f16989f0a57f320872620a5a7c2ceeec6229212c4190ec49b86}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-loki-benchmarks}
+RESULT_ROOT=${RESULT_ROOT:-$SHARD_TELEMETRY_REPOSITORY/benchmark-results/loki}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 CORE_COUNT=${CORE_COUNT:-16}
 LOKI_PORT=${LOKI_PORT:-33100}
 SETTLE_TIMEOUT_SECONDS=${SETTLE_TIMEOUT_SECONDS:-900}
 SETTLE_POLL_SECONDS=${SETTLE_POLL_SECONDS:-10}
 SETTLED_WAL_LIMIT_BYTES=${SETTLED_WAL_LIMIT_BYTES:-1}
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 LOKI_CONFIG=${LOKI_CONFIG:-$SCRIPT_DIR/loki-benchmark.yaml}
 
 for command in awk curl dd docker du lscpu sha256sum stat taskset; do
@@ -40,15 +41,15 @@ done
 }
 
 SOURCE_BYTES=$(stat -c %s "$SOURCE")
-[[ $SOURCE_BYTES -eq $EXPECTED_FILE_BYTES ]] || {
+if [[ -n $EXPECTED_FILE_BYTES && $SOURCE_BYTES -ne $EXPECTED_FILE_BYTES ]]; then
     echo "source size mismatch: got $SOURCE_BYTES, expected $EXPECTED_FILE_BYTES" >&2
     exit 2
-}
+fi
 SOURCE_SHA256=$(sha256sum "$SOURCE" | awk '{ print $1 }')
-[[ $SOURCE_SHA256 == "$EXPECTED_SHA256" ]] || {
+if [[ -n $EXPECTED_SHA256 && $SOURCE_SHA256 != "$EXPECTED_SHA256" ]]; then
     echo "source SHA-256 mismatch: got $SOURCE_SHA256, expected $EXPECTED_SHA256" >&2
     exit 2
-}
+fi
 IMAGE_ID=$(docker image inspect "$LOKI_IMAGE" --format '{{.Id}}')
 [[ $IMAGE_ID == "$LOKI_IMAGE" ]] || {
     echo "Loki image mismatch: got $IMAGE_ID, expected $LOKI_IMAGE" >&2

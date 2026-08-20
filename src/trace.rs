@@ -1,8 +1,9 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
 
+use foldhash::{HashMap, HashMapExt};
 use pco::ChunkConfig;
 use pco::standalone::{simple_compress, simple_decompress_into};
 use serde::{Deserialize, Serialize};
@@ -828,7 +829,7 @@ pub struct TraceSummary {
 }
 
 /// Trace-by-ID query and bounded search constraints.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceQuery {
     /// Required tenant.
     pub tenant: Arc<str>,

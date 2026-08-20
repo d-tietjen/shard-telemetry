@@ -187,7 +187,7 @@ claim that every operator has the same acceleration.
 
 ## Sealed cold-payload behavior
 
-The 2026-07-30 Adam comparison kept both engines' search indexes resident and
+The 2026-07-30 reference-host comparison kept both engines' search indexes resident and
 evicted immutable record payload pages with `POSIX_FADV_DONTNEED` before every
 cold sample. This models a long-lived query process reading sealed data from
 local SSD; it does not include remote object-store request latency.
@@ -218,7 +218,7 @@ may rebuild it from exact structural records without changing record identity.
 
 ## Current measured behavior
 
-The pre-checkpoint Adam profile of a 100-hit query against a 1 GiB real
+The pre-checkpoint reference-host profile of a 100-hit query against a 1 GiB real
 ClickHouse pack attributed 27.24% of cycles to UTF-8 validation of skipped
 values, 39.86% to walking body and field streams, and 13.35% to varint reads.
 Only 2.27% was zstd and 1.14% was the pack read.
@@ -228,7 +228,7 @@ changed zstd-1 size from 148,554 to 148,562 bytes while reducing a newest
 contiguous 100-record decode from 2,683.55 to roughly 175 microseconds. One
 hundred hits spaced every 100 records took roughly 460 microseconds.
 
-The 2026-07-30 Adam head-to-head loaded the full indexed 80 GiB corpus:
+The 2026-07-30 reference-host head-to-head loaded the full indexed 80 GiB corpus:
 607,363,459 accepted records in 10,240 blocks. A warm 100-hit sealed-pack
 query, including planning, pack read, checksum, decompression, and selective
 decode, measured 1.06-1.15 ms p50 across latest, exact-field, one-term, and
@@ -242,8 +242,8 @@ aggregate masks, and takes about 23 seconds to load. Full indexed ingest peaked
 at 97.65 GiB RSS. Query latency is already competitive; reducing posting
 expansion and startup cost is now the primary query-architecture priority.
 
-See [BENCHMARKS.md](BENCHMARKS.md) for the hot-index and real-pack tables,
-provenance, and evidence locations.
+See [BENCHMARKS.md](BENCHMARKS.md) for the hot-index and real-pack harnesses,
+provenance requirements, and methodological caveats.
 
 ## Remaining optimization work
 

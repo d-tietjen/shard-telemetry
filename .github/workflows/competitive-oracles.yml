@@ -1,0 +1,40 @@
+name: Competitive external oracles
+
+on:
+  schedule:
+    - cron: "41 5 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shard-telemetry-competitive-oracles
+  cancel-in-progress: false
+
+jobs:
+  linux-amd64:
+    name: Pinned Linux external-oracle campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal
+      - name: Build campaign binaries
+        run: |
+          cargo build --release --locked \
+            --bin shard-telemetry-server \
+            --bin shard-telemetry-clickhouse-fixture
+      - name: Run pinned Prometheus, Loki, Tempo, ClickHouse, and DuckDB oracles
+        env:
+          RESULT_ROOT: ${{ runner.temp }}/shard-telemetry-competitive
+        run: scripts/run-competitive-oracles.sh
+      - name: Retain external-oracle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: competitive-oracle-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/shard-telemetry-competitive
+          if-no-files-found: warn
+          retention-days: 30

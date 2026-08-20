@@ -13,6 +13,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, HeaderValue, header};
 use axum::response::Response;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -43,7 +44,7 @@ pub enum AnalyticsScanOrder {
     TimestampDescending,
 }
 
-/// Encoding used by the authenticated ClickHouse scan boundary.
+/// Encoding used by the authenticated analytical scan boundary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AnalyticsWireFormat {
     /// Standard Arrow IPC streaming format.
@@ -51,6 +52,12 @@ pub enum AnalyticsWireFormat {
     ArrowStream,
     /// ClickHouse RowBinary using the requested relation projection.
     RowBinary,
+    /// Newline-delimited JSON objects using the requested relation projection.
+    ///
+    /// This is intended for bounded analytical interchange, including DuckDB's
+    /// built-in JSON reader. It is not an ingest protocol or a replacement for
+    /// the typed Arrow stream on high-throughput analytical paths.
+    JsonLines,
 }
 
 /// A stable telemetry relation exposed to ClickHouse.
@@ -183,7 +190,7 @@ pub enum AnalyticsColumn {
 }
 
 impl AnalyticsColumn {
-    /// Stable Arrow and ClickHouse column name.
+    /// Stable Arrow, JSON, and ClickHouse column name.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -643,7 +650,8 @@ impl AnalyticsScanRequest {
         if self.cardinality_only
             && (self.columns.len() != 1
                 || (self.wire_format == AnalyticsWireFormat::ArrowStream
-                    && self.columns != [AnalyticsColumn::Offset]))
+                    && self.columns != [AnalyticsColumn::Offset])
+                || self.wire_format == AnalyticsWireFormat::JsonLines)
         {
             return Err(LokiApiError::bad_request(
                 "cardinality_only requires one RowBinary column or the Arrow offset column",
@@ -904,6 +912,7 @@ pub(crate) fn parse_scan_request(
                 request.wire_format = match value.as_str() {
                     "arrow" | "arrow_stream" => AnalyticsWireFormat::ArrowStream,
                     "rowbinary" => AnalyticsWireFormat::RowBinary,
+                    "json" | "jsonl" | "ndjson" => AnalyticsWireFormat::JsonLines,
                     _ => return Err(LokiApiError::bad_request("unknown analytics wire format")),
                 };
             }
@@ -1809,6 +1818,7 @@ pub(crate) fn analytics_stream_response(
     match request.wire_format {
         AnalyticsWireFormat::ArrowStream => arrow_stream_response(store, request),
         AnalyticsWireFormat::RowBinary => rowbinary_stream_response(store, request),
+        AnalyticsWireFormat::JsonLines => jsonlines_stream_response(store, request),
     }
 }
 
@@ -1873,6 +1883,39 @@ fn rowbinary_stream_response(store: Arc<dyn LokiStore>, request: AnalyticsScanRe
     response
 }
 
+fn jsonlines_stream_response(store: Arc<dyn LokiStore>, request: AnalyticsScanRequest) -> Response {
+    let relation = request.relation.name();
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+    tokio::task::spawn_blocking(move || {
+        let mut sink = ChannelWriter::new(sender.clone(), STREAM_CHUNK_BYTES);
+        let result = write_jsonlines_stream(store, &request, &mut sink).and_then(|()| {
+            sink.finish()
+                .map_err(|error| LokiApiError::internal(error.to_string()))
+        });
+        if let Err(error) = result {
+            let _ = sender.blocking_send(Err(io::Error::other(error.to_string())));
+        }
+    });
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(receiver)));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-shardtelemetry-schema-version"),
+        HeaderValue::from_static("1"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-shardtelemetry-relation"),
+        HeaderValue::from_static(relation),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-shardtelemetry-clickhouse-target"),
+        HeaderValue::from_static(CLICKHOUSE_COMPATIBILITY_TARGET),
+    );
+    response
+}
+
 fn write_rowbinary_stream(
     store: Arc<dyn LokiStore>,
     request: &AnalyticsScanRequest,
@@ -1906,6 +1949,69 @@ fn write_rowbinary_stream(
         }
         Ok(())
     })
+}
+
+fn write_jsonlines_stream(
+    store: Arc<dyn LokiStore>,
+    request: &AnalyticsScanRequest,
+    writer: &mut dyn Write,
+) -> Result<(), LokiApiError> {
+    debug_assert!(!request.cardinality_only);
+    store.scan_analytics(request, &mut |rows| {
+        for row in rows {
+            write_jsonlines_row(writer, row, &request.columns)?;
+        }
+        Ok(())
+    })
+}
+
+fn write_jsonlines_row(
+    writer: &mut dyn Write,
+    row: &AnalyticsRow,
+    columns: &[AnalyticsColumn],
+) -> Result<(), LokiApiError> {
+    let mut object = JsonMap::with_capacity(columns.len());
+    for column in columns {
+        object.insert(column.name().to_owned(), json_column_value(row, *column));
+    }
+    serde_json::to_writer(&mut *writer, &JsonValue::Object(object))
+        .map_err(|error| LokiApiError::internal(error.to_string()))?;
+    writer.write_all(b"\n").map_err(rowbinary_error)
+}
+
+fn json_column_value(row: &AnalyticsRow, column: AnalyticsColumn) -> JsonValue {
+    match column.field().data_type() {
+        DataType::Utf8 => string_value(row, column)
+            .map(|value| JsonValue::String(value.to_owned()))
+            .unwrap_or(JsonValue::Null),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => timestamp_value(row, column)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        DataType::UInt32 => u32_value(row, column)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        DataType::UInt64 => u64_value(row, column)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        DataType::Int32 => i32_value(row, column)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        DataType::Int64 => row
+            .scalar_integer
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        DataType::Boolean => row
+            .monotonic
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        DataType::Map(_, _) => JsonValue::Object(
+            map_value(row, column)
+                .iter()
+                .map(|(key, value)| (key.clone(), JsonValue::String(value.clone())))
+                .collect(),
+        ),
+        _ => unreachable!("public analytical columns use supported JSON types"),
+    }
 }
 
 fn rowbinary_default_value(column: AnalyticsColumn) -> Vec<u8> {
@@ -2788,6 +2894,14 @@ mod tests {
         .expect("RowBinary cardinality request");
         assert!(rowbinary.cardinality_only);
         assert_eq!(rowbinary.columns, [AnalyticsColumn::Partition]);
+
+        assert!(
+            parse_scan_request(
+                "tenant-a".to_owned(),
+                Some("columns=offset&cardinality_only=1&wire=jsonl"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2882,6 +2996,37 @@ mod tests {
                 .value_length(0),
             1
         );
+    }
+
+    #[test]
+    fn jsonlines_projection_preserves_exact_numeric_and_map_values() {
+        let mut row = AnalyticsRow::empty(
+            Arc::from("tenant-a"),
+            "logs",
+            1_800_000_000_000_000_001,
+            4,
+            9,
+        )
+        .expect("row");
+        row.message = Some(Arc::from("request failed"));
+        row.labels.insert("app".to_owned(), "api".to_owned());
+        row.metadata.insert("code".to_owned(), "500".to_owned());
+        let columns = vec![
+            AnalyticsColumn::Timestamp,
+            AnalyticsColumn::Offset,
+            AnalyticsColumn::Message,
+            AnalyticsColumn::Labels,
+            AnalyticsColumn::Metadata,
+        ];
+        let mut output = Vec::new();
+        write_jsonlines_row(&mut output, &row, &columns).expect("JSON lines row");
+        assert!(output.ends_with(b"\n"));
+        let value: JsonValue = serde_json::from_slice(&output).expect("valid JSON line");
+        assert_eq!(value["timestamp"], 1_800_000_000_000_000_001_i64);
+        assert_eq!(value["offset"], 9_u64);
+        assert_eq!(value["message"], "request failed");
+        assert_eq!(value["labels"]["app"], "api");
+        assert_eq!(value["metadata"]["code"], "500");
     }
 
     #[test]

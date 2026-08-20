@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASELINE_RUN=${BASELINE_RUN:-/home/dtietjen/shard-telemetry-query-head-to-head/80gib-v7-20260730T205000Z}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SHARD_TELEMETRY_REPOSITORY=${SHARD_TELEMETRY_REPOSITORY:-$(cd -- "$SCRIPT_DIR/.." && pwd)}
+BASELINE_RUN=${BASELINE_RUN:?set BASELINE_RUN to a completed query-head-to-head run}
 SHARD_PACKS=${SHARD_PACKS:-$BASELINE_RUN/shard-telemetry-packs}
 CLICKHOUSE_SOURCE_DATA=${CLICKHOUSE_SOURCE_DATA:-$BASELINE_RUN/clickhouse-data}
-SHARD_TELEMETRY_QUERY_BIN=${SHARD_TELEMETRY_QUERY_BIN:-/home/dtietjen/shard-telemetry-cold-query-20260730-v2/shard-telemetry/target/release/shard-telemetry-pack-query-bench}
-SOURCE_ARCHIVE=${SOURCE_ARCHIVE:-/home/dtietjen/shard-telemetry-cold-query-20260730-v2.tar.gz}
-SHARD_STREAM_SOURCE=${SHARD_STREAM_SOURCE:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7/shard-stream}
-SHARD_STREAM_REVISION=${SHARD_STREAM_REVISION:-13ee7903d42cabe9bd5c0df0fa8e4a4fdc660ea7}
-DSIM_REPOSITORY=${DSIM_REPOSITORY:-/home/dtietjen/deterministic-simulation}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-query-head-to-head}
+SHARD_TELEMETRY_QUERY_BIN=${SHARD_TELEMETRY_QUERY_BIN:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-pack-query-bench}
+SOURCE_ARCHIVE=${SOURCE_ARCHIVE:?set SOURCE_ARCHIVE to a source archive for provenance}
+SHARD_STREAM_SOURCE=${SHARD_STREAM_SOURCE:?set SHARD_STREAM_SOURCE to a compatible shard-stream checkout}
+SHARD_STREAM_REVISION=${SHARD_STREAM_REVISION:-}
+DSIM_REPOSITORY=${DSIM_REPOSITORY:?set DSIM_REPOSITORY to a deterministic-simulation checkout}
+RESULT_ROOT=${RESULT_ROOT:-$SHARD_TELEMETRY_REPOSITORY/benchmark-results/cold-query}
 RUN_ID=${RUN_ID:-cold-current-$(date -u +%Y%m%dT%H%M%SZ)}
 CORE_COUNT=${CORE_COUNT:-16}
 WARM_ITERATIONS=${WARM_ITERATIONS:-20}
 COLD_ITERATIONS=${COLD_ITERATIONS:-5}
 MISS_ITERATIONS=${MISS_ITERATIONS:-1}
 CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-sha256:770156c537ca9124046e138a3b5845c64ea58ce8722de7a2e05fd827f4976520}
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CLICKHOUSE_CONFIG=$SCRIPT_DIR/clickhouse-benchmark.xml
 
 if [[ $CORE_COUNT -ne 16 ]]; then
@@ -77,6 +78,9 @@ IMAGE_ID=$(docker image inspect "$CLICKHOUSE_IMAGE" --format '{{.Id}}')
     echo "ClickHouse image mismatch" >&2
     exit 2
 }
+if [[ -z $SHARD_STREAM_REVISION ]]; then
+    SHARD_STREAM_REVISION=$(git -C "$SHARD_STREAM_SOURCE" rev-parse HEAD)
+fi
 {
     echo "run_id=$RUN_ID"
     echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -88,13 +92,13 @@ IMAGE_ID=$(docker image inspect "$CLICKHOUSE_IMAGE" --format '{{.Id}}')
     echo "shard_index_sha256=$(sha256sum "$SHARD_PACKS/query-index.bin" | awk '{ print $1 }')"
     echo "shard_query_binary=$SHARD_TELEMETRY_QUERY_BIN"
     echo "shard_query_binary_sha256=$(sha256sum "$SHARD_TELEMETRY_QUERY_BIN" | awk '{ print $1 }')"
-    echo "shard_telemetry_product_revision=unborn"
+    echo "shard_telemetry_product_revision=$(git -C "$SHARD_TELEMETRY_REPOSITORY" rev-parse HEAD)"
+    echo "shard_telemetry_product_status=$(git -C "$SHARD_TELEMETRY_REPOSITORY" status --porcelain | wc -l) modified entries"
     echo "shard_telemetry_source_archive=$SOURCE_ARCHIVE"
     echo "shard_telemetry_source_archive_sha256=$(sha256sum "$SOURCE_ARCHIVE" | awk '{ print $1 }')"
     echo "harness_script_sha256=$(sha256sum "$0" | awk '{ print $1 }')"
     echo "shard_stream_revision=$SHARD_STREAM_REVISION"
     echo "deterministic_simulation_revision=$(git -C "$DSIM_REPOSITORY" rev-parse HEAD)"
-    echo "provenance_gap=ShardTelemetry repository is pre-release and has no commit; source is identified by archive and binary SHA-256"
     echo "clickhouse_source_data=$CLICKHOUSE_SOURCE_DATA"
     echo "clickhouse_image=$CLICKHOUSE_IMAGE"
     echo "physical_cpu_set=$CPU_SET"

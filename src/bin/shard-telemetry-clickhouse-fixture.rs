@@ -26,6 +26,14 @@ use prost::Message;
 struct Arguments {
     #[arg(long)]
     output_directory: PathBuf,
+
+    /// Base timestamp for every generated signal, in Unix nanoseconds.
+    ///
+    /// The fixed default keeps the ClickHouse acceptance corpus byte-stable.
+    /// Cross-engine campaigns override it with a recorded current timestamp so
+    /// strict remote-write receivers do not reject the corpus as future data.
+    #[arg(long)]
+    timestamp_unix_nanos: Option<u64>,
 }
 
 fn string_attribute(key: &str, value: &str) -> KeyValue {
@@ -62,7 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let trace_id = vec![0x11; 16];
     let span_id = vec![0x22; 8];
-    let timestamp = 1_800_000_000_000_000_000;
+    let timestamp = arguments
+        .timestamp_unix_nanos
+        .unwrap_or(1_800_000_000_000_000_000);
 
     let logs = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
