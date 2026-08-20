@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SOURCE=${SOURCE:-/home/dtietjen/log-compression-samples/clickhouse-docker-json-error-loop-tail-80g-20260729.log}
-EXPECTED_SHA256=${EXPECTED_SHA256:-4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508}
-EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-85899345920}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SHARD_TELEMETRY_REPOSITORY=${SHARD_TELEMETRY_REPOSITORY:-$(cd -- "$SCRIPT_DIR/.." && pwd)}
+SOURCE=${SOURCE:?set SOURCE to an immutable Docker json-file input}
+EXPECTED_SHA256=${EXPECTED_SHA256:-}
+EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-}
 SOURCE_LIMIT_BYTES=${SOURCE_LIMIT_BYTES:-1073741824}
 CORE_COUNT=${CORE_COUNT:-16}
 QUERY_ITERATIONS=${QUERY_ITERATIONS:-20}
 REQUIRED_NOFILE=${REQUIRED_NOFILE:-262144}
-SHARD_TELEMETRY_SERVER=${SHARD_TELEMETRY_SERVER:?set SHARD_TELEMETRY_SERVER}
-SHARD_TELEMETRY_LOAD_BIN=${SHARD_TELEMETRY_LOAD_BIN:?set SHARD_TELEMETRY_LOAD_BIN}
+SHARD_TELEMETRY_SERVER=${SHARD_TELEMETRY_SERVER:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-server}
+SHARD_TELEMETRY_LOAD_BIN=${SHARD_TELEMETRY_LOAD_BIN:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-loki-load}
 CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-sha256:422be85ae7344058369cdd366ac0efea9daa8428b55c9cf50258e83a7d12fcb3}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-clickhouse-head-to-head}
+RESULT_ROOT=${RESULT_ROOT:-$SHARD_TELEMETRY_REPOSITORY/benchmark-results/clickhouse-head-to-head}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 SHARD_HTTP_ADDRESS=${SHARD_HTTP_ADDRESS:-127.0.0.1:32100}
 SHARD_NATIVE_ADDRESS=${SHARD_NATIVE_ADDRESS:-127.0.0.1:32101}
@@ -21,7 +23,6 @@ CLICKHOUSE_HTTP_PORT=18123
 CLICKHOUSE_TCP_PORT=19000
 CLICKHOUSE_INTERSERVER_PORT=19009
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CLICKHOUSE_CONFIG=$SCRIPT_DIR/clickhouse-benchmark.xml
 CLICKHOUSE_PORT_CONFIG=$SCRIPT_DIR/clickhouse-benchmark-ports.xml
 CLICKHOUSE_INGEST=$SCRIPT_DIR/clickhouse-ingest-range.sh
@@ -85,19 +86,19 @@ mapfile -t PHYSICAL_CPUS < <(
 CPU_SET=$(IFS=,; echo "${PHYSICAL_CPUS[*]}")
 
 SOURCE_FILE_BYTES=$(stat -c %s "$SOURCE")
-[[ $SOURCE_FILE_BYTES -eq $EXPECTED_FILE_BYTES ]] || {
+if [[ -n $EXPECTED_FILE_BYTES && $SOURCE_FILE_BYTES -ne $EXPECTED_FILE_BYTES ]]; then
     echo "source byte length mismatch" >&2
     exit 2
-}
+fi
 [[ $SOURCE_LIMIT_BYTES -gt 0 && $SOURCE_LIMIT_BYTES -le $SOURCE_FILE_BYTES ]] || {
     echo "source limit must be in 1..=$SOURCE_FILE_BYTES" >&2
     exit 2
 }
 SOURCE_SHA256=$(sha256sum "$SOURCE" | awk '{ print $1 }')
-[[ $SOURCE_SHA256 == "$EXPECTED_SHA256" ]] || {
+if [[ -n $EXPECTED_SHA256 && $SOURCE_SHA256 != "$EXPECTED_SHA256" ]]; then
     echo "source SHA-256 mismatch" >&2
     exit 2
-}
+fi
 IMAGE_ID=$(docker image inspect "$CLICKHOUSE_IMAGE" --format '{{.Id}}')
 [[ $IMAGE_ID == "$CLICKHOUSE_IMAGE" ]] || {
     echo "ClickHouse image mismatch" >&2

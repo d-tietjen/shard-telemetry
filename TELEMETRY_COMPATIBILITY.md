@@ -83,7 +83,18 @@ generated cases and aggregate evidence.
 - OTLP transports: `every_otlp_http_and_grpc_signal_accepts_an_empty_valid_export`
 - ClickHouse SQL boundary: the pinned stock-ClickHouse matrices documented in
   [CLICKHOUSE_COMPATIBILITY.md](CLICKHOUSE_COMPATIBILITY.md)
+- External competitive oracle campaign:
+  `scripts/run-competitive-oracles.sh` on Linux/amd64, which sends one
+  generated OTLP fixture to Prometheus, Loki, Tempo, and ShardTelemetry; runs
+  the stock ClickHouse SQL matrix; and validates the bounded DuckDB NDJSON
+  analytical interchange.
 
 Production qualification must also run the pinned external oracles on Linux.
 The repository's unit/route matrices prove registration and internal semantics;
 they are not substitutes for a same-version differential campaign.
+
+The external campaign is scheduled in GitHub Actions and retains fixture hashes,
+image identities, responses, server logs, and ClickHouse evidence. It is a
+functional compatibility gate. Larger equal-host performance campaigns remain
+separate and may only publish measurements with the corpus, CPU allocation,
+build profile, and verification artefacts required by `CONTRIBUTING.md`.

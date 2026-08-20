@@ -1,0 +1,50 @@
+name: Benchmark qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Retained-corpus comparison to run
+        required: true
+        type: choice
+        options:
+          - clickhouse-logs
+          - loki-logs
+          - clickhouse-signals
+          - clickhouse-hot-queries
+          - clickhouse-cold-queries
+      result_root:
+        description: Absolute path to the dedicated benchmark volume on the runner
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    # This label intentionally selects a dedicated, 16-core Linux host with
+    # the immutable benchmark corpus. Never run these host-sensitive results
+    # on a shared GitHub-hosted runner.
+    runs-on: [self-hosted, linux, x64, shard-telemetry-benchmark]
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal
+      - name: Run retained-corpus qualification
+        id: benchmark
+        env:
+          BENCHMARK_SUITE: ${{ inputs.suite }}
+          BENCHMARK_RESULT_ROOT: ${{ inputs.result_root }}
+          BENCHMARK_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          scripts/run-benchmark-qualification.sh
+          echo "evidence_directory=${BENCHMARK_RESULT_ROOT}/${BENCHMARK_RUN_ID}/evidence" >> "$GITHUB_OUTPUT"
+      - name: Retain compact benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-${{ inputs.suite }}-${{ github.run_id }}
+          path: ${{ steps.benchmark.outputs.evidence_directory }}
+          if-no-files-found: error
+          retention-days: 90

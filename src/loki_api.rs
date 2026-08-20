@@ -33,6 +33,9 @@ pub struct LokiApiConfig {
     pub default_tenant: Arc<str>,
     /// Largest materialized result accepted by query APIs.
     pub max_query_limit: usize,
+    /// Maximum request body accepted by the Loki and Prometheus-compatible
+    /// ingestion routes.
+    pub max_request_bytes: usize,
 }
 
 impl Default for LokiApiConfig {
@@ -40,6 +43,7 @@ impl Default for LokiApiConfig {
         Self {
             default_tenant: Arc::from(DEFAULT_TENANT),
             max_query_limit: MAX_QUERY_LIMIT,
+            max_request_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -463,7 +467,7 @@ fn build_loki_router(
             state.clone(),
             production_gate,
         ))
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(state.config.max_request_bytes))
         .with_state(state)
 }
 
@@ -4883,6 +4887,33 @@ mod tests {
                 StatusCode::METHOD_NOT_ALLOWED,
                 "wrong method for {method} {uri}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_request_body_cap_rejects_ingest_before_deserialization() {
+        let app = loki_router(
+            Arc::new(LokiApiStore::default()),
+            LokiApiConfig {
+                max_request_bytes: 4,
+                ..LokiApiConfig::default()
+            },
+        );
+
+        for uri in ["/loki/api/v1/push", "/api/prom/push", "/otlp/v1/logs"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("12345"))
+                        .expect("oversized request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
         }
     }
 

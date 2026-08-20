@@ -13,14 +13,17 @@ mod block;
 mod correlation;
 mod deletion;
 mod dictionary;
+mod embedded;
 mod envelope;
 mod error;
 mod ingest_pack;
 mod locality;
 mod loki_api;
 mod metric;
+mod native_client;
 mod native_protocol;
 mod native_server;
+mod offload;
 mod otlp;
 mod otlp_server;
 mod otlp_signal;
@@ -63,6 +66,7 @@ pub use dictionary::{
     CompressionCohortId, DictionaryCache, DictionaryCatalog, DictionaryCatalogSnapshot,
     DictionaryId, DictionaryInsert, DictionaryPublication,
 };
+pub use embedded::{EmbeddedTelemetryConfig, EmbeddedTelemetryRuntime, EmbeddedTelemetryState};
 pub use envelope::{MAX_TELEMETRY_ENVELOPE_BYTES, TelemetryEnvelope};
 pub use error::{TelemetryError, TelemetryResult};
 pub use locality::{
@@ -84,14 +88,23 @@ pub use metric::{
     MetricValue, NumberValue, SeriesAccumulatorCheckpoint, SummaryQuantileValue, SummaryValue,
     decode_metric_chunk, encode_metric_chunk, prometheus_string_labels,
 };
+pub use native_client::{NativeClientConfig, NativeClientError, ShardTelemetryClient};
 pub use native_protocol::{
-    MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeFrame, NativeFrameHeader,
-    NativeLogQueryResult, NativeOpcode, NativePartitionAck, NativePartitionAppend,
-    NativeProtocolError, NativeQuery, NativeQueryDirection, NativeStatus, NativeTelemetryAppendAck,
-    NativeTelemetryBatch, decode_native_log_query_result, decode_native_query,
-    encode_native_log_query_result, encode_native_query, is_native_telemetry_batch,
+    MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeCapabilities, NativeFrame,
+    NativeFrameHeader, NativeLogQueryResult, NativeOpcode, NativePartitionAck,
+    NativePartitionAppend, NativeProtocolError, NativeQuery, NativeQueryDirection, NativeStatus,
+    NativeTelemetryAppendAck, NativeTelemetryBatch, decode_native_capabilities,
+    decode_native_log_query_result, decode_native_metric_query, decode_native_metric_query_result,
+    decode_native_query, decode_native_trace_query, decode_native_trace_query_result,
+    encode_native_capabilities, encode_native_log_query_result, encode_native_metric_query,
+    encode_native_metric_query_result, encode_native_query, encode_native_trace_query,
+    encode_native_trace_query_result, is_native_telemetry_batch,
 };
 pub use native_server::{NativeRequestGate, NativeServerConfig, serve_native};
+pub use offload::{
+    OffloadCheckpoint, OffloadError, OffloadLoopReport, OffloadReport, UpstreamOffloadConfig,
+    UpstreamOffloadLoopConfig, UpstreamOffloader,
+};
 pub use otlp::{OtlpLogDecoder, OtlpLogEvent};
 pub use otlp_server::{OtlpIngestService, OtlpReceiverConfig, otlp_http_router, serve_otlp_grpc};
 pub use otlp_signal::{OtlpMetricEvent, OtlpSpanEvent, OtlpTelemetryDecoder};
@@ -115,8 +128,9 @@ pub use remote_write::{
 pub use s3_object_store::{S3ObjectStore, S3ObjectStoreConfig};
 pub use signal_ingest::{
     DockerLogRecord, DockerLogStream, decode_log_envelope, prepare_docker_log_envelope,
-    prepare_docker_log_envelope_with_context, prepare_log_envelope, prepare_loki_log_envelope,
-    prepare_metric_envelope, prepare_metric_envelope_with_protocol, prepare_trace_envelope,
+    prepare_docker_log_envelope_with_context, prepare_log_envelope,
+    prepare_log_envelope_with_context, prepare_loki_log_envelope, prepare_metric_envelope,
+    prepare_metric_envelope_with_protocol, prepare_trace_envelope,
 };
 pub use sink::{OtlpSinkConfig, SinkObjectTierConfig, TelemetryService, TelemetrySinkFactory};
 pub use stripe::{IndexReceipt, LogStripe, ShardStreamDurableSink, ShardTelemetry, StripeConfig};
@@ -132,7 +146,10 @@ pub use telemetry::{
     TRACES_TOPIC_ID, TelemetryAttribute, TelemetryEntityRef, TelemetryRouter, TelemetrySignal,
     TelemetryValue, TraceId,
 };
-pub use telemetry_store::{DurableTelemetryConfig, DurableTelemetryStore, RetentionReport};
+pub use telemetry_store::{
+    DurableTelemetryConfig, DurableTelemetryStore, FetchedTelemetryBatch, RetentionReport,
+    TelemetryAppendDurability, TelemetryAppendGate, TelemetryHostAttachment,
+};
 pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};
 pub use tier::{
     CachedObjectRange, CatalogGroupEntry, CatalogLease, CatalogPage, CatalogPageRef,

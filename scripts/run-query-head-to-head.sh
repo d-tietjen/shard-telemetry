@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SOURCE=${SOURCE:-/home/dtietjen/log-compression-samples/clickhouse-docker-json-error-loop-tail-80g-20260729.log}
-EXPECTED_SHA256=${EXPECTED_SHA256:-4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508}
-EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-85899345920}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SHARD_TELEMETRY_REPOSITORY=${SHARD_TELEMETRY_REPOSITORY:-$(cd -- "$SCRIPT_DIR/.." && pwd)}
+SOURCE=${SOURCE:?set SOURCE to an immutable Docker json-file input}
+EXPECTED_SHA256=${EXPECTED_SHA256:-}
+EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-}
 SOURCE_LIMIT_BYTES=${SOURCE_LIMIT_BYTES:-1073741824}
-SHARD_TELEMETRY_BUILD_BIN=${SHARD_TELEMETRY_BUILD_BIN:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7/shard-telemetry/target/release/shard-telemetry-structural-bench}
-SHARD_TELEMETRY_QUERY_BIN=${SHARD_TELEMETRY_QUERY_BIN:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7/shard-telemetry/target/release/shard-telemetry-pack-query-bench}
-SOURCE_ARCHIVE=${SOURCE_ARCHIVE:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7.tar.gz}
-SHARD_STREAM_SOURCE=${SHARD_STREAM_SOURCE:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7/shard-stream}
-SHARD_STREAM_REVISION=${SHARD_STREAM_REVISION:-13ee7903d42cabe9bd5c0df0fa8e4a4fdc660ea7}
-EXPECTED_SHARD_STREAM_SOURCE_TREE_SHA256=${EXPECTED_SHARD_STREAM_SOURCE_TREE_SHA256:-ad9fdfd9b13fb9635d40a5df6308cdecca7de81a5e3ebfe45db8b5e47f229308}
+SHARD_TELEMETRY_BUILD_BIN=${SHARD_TELEMETRY_BUILD_BIN:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-structural-bench}
+SHARD_TELEMETRY_QUERY_BIN=${SHARD_TELEMETRY_QUERY_BIN:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-pack-query-bench}
+SOURCE_ARCHIVE=${SOURCE_ARCHIVE:?set SOURCE_ARCHIVE to a source archive for provenance}
+SHARD_STREAM_SOURCE=${SHARD_STREAM_SOURCE:?set SHARD_STREAM_SOURCE to a compatible shard-stream checkout}
+SHARD_STREAM_REVISION=${SHARD_STREAM_REVISION:-}
+EXPECTED_SHARD_STREAM_SOURCE_TREE_SHA256=${EXPECTED_SHARD_STREAM_SOURCE_TREE_SHA256:-}
 EXPECTED_REJECTED_RECORDS=${EXPECTED_REJECTED_RECORDS:-0}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-query-head-to-head}
+RESULT_ROOT=${RESULT_ROOT:-$SHARD_TELEMETRY_REPOSITORY/benchmark-results/query-head-to-head}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 CORE_COUNT=${CORE_COUNT:-16}
 BLOCK_BYTES=${BLOCK_BYTES:-8MiB}
 QUERY_ITERATIONS=${QUERY_ITERATIONS:-200}
 CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-sha256:770156c537ca9124046e138a3b5845c64ea58ce8722de7a2e05fd827f4976520}
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CLICKHOUSE_CONFIG=$SCRIPT_DIR/clickhouse-benchmark.xml
 CLICKHOUSE_INGEST=$SCRIPT_DIR/clickhouse-ingest-range.sh
 
@@ -26,7 +27,7 @@ if [[ $CORE_COUNT -ne 16 ]]; then
     echo "this comparison is fixed at 16 physical cores" >&2
     exit 2
 fi
-for command in awk cmp cp dd docker find lscpu sha256sum sort stat taskset wc xargs; do
+for command in awk cmp cp dd docker find git lscpu sha256sum sort stat taskset wc xargs; do
     command -v "$command" >/dev/null || {
         echo "missing required command: $command" >&2
         exit 2
@@ -59,10 +60,10 @@ CPU_SET=$(IFS=,; echo "${PHYSICAL_CPUS[*]}")
 CONTAINER_UID=$(id -u)
 CONTAINER_GID=$(id -g)
 SOURCE_FILE_BYTES=$(stat -c %s "$SOURCE")
-[[ $SOURCE_FILE_BYTES -eq $EXPECTED_FILE_BYTES ]] || {
+if [[ -n $EXPECTED_FILE_BYTES && $SOURCE_FILE_BYTES -ne $EXPECTED_FILE_BYTES ]]; then
     echo "source byte length mismatch" >&2
     exit 2
-}
+fi
 [[ $SOURCE_LIMIT_BYTES -le $SOURCE_FILE_BYTES ]] || {
     echo "source limit exceeds source file" >&2
     exit 2
@@ -88,10 +89,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 SOURCE_SHA256=$(sha256sum "$SOURCE" | awk '{ print $1 }')
-[[ $SOURCE_SHA256 == "$EXPECTED_SHA256" ]] || {
+if [[ -n $EXPECTED_SHA256 && $SOURCE_SHA256 != "$EXPECTED_SHA256" ]]; then
     echo "source SHA-256 mismatch" >&2
     exit 2
-}
+fi
 IMAGE_ID=$(docker image inspect "$CLICKHOUSE_IMAGE" --format '{{.Id}}')
 [[ $IMAGE_ID == "$CLICKHOUSE_IMAGE" ]] || {
     echo "ClickHouse image mismatch" >&2
@@ -113,10 +114,13 @@ SHARD_STREAM_SOURCE_TREE_SHA256=$(
         sha256sum |
         awk '{ print $1 }'
 )
-[[ $SHARD_STREAM_SOURCE_TREE_SHA256 == "$EXPECTED_SHARD_STREAM_SOURCE_TREE_SHA256" ]] || {
+if [[ -n $EXPECTED_SHARD_STREAM_SOURCE_TREE_SHA256 && $SHARD_STREAM_SOURCE_TREE_SHA256 != "$EXPECTED_SHARD_STREAM_SOURCE_TREE_SHA256" ]]; then
     echo "shard-stream source-tree hash mismatch" >&2
     exit 2
-}
+fi
+if [[ -z $SHARD_STREAM_REVISION ]]; then
+    SHARD_STREAM_REVISION=$(git -C "$SHARD_STREAM_SOURCE" rev-parse HEAD)
+fi
 
 {
     echo "run_id=$RUN_ID"

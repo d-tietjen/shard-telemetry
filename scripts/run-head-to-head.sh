@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SOURCE=${SOURCE:-/home/dtietjen/log-compression-samples/clickhouse-docker-json-error-loop-tail-80g-20260729.log}
-EXPECTED_SHA256=${EXPECTED_SHA256:-4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508}
-EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-85899345920}
-SHARD_TELEMETRY_BIN=${SHARD_TELEMETRY_BIN:-/home/dtietjen/shard-telemetry-target-20260729/release/shard-telemetry-structural-bench}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SHARD_TELEMETRY_REPOSITORY=${SHARD_TELEMETRY_REPOSITORY:-$(cd -- "$SCRIPT_DIR/.." && pwd)}
+SOURCE=${SOURCE:?set SOURCE to an immutable Docker json-file input}
+EXPECTED_SHA256=${EXPECTED_SHA256:-}
+EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-}
+SHARD_TELEMETRY_BIN=${SHARD_TELEMETRY_BIN:-$SHARD_TELEMETRY_REPOSITORY/target/release/shard-telemetry-structural-bench}
 LOCALITY_MODE=${LOCALITY_MODE:-disabled}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-head-to-head}
+RESULT_ROOT=${RESULT_ROOT:-$SHARD_TELEMETRY_REPOSITORY/benchmark-results/head-to-head}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 CORE_COUNT=${CORE_COUNT:-16}
 BLOCK_BYTES=${BLOCK_BYTES:-8MiB}
 CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-sha256:770156c537ca9124046e138a3b5845c64ea58ce8722de7a2e05fd827f4976520}
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CLICKHOUSE_CONFIG=$SCRIPT_DIR/clickhouse-benchmark.xml
 
 [[ -x $SHARD_TELEMETRY_BIN ]] || {

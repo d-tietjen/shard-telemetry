@@ -75,7 +75,7 @@ repeats an object range request, nor copies every selected extent. This is an
 execution optimization only: every block retains its own checksum and is
 verified independently before decode.
 
-The Adam error-loop corpus reached 33.13x with bzip2 and 27.56x with zstd-9 as
+One historical error-loop corpus reached 33.13x with bzip2 and 27.56x with zstd-9 as
 raw 8 MiB blocks. A trained dictionary and the current line-template prototype
 did not improve that corpus materially. That is evidence to optimize data
 representation before changing byte codecs; it is not evidence that 100x is
@@ -83,7 +83,7 @@ impossible on normalized OTLP traffic.
 
 ## Current baseline
 
-The current authoritative live log result is the full 80 GiB Adam run
+The former authoritative live log result was a full 80 GiB reference-host run
 `benchmark-80g-final-attempt3`. The complete ShardTelemetry durable directory
 was 2,702,973,946 bytes for 85,899,345,920 source bytes, or 31.78x. The pinned
 ClickHouse MergeTree used 6,091,870,726 active-part bytes, or 14.10x, with its
@@ -214,7 +214,7 @@ exact-roundtrip benchmark, close to the measured 6.32-bit delta entropy floor.
 ## Algorithmic block collation
 
 `src/locality.rs` implements the optional placement policy. It borrows the
-useful grouping mechanics from Pluribus—centroids, observed radius/variance,
+useful grouping mechanics—centroids, observed radius/variance,
 farthest-point split seeds, nearest-centroid reassignment, bounded split
 passes—and request-analyzer's deterministic structural fingerprint grouping.
 It does not import their embedding model, `serde_json::Value`, global interner,
@@ -234,7 +234,7 @@ term path. It emits:
 
 The SimHash is `CompressionTemperature`. Its bits form a locality signature;
 distance is XOR Hamming distance. A lower numeric value is not inherently
-colder than a higher value. Eden-style exact shape grouping contributes a
+colder than a higher value. Exact shape grouping contributes a
 fixed four-point distance penalty when template-shape hashes differ. This
 keeps exact structures strongly collated while retaining a graded distance for
 nearby structures. Hash collisions can affect placement quality only.
@@ -533,9 +533,9 @@ dictionaries are therefore a query-granularity tool: they recover compression
 lost to small independently readable blocks, not a replacement for choosing
 the largest block size the read path can tolerate.
 
-Earlier 8 MiB Adam trials that trained from a mixed structural sample or from
+Earlier 8 MiB trials that trained from a mixed structural sample or from
 original message bodies both correctly published nothing. The exact
-structural-lane learner must still be rerun on Adam's immutable 80 GiB corpus
+structural-lane learner must still be rerun on an immutable 80 GiB corpus
 and on a non-repeated heterogeneous service stream before it can become a
 default.
 
@@ -562,12 +562,12 @@ disabled/enabled/ClickHouse legs with identical prewarming and CPUs.
 multiple Docker/OTLP-adapter outputs and compares the routing ablation.
 
 1. Benchmark normalized OTLP records, not only raw Docker JSON wrappers. Keep
-   the HDFS corpus, the Adam error-loop corpus, and at least one heterogeneous
+   the HDFS corpus, a repeated error-loop corpus, and at least one heterogeneous
    production-like corpus.
 2. Run a block-size matrix at 1, 4, 8, 32, and 64 MiB. Measure ratio, encode
    throughput, tail seal latency, active memory, and recovery granularity.
 3. Expand the deterministic interleaving run beyond the current bounded
-   Pluribus, Eden, and OTEL Collector samples. That first real-service run
+   heterogeneous application and OTEL Collector samples. That first real-service run
    reduced stored size by 4.05%, but is too small for a general claim.
 4. Account for every byte: manifests, templates, dictionaries, block indexes,
    metadata postings, and object-store envelopes. Do not count raw payload
@@ -575,7 +575,7 @@ multiple Docker/OTLP-adapter outputs and compares the routing ablation.
 5. Assert byte-identical record reconstruction, ordered-offset replay, term
    and exact-field query equivalence, and bounded decode amplification for
    targeted reads.
-6. Rerun exact-lane real-time dictionary learning on Adam at 512 KiB, 1 MiB,
+6. Rerun exact-lane real-time dictionary learning on a reproducible corpus at 512 KiB, 1 MiB,
    and 8 MiB targets. Keep it opt-in unless heterogeneous data shows a durable
    gain and the 8 MiB homogeneous run remains byte-identical.
 
@@ -645,12 +645,12 @@ use a direct append path; multi-partition batches retain bounded parallel
 dispatch. These changes reduce owner-core work without moving structural
 encoding onto the single owner, preserving the multi-core producer model.
 
-Adam validation on the ClickHouse Docker corpus used server CPU 0, loader CPUs
+Reference-host validation on the ClickHouse Docker corpus used server CPU 0, loader CPUs
 1-15, one physical owner stripe, and 16 persistent loader connections. The
 2-GiB run reduced server cycles by about 23% and instructions by about 17%
 while keeping durable bytes byte-identical. The longer 4-GiB run sustained just
-over 1 GiB/s of source throughput on the isolated server core; the detailed
-measurements and retained evidence paths are in [BENCHMARKS.md](BENCHMARKS.md).
+over 1 GiB/s of source throughput on the isolated server core; rerun the public
+harness before treating this historical observation as a current result.
 
 Shard-stream keeps immutable pack paths and extent metadata, not one open
 `File` per rolled pack. Fetch opens a reader for one coalesced range and closes

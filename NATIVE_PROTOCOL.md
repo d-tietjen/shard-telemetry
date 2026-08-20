@@ -47,6 +47,16 @@ The topic must match the envelope signal. Duplicate topic/partition pairs are re
 
 A successful append returns one `STM1` acknowledgement entry per input partition, in request order. Each entry contains topic ID, partition ID, first durable offset, and last durable offset. Every offset represents exactly one log record, span, or metric point.
 
+### Retry identity
+
+The frame request ID is also the durable retry identity for append. The server
+persists the accepted `STM1` receipt with a BLAKE3 digest of the complete `STB1`
+payload. Retrying the same ID and bytes after a reconnect or server restart
+returns that receipt without appending another copy. Reusing an ID with different
+bytes is rejected. Receipt records follow the local retention window; upstream
+store-and-forward clients therefore derive a stable ID from their source
+partition, offset range, and envelope bytes.
+
 ## Indexed log query
 
 The current native query opcode exposes the fastest exact log lookup primitive. Its `STQ1` request supports tenant, exact labels, exact case-insensitive message terms, an optional time range, result limit, and sort direction.
@@ -64,3 +74,14 @@ The corpus loader's `--protocol native` mode constructs `STEL` log envelopes and
 OTLP, Prometheus Remote Write, and Tempo retain the version identifiers defined
 by those external specifications. They decode into this one ShardTelemetry v1
 storage and native-protocol representation.
+
+## Embedded nodes and upstream offload
+
+The Rust crate exposes `EmbeddedTelemetryRuntime` for a single local owner and
+`UpstreamOffloader` for a background store-and-forward deployment. The runtime
+recovers its local WAL, indexes, object catalogs, and metric accumulators before
+the host marks it ready. The offloader reads authoritative local `STEL` batches
+in partition order and persists a source-offset checkpoint only after the
+upstream native server acknowledges the batch. Local source reclamation remains
+under local retention control, so an offload outage cannot turn into telemetry
+loss. S3 offload uses the existing immutable object-tier catalog path.

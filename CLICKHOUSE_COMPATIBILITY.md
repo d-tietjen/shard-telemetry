@@ -45,6 +45,9 @@ Two lossless Rust encoders are available:
   stock-ClickHouse tables.
 - `wire=arrow` streams Arrow IPC for columnar clients and ad hoc `url(...)`
   queries.
+- `wire=jsonl` streams a bounded NDJSON projection for analytical consumers
+  such as DuckDB. It preserves integer text, nullability, and string maps, but
+  is an interchange format rather than the high-throughput Arrow path.
 
 Responses are emitted in bounded batches. The Rust service never materializes
 an entire tenant. Durable scans query owner stripes in parallel, page by stable
@@ -120,7 +123,7 @@ The endpoint accepts these fail-closed parameters:
 | `name` | Exact span, event, or metric name |
 | `columns` | Comma-separated output order |
 | `limit` | Optional global row limit |
-| `wire` | `rowbinary`, `arrow`, or `arrow_stream` |
+| `wire` | `rowbinary`, `arrow`, `arrow_stream`, `json`, `jsonl`, or `ndjson` |
 
 Unknown parameters, columns, duplicate columns, invalid ranges, and invalid IDs
 are rejected. Safe constraints are translated directly into `LogQuery`,
@@ -177,18 +180,22 @@ the Rust server, runs both matrices through a pinned official ClickHouse image,
 and retains hashes, versions, metrics, and exact results in a new evidence
 directory.
 
-The current Adam acceptance run passed all 30 cases against the unmodified
-official ClickHouse `26.3.17.56` image: 18 log cases and 12 trace, metric, and
-cross-signal cases. Retained evidence is:
-
-```text
-/home/dtietjen/deterministic-sim-runs/shard-telemetry/clickhouse-stock-url-20260806-v1/acceptance-3-26.3
-```
+The acceptance harness checks 30 cases against the pinned official ClickHouse
+`26.3.17.56` image: 18 log cases and 12 trace, metric, and cross-signal
+cases. Attach the result directory from a release candidate or pull request
+when publishing a pass; machine-local evidence paths are not part of the
+repository.
 
 The end-to-end comparison is `scripts/run-clickhouse-head-to-head.sh`. It uses
 the official pinned ClickHouse image, equal source bytes, identical physical
 CPUs, exact row counts, and byte-identical result checks. No custom ClickHouse
 binary or ClickHouse source checkout is accepted by the harness.
+
+`scripts/run-competitive-oracles.sh` invokes this stock matrix alongside pinned
+Prometheus, Loki, Tempo, and DuckDB checks. Its DuckDB leg reads an explicitly
+projected NDJSON scan, so it validates the analytical interchange boundary
+rather than claiming that DuckDB is a telemetry ingestion server. See
+[competitive/README.md](competitive/README.md) for the equal-input assertions.
 
 ## Compatibility status
 

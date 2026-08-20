@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::Read;
 use std::net::SocketAddr;
@@ -26,6 +26,7 @@ use opentelemetry_proto::tonic::collector::{
     },
 };
 use prost::Message;
+use rayon::prelude::*;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tonic::codec::CompressionEncoding;
@@ -34,7 +35,7 @@ use tonic::{Request, Response as GrpcResponse, Status};
 use crate::{
     DurableTelemetryStore, NativePartitionAppend, NativeTelemetryBatch, OtlpLogDecoder,
     OtlpTelemetryDecoder, ProductionRuntime, ServiceState, ShardTelemetryConfig, TelemetryError,
-    TelemetryResult, TelemetryRouter, prepare_log_envelope, prepare_metric_envelope,
+    TelemetryResult, TelemetryRouter, prepare_log_envelope_with_context, prepare_metric_envelope,
     prepare_trace_envelope,
 };
 
@@ -137,15 +138,20 @@ impl OtlpIngestService {
                 .or_insert_with(Vec::new)
                 .push(event);
         }
-        let mut appends = Vec::with_capacity(partitions.len());
-        for (topic_partition, events) in partitions {
-            appends.push(NativePartitionAppend {
-                topic_partition,
-                envelope: prepare_log_envelope(&self.config.tenant, &events)
-                    .map_err(|error| error.to_string())?,
-                transient_context: None,
-            });
-        }
+        let mut appends = partitions
+            .into_par_iter()
+            .map(|(topic_partition, events)| {
+                let (envelope, transient_context) =
+                    prepare_log_envelope_with_context(&self.config.tenant, &events)
+                        .map_err(|error| error.to_string())?;
+                Ok(NativePartitionAppend {
+                    topic_partition,
+                    envelope,
+                    transient_context: Some(transient_context),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        appends.sort_unstable_by_key(|append| append.topic_partition);
         self.append(appends)?;
         Ok(item_count)
     }
@@ -157,15 +163,18 @@ impl OtlpIngestService {
             .map_err(|error| error.to_string())?;
         let item_count = events.len();
         let partitions = decoder.partition_traces(&self.router, events);
-        let mut appends = Vec::with_capacity(partitions.len());
-        for (topic_partition, events) in partitions {
-            appends.push(NativePartitionAppend {
-                topic_partition,
-                envelope: prepare_trace_envelope(topic_partition, events)
-                    .map_err(|error| error.to_string())?,
-                transient_context: None,
-            });
-        }
+        let mut appends = partitions
+            .into_par_iter()
+            .map(|(topic_partition, events)| {
+                Ok(NativePartitionAppend {
+                    topic_partition,
+                    envelope: prepare_trace_envelope(topic_partition, events)
+                        .map_err(|error| error.to_string())?,
+                    transient_context: None,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        appends.sort_unstable_by_key(|append| append.topic_partition);
         self.append(appends)?;
         Ok(item_count)
     }
@@ -176,17 +185,46 @@ impl OtlpIngestService {
             .decode_metrics(&self.config.tenant, &request.encode_to_vec())
             .map_err(|error| error.to_string())?;
         let item_count = events.len();
-        let partitions = decoder.partition_metrics(&self.router, events);
-        let mut appends = Vec::with_capacity(partitions.len());
-        for (topic_partition, events) in partitions {
-            appends.push(NativePartitionAppend {
-                topic_partition,
-                envelope: prepare_metric_envelope(topic_partition, events)
-                    .map_err(|error| error.to_string())?,
-                transient_context: None,
-            });
+        let mut series = BTreeMap::new();
+        for event in events {
+            let fingerprint = event.series_fingerprint();
+            let topic_partition = self.router.metric(&self.config.tenant, fingerprint);
+            series
+                .entry((topic_partition, fingerprint))
+                .or_insert_with(Vec::new)
+                .push(event);
         }
-        self.append(appends)?;
+        let mut appends = series
+            .into_par_iter()
+            .map(|((topic_partition, fingerprint), events)| {
+                Ok((
+                    topic_partition,
+                    fingerprint,
+                    NativePartitionAppend {
+                        topic_partition,
+                        envelope: prepare_metric_envelope(topic_partition, events)
+                            .map_err(|error| error.to_string())?,
+                        transient_context: None,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        appends.sort_unstable_by_key(|(partition, fingerprint, _)| (*partition, *fingerprint));
+        let mut rounds = Vec::<(BTreeSet<_>, Vec<NativePartitionAppend>)>::new();
+        for (topic_partition, _, append) in appends {
+            if let Some((partitions, appends)) = rounds
+                .iter_mut()
+                .find(|(partitions, _)| !partitions.contains(&topic_partition))
+            {
+                partitions.insert(topic_partition);
+                appends.push(append);
+            } else {
+                rounds.push((BTreeSet::from([topic_partition]), vec![append]));
+            }
+        }
+        for (_, appends) in rounds {
+            self.append(appends)?;
+        }
         Ok(item_count)
     }
 
@@ -606,10 +644,15 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+    };
     use tower::ServiceExt;
 
     use super::*;
-    use crate::{DurableTelemetryConfig, StripeConfig};
+    use crate::{
+        DurableTelemetryConfig, MetricQuery, ShardTelemetryConfig, SignalConfig, StripeConfig,
+    };
 
     fn test_service() -> (OtlpIngestService, std::path::PathBuf) {
         let nonce = SystemTime::now()
@@ -635,15 +678,77 @@ mod tests {
             })
             .expect("store opens"),
         );
+        let one = std::num::NonZeroU16::new(1).unwrap();
+        let default_signals = ShardTelemetryConfig::default();
         let service = OtlpIngestService::new(
             store,
             OtlpReceiverConfig {
                 tenant: Arc::from("tenant-a"),
+                signals: ShardTelemetryConfig {
+                    logs: SignalConfig {
+                        logical_partitions: one,
+                        physical_stripes: one,
+                        ..default_signals.logs
+                    },
+                    traces: SignalConfig {
+                        logical_partitions: one,
+                        physical_stripes: one,
+                        ..default_signals.traces
+                    },
+                    metrics: SignalConfig {
+                        logical_partitions: one,
+                        physical_stripes: one,
+                        ..default_signals.metrics
+                    },
+                    ..default_signals
+                },
                 ..OtlpReceiverConfig::default()
             },
         )
         .expect("OTLP service opens");
         (service, directory)
+    }
+
+    #[test]
+    fn colliding_metric_series_are_encoded_and_appended_in_bounded_rounds() {
+        let (service, directory) = test_service();
+        let metric = |name: &str, value: i64| Metric {
+            name: name.to_owned(),
+            data: Some(metric::Data::Gauge(Gauge {
+                data_points: vec![NumberDataPoint {
+                    time_unix_nano: 10,
+                    value: Some(number_data_point::Value::AsInt(value)),
+                    ..NumberDataPoint::default()
+                }],
+            })),
+            ..Metric::default()
+        };
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![metric("requests", 1), metric("errors", 2)],
+                    ..ScopeMetrics::default()
+                }],
+                ..ResourceMetrics::default()
+            }],
+        };
+
+        assert_eq!(service.ingest_metrics(request).unwrap(), 2);
+        for name in ["requests", "errors"] {
+            let points = service
+                .store
+                .query_metrics(&MetricQuery {
+                    tenant: Arc::from("tenant-a"),
+                    name: Some(Arc::from(name)),
+                    limit: 10,
+                    ..MetricQuery::default()
+                })
+                .unwrap();
+            assert_eq!(points.len(), 1, "{name}");
+        }
+
+        drop(service);
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[test]

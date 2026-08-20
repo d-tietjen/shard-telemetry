@@ -2363,7 +2363,7 @@ fn metric_point_time_matches(query: &MetricQuery, point: &DurableMetricPoint) ->
 }
 
 /// Native metric selector used by PromQL storage scans and direct APIs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetricQuery {
     /// Required tenant.
     pub tenant: Arc<str>,

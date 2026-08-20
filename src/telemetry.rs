@@ -590,6 +590,16 @@ impl TelemetryRouter {
         }
     }
 
+    /// Returns the configured logical partition count for one telemetry signal.
+    #[must_use]
+    pub const fn logical_partition_count(&self, signal: TelemetrySignal) -> u16 {
+        self.logical_partitions[match signal {
+            TelemetrySignal::Logs => 0,
+            TelemetrySignal::Traces => 1,
+            TelemetrySignal::Metrics => 2,
+        }]
+    }
+
     /// Routes a trace by tenant and trace ID.
     #[must_use]
     pub fn trace(&self, tenant: &str, trace_id: TraceId) -> TopicPartition {
@@ -671,10 +681,16 @@ fn fingerprint128(domain: &[u8], canonical: &[u8]) -> u128 {
 }
 
 fn write_hex(formatter: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
-    for byte in bytes {
-        write!(formatter, "{byte:02x}")?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = [0_u8; 32];
+    debug_assert!(bytes.len() <= encoded.len() / 2);
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        encoded[index * 2] = HEX[usize::from(byte >> 4)];
+        encoded[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
     }
-    Ok(())
+    let encoded = std::str::from_utf8(&encoded[..bytes.len() * 2])
+        .expect("hex table contains only valid UTF-8");
+    formatter.write_str(encoded)
 }
 
 #[cfg(test)]
@@ -687,6 +703,18 @@ mod tests {
         let value = TelemetryValue::from_f64(f64::from_bits(bits));
         assert_eq!(value.as_f64().expect("double").to_bits(), bits);
         assert_eq!(value, TelemetryValue::DoubleBits(bits));
+    }
+
+    #[test]
+    fn telemetry_ids_use_fixed_width_lowercase_hex() {
+        let trace = TraceId::from_bytes([
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ])
+        .unwrap();
+        let span = SpanId::from_bytes([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]).unwrap();
+        assert_eq!(trace.to_string(), "0123456789abcdeffedcba9876543210");
+        assert_eq!(span.to_string(), "0123456789abcdef");
     }
 
     #[test]

@@ -107,15 +107,14 @@ HTTP 400 instead of silently producing approximate results.
 
 ## Full Loki oracle measurement
 
-The complete 80 GiB corpus has now been ingested through Loki's HTTP API on
-Adam. After `/flush` and WAL checkpoint reclamation, Loki occupied
-3,782,890,631 bytes (22.71x) and the client sustained 83.87 MiB/s over 976.70
-seconds. Peak WAL-inclusive disk was roughly 30–40 GiB. Full provenance and the
-provisional same-corpus comparison are in `BENCHMARKS.md`.
+Run the Loki harness with an immutable corpus, pinned image digest, and
+explicit CPU allocation before making a comparative claim. Its result
+directory captures the post-flush storage accounting, accepted records, input
+hash, and loader configuration needed for review.
 
 ## First identical-wire ablation
 
-Adam, CPUs `0-15`, 16 persistent HTTP connections, 1 MiB JSON pushes, the same
+the reference Linux host, CPUs `0-15`, 16 persistent HTTP connections, 1 MiB JSON pushes, the same
 128 MiB prefix of the immutable 80 GiB ClickHouse Docker JSON corpus:
 
 | Engine | Source MiB/s | Records | Total disk bytes |

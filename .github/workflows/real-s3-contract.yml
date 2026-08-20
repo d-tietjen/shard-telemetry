@@ -1,0 +1,54 @@
+name: Real S3 contract
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contract:
+    name: Real object-store immutable and CAS contract
+    # This protected environment supplies a disposable bucket/prefix and
+    # short-lived test credentials. Do not replace them with production S3
+    # credentials or a bucket shared with product data.
+    environment: s3-contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: shard-telemetry-real-s3-contract
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal
+      - name: Require isolated object-store test configuration
+        env:
+          TEST_BUCKET: ${{ vars.SHARD_TELEMETRY_S3_TEST_BUCKET }}
+          TEST_PREFIX: ${{ vars.SHARD_TELEMETRY_S3_TEST_PREFIX }}
+          TEST_REGION: ${{ vars.SHARD_TELEMETRY_S3_TEST_REGION }}
+          TEST_ACCESS_KEY: ${{ secrets.SHARD_TELEMETRY_S3_TEST_ACCESS_KEY_ID }}
+          TEST_SECRET_KEY: ${{ secrets.SHARD_TELEMETRY_S3_TEST_SECRET_ACCESS_KEY }}
+        run: |
+          test -n "$TEST_BUCKET"
+          test -n "$TEST_PREFIX"
+          test -n "$TEST_REGION"
+          test -n "$TEST_ACCESS_KEY"
+          test -n "$TEST_SECRET_KEY"
+          case "$TEST_PREFIX" in
+            production/*|prod/*|/) exit 1 ;;
+          esac
+      - name: Run real S3 immutable-object and catalog-CAS contract
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SHARD_TELEMETRY_S3_TEST_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SHARD_TELEMETRY_S3_TEST_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.SHARD_TELEMETRY_S3_TEST_REGION }}
+          AWS_DEFAULT_REGION: ${{ vars.SHARD_TELEMETRY_S3_TEST_REGION }}
+          SHARD_TELEMETRY_S3_TEST_BUCKET: ${{ vars.SHARD_TELEMETRY_S3_TEST_BUCKET }}
+          SHARD_TELEMETRY_S3_TEST_PREFIX: ${{ vars.SHARD_TELEMETRY_S3_TEST_PREFIX }}
+        run: cargo test --locked --test s3_object_store -- --ignored

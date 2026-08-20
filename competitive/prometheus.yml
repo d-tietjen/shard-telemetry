@@ -1,0 +1,5 @@
+global:
+  scrape_interval: 1h
+  evaluation_interval: 1h
+
+scrape_configs: []

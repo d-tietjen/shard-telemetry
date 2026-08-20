@@ -12,6 +12,7 @@ NATIVE_ADDRESS=${SHARD_TELEMETRY_NATIVE_ADDRESS:-127.0.0.1:32101}
 OTLP_GRPC_ADDRESS=${SHARD_TELEMETRY_OTLP_GRPC_ADDRESS:-127.0.0.1:34317}
 OTLP_HTTP_ADDRESS=${SHARD_TELEMETRY_OTLP_HTTP_ADDRESS:-127.0.0.1:34318}
 TENANT=${SHARD_TELEMETRY_TENANT:-fake}
+FIXTURE_TIMESTAMP_UNIX_NANOS=${SHARD_TELEMETRY_FIXTURE_TIMESTAMP_UNIX_NANOS:-}
 
 [[ ! -e $RESULT_DIR ]] || {
     echo "refusing to overwrite result directory: $RESULT_DIR" >&2
@@ -49,7 +50,15 @@ umask 077
 TOKEN_FILE=$RESULT_DIR/clickhouse-token
 printf '%s\n' 'shard-telemetry-clickhouse-acceptance-token' >"$TOKEN_FILE"
 
-"$SHARD_TELEMETRY_FIXTURE_BIN" --output-directory "$RESULT_DIR/fixture" \
+FIXTURE_ARGUMENTS=(--output-directory "$RESULT_DIR/fixture")
+if [[ -n $FIXTURE_TIMESTAMP_UNIX_NANOS ]]; then
+    [[ $FIXTURE_TIMESTAMP_UNIX_NANOS =~ ^[0-9]+$ ]] || {
+        echo 'SHARD_TELEMETRY_FIXTURE_TIMESTAMP_UNIX_NANOS must be an unsigned Unix-nanosecond value' >&2
+        exit 2
+    }
+    FIXTURE_ARGUMENTS+=(--timestamp-unix-nanos "$FIXTURE_TIMESTAMP_UNIX_NANOS")
+fi
+"$SHARD_TELEMETRY_FIXTURE_BIN" "${FIXTURE_ARGUMENTS[@]}" \
     >"$RESULT_DIR/fixture-files.txt"
 sha256sum "$RESULT_DIR"/fixture/*.pb >"$RESULT_DIR/fixture-sha256.txt"
 printf 'image=%s\nimage_id=%s\nversion=%s\n' \

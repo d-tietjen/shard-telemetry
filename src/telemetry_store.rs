@@ -1,14 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::num::NonZeroU16;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use bytes::Bytes;
-use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
+use serde::{Deserialize, Serialize};
 use shard_stream_core::{
     LogicalOffset, LogicalPartitionId, PlacementSequence, TopicId, TopicPartition,
 };
@@ -35,6 +38,21 @@ const LOKI_TOPIC_ID: TopicId = crate::LOGS_TOPIC_ID;
 const LABEL_PREFIX: &str = "resource.loki.label.";
 const METADATA_PREFIX: &str = "attr.loki.metadata.";
 const TENANT_FIELD: &str = "resource.loki.tenant";
+const MIN_APPEND_SUBMISSION_THREADS: usize = 8;
+const MAX_APPEND_SUBMISSION_THREADS: usize = 32;
+
+fn build_append_submission_pool(physical_stripes: u32) -> Result<ThreadPool, LokiApiError> {
+    let threads = usize::try_from(physical_stripes)
+        .unwrap_or(MAX_APPEND_SUBMISSION_THREADS)
+        .clamp(MIN_APPEND_SUBMISSION_THREADS, MAX_APPEND_SUBMISSION_THREADS);
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("shard-telemetry-append-{index}"))
+        .build()
+        .map_err(|error| {
+            LokiApiError::configuration(format!("failed to build append submission pool: {error}"))
+        })
+}
 
 fn object_tier_partitions(partition_count: u32) -> Vec<TopicPartition> {
     let mut partitions = [
@@ -129,10 +147,15 @@ pub struct DurableTelemetryStore {
     _data_directory_lease: DataDirectoryLease,
     engine: Arc<StreamEngine>,
     service: TelemetryService,
+    append_durability: Durability,
+    append_gate: Option<Arc<dyn TelemetryAppendGate>>,
     tenant_partitions: u32,
+    telemetry_router: crate::TelemetryRouter,
     ingest_stripes_per_tenant: u32,
     indexed_ack_timeout: Duration,
+    append_submission_pool: ThreadPool,
     next_request_id: AtomicU64,
+    append_receipts: AppendReceiptCatalog,
     remote_write_append: Mutex<()>,
     deletes: DeleteCatalog,
     retention: Option<Duration>,
@@ -144,6 +167,445 @@ pub struct DurableTelemetryStore {
     retired_object_groups: AtomicU64,
     retired_object_payload_bytes: AtomicU64,
     retired_object_keys: AtomicU64,
+}
+
+/// Product-owned admission check evaluated before a durable telemetry append.
+///
+/// Embedded and standalone stores leave this unset. HA hosts install a gate
+/// that verifies readiness, leadership, and fencing for every routed
+/// partition. Keeping the check at the store boundary ensures that native,
+/// OTLP, Loki, Prometheus, and direct Rust ingestion share the same safety
+/// invariant.
+pub trait TelemetryAppendGate: Send + Sync + std::fmt::Debug + 'static {
+    /// Returns `Ok` only when this process may append every supplied partition.
+    fn check_append_partitions(
+        &self,
+        partitions: &[crate::NativePartitionAppend],
+    ) -> Result<(), String>;
+}
+
+/// Durability required before ShardTelemetry acknowledges a WAL append.
+///
+/// Standalone and embedded stores use [`Leader`](Self::Leader). Private HA
+/// hosts attach to their already-configured replicated shard-stream engine
+/// with [`Quorum`](Self::Quorum), so a native acknowledgement cannot outrun
+/// the configured in-sync replica set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryAppendDurability {
+    /// Acknowledge once the local authoritative WAL has committed the batch.
+    Leader,
+    /// Acknowledge only after shard-stream's configured replica quorum commits.
+    Quorum,
+}
+
+/// Externally owned shard-stream engine and signal-service attachment.
+///
+/// Private HA hosts build this after installing [`TelemetrySinkFactory`] into
+/// their replicated engine and before exposing their telemetry protocol
+/// listeners. The attachment cannot open a second WAL or replace the host's
+/// replication, assignment, or fencing policy.
+#[derive(Clone)]
+pub struct TelemetryHostAttachment {
+    /// Product-owned directory for delete state, retry receipts, and query
+    /// metadata. It must not be shared by more than one local process.
+    pub data_directory: PathBuf,
+    /// The host's already-opened authoritative stream engine.
+    pub engine: Arc<StreamEngine>,
+    /// Query service returned by the exact sink factory installed in `engine`.
+    pub service: TelemetryService,
+    /// Common logical signal partition count.
+    pub tenant_partitions: u32,
+    /// Number of physical sink-owner stripes selected by the host.
+    pub ingest_stripes_per_tenant: u32,
+    /// Bound for waiting on local query-index visibility.
+    pub indexed_ack_timeout: Duration,
+    /// Optional logical retention window.
+    pub retention: Option<Duration>,
+    /// WAL durability required before an append acknowledgement.
+    pub append_durability: TelemetryAppendDurability,
+    /// Optional HA admission and leader-fencing check for every append path.
+    pub append_gate: Option<Arc<dyn TelemetryAppendGate>>,
+}
+
+impl std::fmt::Debug for TelemetryHostAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TelemetryHostAttachment")
+            .field("data_directory", &self.data_directory)
+            .field("tenant_partitions", &self.tenant_partitions)
+            .field("ingest_stripes_per_tenant", &self.ingest_stripes_per_tenant)
+            .field("indexed_ack_timeout", &self.indexed_ack_timeout)
+            .field("retention", &self.retention)
+            .field("append_durability", &self.append_durability)
+            .field("append_gate_configured", &self.append_gate.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<TelemetryAppendDurability> for Durability {
+    fn from(value: TelemetryAppendDurability) -> Self {
+        match value {
+            TelemetryAppendDurability::Leader => Self::Leader,
+            TelemetryAppendDurability::Quorum => Self::Quorum,
+        }
+    }
+}
+
+const APPEND_RECEIPTS_VERSION: u8 = 1;
+const MAX_NATIVE_APPEND_RECEIPTS: usize = 65_536;
+const NATIVE_APPEND_RECEIPT_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// One source batch recovered from the local WAL for durable upstream offload.
+#[derive(Debug, Clone)]
+pub struct FetchedTelemetryBatch {
+    /// Source partition from which the authoritative envelope was read.
+    pub topic_partition: TopicPartition,
+    /// First local durable offset covered by the envelope.
+    pub first_offset: LogicalOffset,
+    /// Last local durable offset covered by the envelope.
+    pub last_offset: LogicalOffset,
+    /// Validated signal-native envelope. Its payload remains byte-identical to
+    /// the source WAL and can be sent through the native append protocol.
+    pub envelope: crate::TelemetryEnvelope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedAppendReceipt {
+    request_id: String,
+    payload_digest: String,
+    recorded_at_unix_nanos: u64,
+    acknowledgement: crate::NativeTelemetryAppendAck,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedAppendReceipts {
+    version: u8,
+    receipts: Vec<PersistedAppendReceipt>,
+}
+
+#[derive(Debug)]
+struct AppendReceiptCatalog {
+    directory: PathBuf,
+    state: Mutex<AppendReceiptState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct AppendReceiptState {
+    receipts: BTreeMap<String, AppendReceiptStateEntry>,
+    completed_by_time: BTreeSet<(u64, String)>,
+}
+
+#[derive(Debug)]
+enum AppendReceiptStateEntry {
+    Pending { payload_digest: String },
+    Complete(PersistedAppendReceipt),
+}
+
+enum AppendReceiptReservation {
+    Existing(crate::NativeTelemetryAppendAck),
+    Reserved,
+}
+
+impl AppendReceiptCatalog {
+    fn open(data_directory: &Path) -> Result<Self, LokiApiError> {
+        let directory = data_directory.join("native-append-receipts-v2");
+        fs::create_dir_all(&directory).map_err(receipt_io_error)?;
+        let mut state = AppendReceiptState::default();
+        let mut found_v2_receipt = false;
+        for entry in fs::read_dir(&directory).map_err(receipt_io_error)? {
+            let entry = entry.map_err(receipt_io_error)?;
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            found_v2_receipt = true;
+            let receipt = serde_json::from_slice::<PersistedAppendReceipt>(
+                &fs::read(&path).map_err(receipt_io_error)?,
+            )
+            .map_err(|error| {
+                LokiApiError::configuration(format!(
+                    "native append receipt {} is invalid: {error}",
+                    path.display()
+                ))
+            })?;
+            Self::insert_recovered(&mut state, receipt)?;
+        }
+
+        // v1 kept every receipt in one ever-growing JSON document. Migrate it
+        // once to independently durable, bounded v2 records without asking an
+        // operator to delete the old checkpoint and risk replaying data.
+        let legacy_path = data_directory.join("native-append-receipts-v1.json");
+        if !found_v2_receipt && legacy_path.exists() {
+            let persisted = match fs::read(&legacy_path) {
+                Ok(bytes) => {
+                    serde_json::from_slice::<PersistedAppendReceipts>(&bytes).map_err(|error| {
+                        LokiApiError::configuration(format!(
+                            "native append receipt journal {} is invalid: {error}",
+                            legacy_path.display()
+                        ))
+                    })?
+                }
+                Err(error) => {
+                    return Err(LokiApiError::internal(format!(
+                        "native append receipt journal {} cannot be read: {error}",
+                        legacy_path.display()
+                    )));
+                }
+            };
+            if persisted.version != APPEND_RECEIPTS_VERSION {
+                return Err(LokiApiError::configuration(
+                    "unsupported native append receipt journal version",
+                ));
+            }
+            for receipt in persisted.receipts {
+                Self::insert_recovered(&mut state, receipt)?;
+            }
+        }
+        let catalog = Self {
+            directory,
+            state: Mutex::new(state),
+            changed: Condvar::new(),
+        };
+        let cutoff =
+            unix_nanos_now().saturating_sub(duration_to_nanos(NATIVE_APPEND_RECEIPT_RETENTION));
+        let mut state = catalog
+            .state
+            .lock()
+            .map_err(|_| LokiApiError::internal("native append receipt lock poisoned"))?;
+        catalog.prune_locked(&mut state, cutoff, MAX_NATIVE_APPEND_RECEIPTS)?;
+        for receipt in state.receipts.values() {
+            if let AppendReceiptStateEntry::Complete(receipt) = receipt {
+                let path = catalog.receipt_path(&receipt.request_id);
+                if !path.exists() {
+                    catalog.persist_receipt(receipt)?;
+                }
+            }
+        }
+        drop(state);
+        Ok(catalog)
+    }
+
+    fn insert_recovered(
+        state: &mut AppendReceiptState,
+        receipt: PersistedAppendReceipt,
+    ) -> Result<(), LokiApiError> {
+        if receipt.request_id.len() != 32
+            || receipt.payload_digest.len() != 64
+            || state.receipts.contains_key(&receipt.request_id)
+        {
+            return Err(LokiApiError::configuration(
+                "native append receipt journal contains an invalid or duplicate receipt",
+            ));
+        }
+        state
+            .completed_by_time
+            .insert((receipt.recorded_at_unix_nanos, receipt.request_id.clone()));
+        state.receipts.insert(
+            receipt.request_id.clone(),
+            AppendReceiptStateEntry::Complete(receipt),
+        );
+        Ok(())
+    }
+
+    fn reserve(
+        &self,
+        request_id: u128,
+        payload_digest: &str,
+    ) -> Result<AppendReceiptReservation, LokiApiError> {
+        let key = request_key(request_id);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LokiApiError::internal("native append receipt lock poisoned"))?;
+        loop {
+            match state.receipts.get(&key) {
+                Some(AppendReceiptStateEntry::Complete(receipt)) => {
+                    if receipt.payload_digest != payload_digest {
+                        return Err(LokiApiError::bad_request(
+                            "native retry ID was reused with different telemetry content",
+                        ));
+                    }
+                    return Ok(AppendReceiptReservation::Existing(
+                        receipt.acknowledgement.clone(),
+                    ));
+                }
+                Some(AppendReceiptStateEntry::Pending {
+                    payload_digest: pending_digest,
+                }) => {
+                    if pending_digest != payload_digest {
+                        return Err(LokiApiError::bad_request(
+                            "native retry ID was reused with different telemetry content",
+                        ));
+                    }
+                    state = self.changed.wait(state).map_err(|_| {
+                        LokiApiError::internal("native append receipt lock poisoned")
+                    })?;
+                }
+                None => {
+                    let cutoff = unix_nanos_now()
+                        .saturating_sub(duration_to_nanos(NATIVE_APPEND_RECEIPT_RETENTION));
+                    self.prune_locked(&mut state, cutoff, MAX_NATIVE_APPEND_RECEIPTS - 1)?;
+                    if state.receipts.len() >= MAX_NATIVE_APPEND_RECEIPTS {
+                        return Err(LokiApiError::unavailable(
+                            "native append idempotency window is at capacity",
+                        ));
+                    }
+                    state.receipts.insert(
+                        key,
+                        AppendReceiptStateEntry::Pending {
+                            payload_digest: payload_digest.to_owned(),
+                        },
+                    );
+                    return Ok(AppendReceiptReservation::Reserved);
+                }
+            }
+        }
+    }
+
+    fn complete(
+        &self,
+        request_id: u128,
+        payload_digest: String,
+        acknowledgement: crate::NativeTelemetryAppendAck,
+    ) -> Result<(), LokiApiError> {
+        let request_id = request_key(request_id);
+        let receipt = PersistedAppendReceipt {
+            request_id: request_id.clone(),
+            payload_digest,
+            recorded_at_unix_nanos: unix_nanos_now(),
+            acknowledgement,
+        };
+        self.persist_receipt(&receipt)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LokiApiError::internal("native append receipt lock poisoned"))?;
+        match state.receipts.remove(&request_id) {
+            Some(AppendReceiptStateEntry::Pending { .. }) => {}
+            Some(AppendReceiptStateEntry::Complete(_)) => {
+                return Err(LokiApiError::internal(
+                    "native append receipt completed more than once",
+                ));
+            }
+            None => {
+                return Err(LokiApiError::internal(
+                    "native append receipt reservation disappeared",
+                ));
+            }
+        }
+        state
+            .completed_by_time
+            .insert((receipt.recorded_at_unix_nanos, request_id.clone()));
+        state
+            .receipts
+            .insert(request_id, AppendReceiptStateEntry::Complete(receipt));
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn abandon(&self, request_id: u128) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if matches!(
+            state.receipts.get(&request_key(request_id)),
+            Some(AppendReceiptStateEntry::Pending { .. })
+        ) {
+            state.receipts.remove(&request_key(request_id));
+            self.changed.notify_all();
+        }
+    }
+
+    fn retain_since(&self, cutoff_unix_nanos: u64) -> Result<(), LokiApiError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LokiApiError::internal("native append receipt lock poisoned"))?;
+        self.prune_locked(&mut state, cutoff_unix_nanos, MAX_NATIVE_APPEND_RECEIPTS)
+    }
+
+    fn prune_locked(
+        &self,
+        state: &mut AppendReceiptState,
+        cutoff_unix_nanos: u64,
+        maximum_entries: usize,
+    ) -> Result<(), LokiApiError> {
+        while state
+            .completed_by_time
+            .first()
+            .is_some_and(|(recorded_at, _)| {
+                *recorded_at < cutoff_unix_nanos || state.completed_by_time.len() > maximum_entries
+            })
+        {
+            let (_, request_id) = state
+                .completed_by_time
+                .pop_first()
+                .expect("first append receipt exists");
+            let Some(AppendReceiptStateEntry::Complete(receipt)) =
+                state.receipts.remove(&request_id)
+            else {
+                return Err(LokiApiError::internal(
+                    "native append receipt indexes are inconsistent",
+                ));
+            };
+            fs::remove_file(self.receipt_path(&receipt.request_id)).map_err(receipt_io_error)?;
+        }
+        Ok(())
+    }
+
+    fn persist_receipt(&self, receipt: &PersistedAppendReceipt) -> Result<(), LokiApiError> {
+        let encoded = serde_json::to_vec(receipt).map_err(|error| {
+            LokiApiError::internal(format!("native receipt serialization failed: {error}"))
+        })?;
+        let path = self.receipt_path(&receipt.request_id);
+        let temporary = temporary_path(&path);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(receipt_io_error)?;
+        file.write_all(&encoded)
+            .and_then(|()| file.sync_all())
+            .map_err(receipt_io_error)?;
+        fs::rename(&temporary, &path).map_err(receipt_io_error)?;
+        File::open(&self.directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(receipt_io_error)?;
+        Ok(())
+    }
+
+    fn receipt_path(&self, request_id: &str) -> PathBuf {
+        self.directory.join(format!("{request_id}.json"))
+    }
+}
+
+fn duration_to_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().try_into().unwrap_or(u64::MAX)
+}
+
+fn request_key(request_id: u128) -> String {
+    format!("{request_id:032x}")
+}
+
+fn unix_nanos_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+fn receipt_io_error(error: std::io::Error) -> LokiApiError {
+    LokiApiError::internal(format!("native append receipt journal I/O failed: {error}"))
 }
 
 /// Result of one batch-aligned physical retention pass.
@@ -170,11 +632,21 @@ impl std::fmt::Debug for DurableTelemetryStore {
             .field("tenant_partitions", &self.tenant_partitions)
             .field("ingest_stripes_per_tenant", &self.ingest_stripes_per_tenant)
             .field("indexed_ack_timeout", &self.indexed_ack_timeout)
+            .field(
+                "append_submission_threads",
+                &self.append_submission_pool.current_num_threads(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl DurableTelemetryStore {
+    /// Returns the common logical partition count used by this local store.
+    #[must_use]
+    pub const fn telemetry_partition_count(&self) -> u32 {
+        self.tenant_partitions
+    }
+
     /// Opens or recovers a standalone durable store.
     pub fn open(config: DurableTelemetryConfig) -> Result<Self, LokiApiError> {
         Self::open_with_object_tier_config(config, ObjectTierConfig::default())
@@ -186,6 +658,7 @@ impl DurableTelemetryStore {
         object_tier_config: ObjectTierConfig,
     ) -> Result<Self, LokiApiError> {
         config.validate()?;
+        let append_submission_pool = build_append_submission_pool(config.shard_count)?;
         object_tier_config
             .validate()
             .map_err(|error| LokiApiError::configuration(error.to_string()))?;
@@ -194,6 +667,7 @@ impl DurableTelemetryStore {
                 LokiApiError::configuration("tenant_partitions must fit the v1 u16 routing space")
             })?)
             .expect("configuration validation rejects zero partitions");
+        let telemetry_router = crate::TelemetryRouter::new(logical_partitions);
         let physical_stripes = NonZeroU16::new(
             u16::try_from(config.shard_count.min(config.tenant_partitions)).map_err(|_| {
                 LokiApiError::configuration("shard_count must fit the v1 u16 routing space")
@@ -207,6 +681,7 @@ impl DurableTelemetryStore {
         }
         let data_directory_lease = DataDirectoryLease::acquire(&config.data_directory)?;
         let deletes = DeleteCatalog::open(config.data_directory.join("delete-catalog-v1.json"))?;
+        let append_receipts = AppendReceiptCatalog::open(&config.data_directory)?;
         let engine_config = EngineConfig {
             data_dir: config.data_directory.join("stream"),
             // ShardTelemetry's compressed tier is authoritative after its
@@ -285,7 +760,7 @@ impl DurableTelemetryStore {
             )
             .map_err(engine_error)?,
         );
-        match engine.create_topic(TopicConfig {
+        match engine.create_partition_affine_topic(TopicConfig {
             topic_id: LOKI_TOPIC_ID,
             partitions: config.tenant_partitions,
             shards: None,
@@ -294,7 +769,7 @@ impl DurableTelemetryStore {
             Err(error) => return Err(engine_error(error)),
         }
         for topic_id in [crate::TRACES_TOPIC_ID, crate::METRICS_TOPIC_ID] {
-            match engine.create_topic(TopicConfig {
+            match engine.create_partition_affine_topic(TopicConfig {
                 topic_id,
                 partitions: config.tenant_partitions,
                 shards: None,
@@ -307,10 +782,15 @@ impl DurableTelemetryStore {
             _data_directory_lease: data_directory_lease,
             engine,
             service,
+            append_durability: Durability::Leader,
+            append_gate: None,
             tenant_partitions: config.tenant_partitions,
+            telemetry_router,
             ingest_stripes_per_tenant: config.shard_count.min(config.tenant_partitions),
             indexed_ack_timeout: config.indexed_ack_timeout,
+            append_submission_pool,
             next_request_id: AtomicU64::new(1),
+            append_receipts,
             remote_write_append: Mutex::new(()),
             deletes,
             retention: config.retention,
@@ -340,6 +820,41 @@ impl DurableTelemetryStore {
         indexed_ack_timeout: Duration,
         retention: Option<Duration>,
     ) -> Result<Self, LokiApiError> {
+        Self::attach_with_durability(TelemetryHostAttachment {
+            data_directory,
+            engine,
+            service,
+            tenant_partitions,
+            ingest_stripes_per_tenant,
+            indexed_ack_timeout,
+            retention,
+            append_durability: TelemetryAppendDurability::Leader,
+            append_gate: None,
+        })
+    }
+
+    /// Attaches ShardTelemetry to an externally owned stream engine with the
+    /// acknowledgement durability selected by that host.
+    ///
+    /// HA hosts must use [`TelemetryAppendDurability::Quorum`] and configure
+    /// the supplied engine with their replicated transport, assignment
+    /// provider, and write fence before calling this method. The store owns no
+    /// WAL in this mode; it only creates the signal topics and query state on
+    /// the supplied engine.
+    pub fn attach_with_durability(
+        attachment: TelemetryHostAttachment,
+    ) -> Result<Self, LokiApiError> {
+        let TelemetryHostAttachment {
+            data_directory,
+            engine,
+            service,
+            tenant_partitions,
+            ingest_stripes_per_tenant,
+            indexed_ack_timeout,
+            retention,
+            append_durability,
+            append_gate,
+        } = attachment;
         if tenant_partitions == 0 || ingest_stripes_per_tenant == 0 {
             return Err(LokiApiError::configuration(
                 "tenant and ingest stripe counts must be nonzero",
@@ -360,8 +875,15 @@ impl DurableTelemetryStore {
                 "retention must be nonzero when configured",
             ));
         }
+        let logical_partitions =
+            NonZeroU16::new(u16::try_from(tenant_partitions).map_err(|_| {
+                LokiApiError::configuration("tenant_partitions must fit the v1 u16 routing space")
+            })?)
+            .ok_or_else(|| LokiApiError::configuration("tenant_partitions must be nonzero"))?;
+        let append_submission_pool = build_append_submission_pool(ingest_stripes_per_tenant)?;
         let data_directory_lease = DataDirectoryLease::acquire(&data_directory)?;
         let deletes = DeleteCatalog::open(data_directory.join("delete-catalog-v1.json"))?;
+        let append_receipts = AppendReceiptCatalog::open(&data_directory)?;
         for topic_id in [
             LOKI_TOPIC_ID,
             crate::TRACES_TOPIC_ID,
@@ -381,10 +903,15 @@ impl DurableTelemetryStore {
             _data_directory_lease: data_directory_lease,
             engine,
             service,
+            append_durability: append_durability.into(),
+            append_gate,
             tenant_partitions,
+            telemetry_router: crate::TelemetryRouter::new(logical_partitions),
             ingest_stripes_per_tenant,
             indexed_ack_timeout,
+            append_submission_pool,
             next_request_id: AtomicU64::new(1),
+            append_receipts,
             remote_write_append: Mutex::new(()),
             deletes,
             retention,
@@ -480,6 +1007,9 @@ impl DurableTelemetryStore {
             Err(_) => {
                 self.retention_failures.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if result.is_ok() {
+            self.append_receipts.retain_since(cutoff)?;
         }
         result
     }
@@ -578,6 +1108,327 @@ impl DurableTelemetryStore {
         self.append_validated_telemetry_batch(&validated, wait_for_index)
     }
 
+    /// Appends one batch under a caller-stable retry ID.
+    ///
+    /// Matching retries after a connection loss or process restart return the
+    /// original acknowledgement. Reusing an ID for different encoded content
+    /// is rejected before it can create an ambiguous duplicate.
+    pub fn append_telemetry_batch_with_retry_id(
+        &self,
+        batch: &crate::NativeTelemetryBatch,
+        wait_for_index: bool,
+        retry_id: u128,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        let encoded = batch
+            .encode_native_append()
+            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        let validated = crate::NativeTelemetryBatch::decode(&encoded)
+            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        self.append_validated_telemetry_batch_with_retry_id(
+            &validated,
+            wait_for_index,
+            retry_id,
+            blake3::hash(&encoded).to_hex().to_string(),
+        )
+    }
+
+    /// Returns the authoritative local WAL batches beginning at `start_offset`.
+    ///
+    /// The returned envelopes are checksum-validated and retain their exact
+    /// signal payload bytes, making this suitable for a store-and-forward
+    /// uploader. It does not mutate retention or acknowledge offload progress.
+    pub fn fetch_telemetry_batches(
+        &self,
+        topic_partition: TopicPartition,
+        start_offset: LogicalOffset,
+        max_bytes: u32,
+    ) -> Result<Vec<FetchedTelemetryBatch>, LokiApiError> {
+        if max_bytes == 0 {
+            return Err(LokiApiError::bad_request(
+                "telemetry WAL fetch max_bytes must be nonzero",
+            ));
+        }
+        let batches = self
+            .engine
+            .fetch(FetchRequest {
+                request_id: 0,
+                topic_id: topic_partition.topic_id,
+                partition_id: topic_partition.partition_id,
+                start_offset,
+                max_bytes,
+                mode: FetchMode::Ordered,
+            })
+            .map_err(engine_error)?;
+        batches
+            .into_iter()
+            .map(|batch| {
+                let envelope = crate::TelemetryEnvelope::decode(&batch.payload)
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                if envelope.signal.topic_id() != topic_partition.topic_id {
+                    return Err(LokiApiError::internal(
+                        "telemetry WAL batch topic disagrees with its signal envelope",
+                    ));
+                }
+                Ok(FetchedTelemetryBatch {
+                    topic_partition,
+                    first_offset: batch.first_offset,
+                    last_offset: batch.last_offset,
+                    envelope,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns the first locally retained offset for an offload source partition.
+    pub fn telemetry_partition_start_offset(
+        &self,
+        topic_partition: TopicPartition,
+    ) -> Result<LogicalOffset, LokiApiError> {
+        self.engine
+            .watermarks(topic_partition)
+            .map(|watermarks| watermarks.log_start)
+            .map_err(engine_error)
+    }
+
+    /// Lists all configured local signal partitions in stable signal/partition order.
+    #[must_use]
+    pub fn telemetry_partitions(&self) -> Vec<TopicPartition> {
+        [
+            crate::LOGS_TOPIC_ID,
+            crate::TRACES_TOPIC_ID,
+            crate::METRICS_TOPIC_ID,
+        ]
+        .into_iter()
+        .flat_map(|topic_id| self.signal_partitions(topic_id))
+        .collect()
+    }
+
+    /// Directly appends normalized log events for an embedded producer.
+    ///
+    /// The method performs routing and durable append work only when the
+    /// producer's background exporter calls it; logging call sites should never
+    /// invoke it directly on their hot path.
+    pub fn append_log_events(
+        &self,
+        tenant: &str,
+        events: Vec<crate::OtlpLogEvent>,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        if events.is_empty() {
+            return Ok(crate::NativeTelemetryAppendAck {
+                partitions: Vec::new(),
+            });
+        }
+        if tenant.is_empty() {
+            return Err(LokiApiError::bad_request(
+                "embedded log tenant must not be empty",
+            ));
+        }
+        let router = self.telemetry_router;
+        let mut routed = BTreeMap::<TopicPartition, Vec<crate::OtlpLogEvent>>::new();
+        for event in events {
+            let identity = event.resource.id().get().to_le_bytes();
+            let partition = router.log(tenant, event.trace_id, &identity);
+            routed.entry(partition).or_default().push(event);
+        }
+        self.append_partitioned_envelopes(
+            routed
+                .into_iter()
+                .map(|(topic_partition, events)| {
+                    crate::signal_ingest::prepare_log_envelope_owned_with_context(tenant, events)
+                        .map(
+                            |(envelope, transient_context)| crate::NativePartitionAppend {
+                                topic_partition,
+                                envelope,
+                                transient_context: Some(transient_context),
+                            },
+                        )
+                        .map_err(|error| LokiApiError::bad_request(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            wait_for_index,
+        )
+    }
+
+    /// Directly appends normalized trace spans for an embedded producer.
+    ///
+    /// Trace batches are routed by trace identity and remain tenant-isolated
+    /// even when multiple tenants hash to the same physical partition. The
+    /// path bypasses OTLP and native-protocol encode/decode work; callers pass
+    /// already validated [`crate::OtlpSpanEvent`] values from a bounded
+    /// exporter worker.
+    pub fn append_trace_events(
+        &self,
+        events: Vec<crate::OtlpSpanEvent>,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        if events.is_empty() {
+            return Ok(crate::NativeTelemetryAppendAck {
+                partitions: Vec::new(),
+            });
+        }
+        let router = self.telemetry_router;
+        // Trace blocks carry one envelope tenant. Partition keys therefore
+        // include the tenant, while `append_partitioned_envelopes` retains the
+        // physical partition's single append order below.
+        let mut routed = BTreeMap::<(TopicPartition, Arc<str>), Vec<crate::OtlpSpanEvent>>::new();
+        for event in events {
+            let partition = router.trace(event.tenant(), event.trace_id());
+            routed
+                .entry((partition, Arc::from(event.tenant())))
+                .or_default()
+                .push(event);
+        }
+        self.append_partitioned_envelopes(
+            routed
+                .into_iter()
+                .map(|((topic_partition, _tenant), events)| {
+                    crate::prepare_trace_envelope(topic_partition, events)
+                        .map(|envelope| crate::NativePartitionAppend {
+                            topic_partition,
+                            envelope,
+                            transient_context: None,
+                        })
+                        .map_err(|error| LokiApiError::bad_request(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            wait_for_index,
+        )
+    }
+
+    /// Directly appends normalized metric points for an embedded producer.
+    ///
+    /// It preserves native metric kinds, histogram buckets, labels, resource
+    /// context, and series identity without an OTLP encode/decode round trip.
+    pub fn append_metric_point(
+        &self,
+        point: crate::DurableMetricPoint,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        let event = crate::OtlpMetricEvent::from_durable(point)
+            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        let partition = self
+            .telemetry_router
+            .metric(event.tenant(), event.series_fingerprint());
+        let envelope = crate::prepare_metric_envelope(partition, vec![event])
+            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        self.append_partitioned_envelopes(
+            vec![crate::NativePartitionAppend {
+                topic_partition: partition,
+                envelope,
+                transient_context: None,
+            }],
+            wait_for_index,
+        )
+    }
+
+    /// Directly appends normalized metric points for an embedded producer.
+    ///
+    /// It preserves native metric kinds, histogram buckets, labels, resource
+    /// context, and series identity without an OTLP encode/decode round trip.
+    pub fn append_metric_points(
+        &self,
+        points: Vec<crate::DurableMetricPoint>,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        if points.is_empty() {
+            return Ok(crate::NativeTelemetryAppendAck {
+                partitions: Vec::new(),
+            });
+        }
+        let router = self.telemetry_router;
+        // Fast-telemetry snapshots frequently contain one metric series. Keep
+        // that common embedded case on a direct lane: no series map, fan-out
+        // map, or Rayon scheduling is needed for one already owned point.
+        if points.len() == 1 {
+            return self.append_metric_point(
+                points
+                    .into_iter()
+                    .next()
+                    .expect("one point was checked above"),
+                wait_for_index,
+            );
+        }
+        // A metric chunk is columnar storage for exactly one canonical series,
+        // even when multiple series route to the same logical partition. Group
+        // before creating envelopes so embedded fast exporters can snapshot an
+        // entire fast-telemetry runtime in one direct call.
+        let mut partitions = BTreeMap::<
+            (TopicPartition, crate::SeriesFingerprint),
+            Vec<crate::OtlpMetricEvent>,
+        >::new();
+        for point in points {
+            let event = crate::OtlpMetricEvent::from_durable(point)
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+            let series = event.series_fingerprint();
+            let partition = router.metric(event.tenant(), series);
+            partitions
+                .entry((partition, series))
+                .or_default()
+                .push(event);
+        }
+        self.append_partitioned_envelopes(
+            partitions
+                .into_iter()
+                .map(|((topic_partition, _series), events)| {
+                    crate::prepare_metric_envelope(topic_partition, events)
+                        .map(|envelope| crate::NativePartitionAppend {
+                            topic_partition,
+                            envelope,
+                            transient_context: None,
+                        })
+                        .map_err(|error| LokiApiError::bad_request(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            wait_for_index,
+        )
+    }
+
+    fn append_partitioned_envelopes(
+        &self,
+        mut partitions: Vec<crate::NativePartitionAppend>,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        self.check_append_partitions(&partitions)?;
+        // A storage engine partition has a single append order. Metric series
+        // commonly share a partition, so execute envelopes from one partition
+        // serially while retaining parallelism between independent partitions.
+        // This also avoids the native-v1 encode/decode validation round trip:
+        // `prepare_*_envelope` already constructed self-validating envelopes
+        // from typed in-process data.
+        if partitions.len() == 1 {
+            let acknowledgement = self.append_telemetry_partition(
+                &partitions.pop().expect("one partition was checked above"),
+                wait_for_index,
+            )?;
+            return Ok(crate::NativeTelemetryAppendAck {
+                partitions: vec![acknowledgement],
+            });
+        }
+        let mut by_partition = BTreeMap::<TopicPartition, Vec<crate::NativePartitionAppend>>::new();
+        for partition in partitions {
+            by_partition
+                .entry(partition.topic_partition)
+                .or_default()
+                .push(partition);
+        }
+        let acknowledgements = by_partition
+            .into_par_iter()
+            .map(|(_, partitions)| {
+                partitions
+                    .into_iter()
+                    .map(|partition| self.append_telemetry_partition(&partition, wait_for_index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(crate::NativeTelemetryAppendAck {
+            partitions: acknowledgements,
+        })
+    }
+
     /// Appends a native batch that has already been decoded and checksum
     /// validated by the native protocol server.
     pub(crate) fn append_validated_telemetry_batch(
@@ -585,18 +1436,61 @@ impl DurableTelemetryStore {
         batch: &crate::NativeTelemetryBatch,
         wait_for_index: bool,
     ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        self.check_append_partitions(&batch.partitions)?;
         let acknowledgements = if batch.partitions.len() == 1 {
             vec![self.append_telemetry_partition(&batch.partitions[0], wait_for_index)?]
         } else {
-            batch
-                .partitions
-                .par_iter()
-                .map(|partition| self.append_telemetry_partition(partition, wait_for_index))
-                .collect::<Result<Vec<_>, _>>()?
+            self.append_submission_pool.install(|| {
+                batch
+                    .partitions
+                    .par_iter()
+                    .map(|partition| self.append_telemetry_partition(partition, wait_for_index))
+                    .collect::<Result<Vec<_>, _>>()
+            })?
         };
         Ok(crate::NativeTelemetryAppendAck {
             partitions: acknowledgements,
         })
+    }
+
+    /// Appends a validated native payload with the idempotency identity carried
+    /// by its native frame header. The raw payload digest must bind the retry
+    /// ID, including transient contexts that affect index construction.
+    pub(crate) fn append_validated_telemetry_batch_with_retry_id(
+        &self,
+        batch: &crate::NativeTelemetryBatch,
+        wait_for_index: bool,
+        retry_id: u128,
+        payload_digest: String,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        self.check_append_partitions(&batch.partitions)?;
+        if batch.partitions.len() != 1 {
+            return Err(LokiApiError::bad_request(
+                "retryable native v1 append requires exactly one partition",
+            ));
+        }
+        match self.append_receipts.reserve(retry_id, &payload_digest)? {
+            AppendReceiptReservation::Existing(acknowledgement) => return Ok(acknowledgement),
+            AppendReceiptReservation::Reserved => {}
+        }
+        let acknowledgement =
+            match self.append_telemetry_partition(&batch.partitions[0], wait_for_index) {
+                Ok(acknowledgement) => crate::NativeTelemetryAppendAck {
+                    partitions: vec![acknowledgement],
+                },
+                Err(error) => {
+                    self.append_receipts.abandon(retry_id);
+                    return Err(error);
+                }
+            };
+        if let Err(error) =
+            self.append_receipts
+                .complete(retry_id, payload_digest, acknowledgement.clone())
+        {
+            self.append_receipts.abandon(retry_id);
+            return Err(error);
+        }
+        Ok(acknowledgement)
     }
 
     /// Validates and appends one complete Remote Write request under serialized
@@ -605,6 +1499,7 @@ impl DurableTelemetryStore {
         &self,
         batch: &crate::NativeTelemetryBatch,
     ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        self.check_append_partitions(&batch.partitions)?;
         let _guard = self
             .remote_write_append
             .lock()
@@ -680,6 +1575,26 @@ impl DurableTelemetryStore {
             .map_err(|error| LokiApiError::internal(error.to_string()))
     }
 
+    fn query_traces_unordered(
+        &self,
+        query: &crate::TraceQuery,
+    ) -> Result<Vec<crate::DurableSpan>, LokiApiError> {
+        let mut query = query.clone();
+        if let Some(cutoff) = self.retention_cutoff() {
+            if query.end_time_unix_nanos.is_some_and(|end| end <= cutoff) {
+                return Ok(Vec::new());
+            }
+            query.start_time_unix_nanos = Some(
+                query
+                    .start_time_unix_nanos
+                    .map_or(cutoff, |start| start.max(cutoff)),
+            );
+        }
+        self.service
+            .query_traces_unordered(&query)
+            .map_err(|error| LokiApiError::internal(error.to_string()))
+    }
+
     /// Executes a native exact raw-metric query on the owner stripes.
     pub fn query_metrics(
         &self,
@@ -728,6 +1643,7 @@ impl DurableTelemetryStore {
         partition: &crate::NativePartitionAppend,
         wait_for_index: bool,
     ) -> Result<crate::NativePartitionAck, LokiApiError> {
+        self.check_append_partitions(std::slice::from_ref(partition))?;
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let payload = partition
             .envelope
@@ -739,7 +1655,7 @@ impl DurableTelemetryStore {
             partition_id: partition.topic_partition.partition_id,
             record_count: partition.envelope.item_count,
             payload: Bytes::from(payload),
-            durability: Durability::Leader,
+            durability: self.append_durability,
             producer: None,
             atomic_group: None,
             leader_epoch: None,
@@ -781,6 +1697,19 @@ impl DurableTelemetryStore {
             topic_partition: partition.topic_partition,
             first_offset: appended.first_offset.get(),
             last_offset: appended.last_offset.get(),
+        })
+    }
+
+    fn check_append_partitions(
+        &self,
+        partitions: &[crate::NativePartitionAppend],
+    ) -> Result<(), LokiApiError> {
+        if partitions.is_empty() {
+            return Ok(());
+        }
+        self.append_gate.as_ref().map_or(Ok(()), |gate| {
+            gate.check_append_partitions(partitions)
+                .map_err(LokiApiError::unavailable)
         })
     }
 
@@ -1073,7 +2002,11 @@ impl LokiStore for DurableTelemetryStore {
                     min_duration_nanos: None,
                     limit,
                 };
-                let spans = self.query_traces(&query)?;
+                let spans = if request.order.is_none() {
+                    self.query_traces_unordered(&query)?
+                } else {
+                    self.query_traces(&query)?
+                };
                 if !spans.is_empty() {
                     let batch = crate::analytics::direct_span_record_batch(
                         &spans,
@@ -1166,7 +2099,11 @@ impl LokiStore for DurableTelemetryStore {
                     min_duration_nanos: None,
                     limit,
                 };
-                let spans = self.query_traces(&query)?;
+                let spans = if request.order.is_none() {
+                    self.query_traces_unordered(&query)?
+                } else {
+                    self.query_traces(&query)?
+                };
                 crate::analytics::write_direct_span_rowbinary(&spans, &request.columns, writer)
             }
             _ => Ok(false),
@@ -1268,7 +2205,20 @@ impl LokiStore for DurableTelemetryStore {
             return Ok(());
         }
         let mut emitted = 0usize;
-        for partition in self.tenant_partitions(&request.tenant)? {
+        let partitions = if let Some(trace_id) = request.trace_id {
+            let router = crate::TelemetryRouter::new(
+                NonZeroU16::new(u16::try_from(self.tenant_partitions).map_err(|_| {
+                    LokiApiError::internal("tenant partition count exceeds the routing space")
+                })?)
+                .ok_or_else(|| LokiApiError::internal("tenant partition count is zero"))?,
+            );
+            vec![router.log(&request.tenant, Some(trace_id), &[])]
+        } else {
+            self.tenant_partitions(&request.tenant)?
+        };
+        let trace_id = request.trace_id.map(|trace_id| trace_id.to_string());
+        let span_id = request.span_id.map(|span_id| span_id.to_string());
+        for partition in partitions {
             let mut next_offset = None;
             loop {
                 let page_limit = 8_192usize.min(limit.saturating_sub(emitted));
@@ -1308,6 +2258,12 @@ impl LokiStore for DurableTelemetryStore {
                         format!("{METADATA_PREFIX}{}", field.key),
                         Arc::clone(&field.value),
                     );
+                }
+                if let Some(trace_id) = trace_id.as_deref() {
+                    query = query.with_field("otel.trace_id", trace_id);
+                }
+                if let Some(span_id) = span_id.as_deref() {
+                    query = query.with_field("otel.span_id", span_id);
                 }
                 let matches = self
                     .service
@@ -1601,7 +2557,11 @@ impl DurableTelemetryStore {
                     min_duration_nanos: None,
                     limit: page_limit,
                 };
-                let spans = self.query_traces(&query)?;
+                let spans = if request.order.is_none() {
+                    self.query_traces_unordered(&query)?
+                } else {
+                    self.query_traces(&query)?
+                };
                 if spans.is_empty() {
                     break;
                 }
@@ -1855,10 +2815,33 @@ mod tests {
         trace::v1::{ResourceSpans, ScopeSpans, Span, span},
     };
     use prost::Message;
+    use shard_stream_core::ShardId;
     use shard_stream_protocol::{FetchMode, FetchRequest};
 
     use super::*;
     use crate::ingest_pack::{decode_ingest_pack, validate_ingest_pack};
+
+    #[test]
+    fn append_submission_pool_preserves_grouping_concurrency() {
+        assert_eq!(
+            build_append_submission_pool(1)
+                .expect("single stripe pool")
+                .current_num_threads(),
+            MIN_APPEND_SUBMISSION_THREADS
+        );
+        assert_eq!(
+            build_append_submission_pool(16)
+                .expect("multi-stripe pool")
+                .current_num_threads(),
+            16
+        );
+        assert_eq!(
+            build_append_submission_pool(256)
+                .expect("bounded pool")
+                .current_num_threads(),
+            MAX_APPEND_SUBMISSION_THREADS
+        );
+    }
 
     #[test]
     fn object_tier_catalogs_cover_every_signal_partition() {
@@ -1878,6 +2861,154 @@ mod tests {
             );
         }
         assert!(partitions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn append_receipt_catalog_migrates_v1_without_losing_retry_identity() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-receipt-migration-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("directory");
+        let request_id = 7_u128;
+        let digest = "a".repeat(64);
+        let legacy = PersistedAppendReceipts {
+            version: APPEND_RECEIPTS_VERSION,
+            receipts: vec![PersistedAppendReceipt {
+                request_id: request_key(request_id),
+                payload_digest: digest.clone(),
+                recorded_at_unix_nanos: unix_nanos_now(),
+                acknowledgement: crate::NativeTelemetryAppendAck {
+                    partitions: Vec::new(),
+                },
+            }],
+        };
+        fs::write(
+            directory.join("native-append-receipts-v1.json"),
+            serde_json::to_vec(&legacy).expect("encode legacy"),
+        )
+        .expect("write legacy");
+        let catalog = AppendReceiptCatalog::open(&directory).expect("migrate catalog");
+        assert!(matches!(
+            catalog.reserve(request_id, &digest).expect("lookup"),
+            AppendReceiptReservation::Existing(crate::NativeTelemetryAppendAck { ref partitions })
+                if partitions.is_empty()
+        ));
+        assert!(
+            directory
+                .join("native-append-receipts-v2")
+                .join(format!("{}.json", request_key(request_id)))
+                .exists()
+        );
+        drop(catalog);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn direct_metric_append_groups_multiple_series_before_serial_partition_append() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-direct-metrics-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = DurableTelemetryStore::open(DurableTelemetryConfig {
+            data_directory: directory.clone(),
+            object_store_directory: None,
+            s3_object_store: None,
+            recovery_journal: false,
+            retention: None,
+            shard_count: 1,
+            tenant_partitions: 1,
+            append_linger: Duration::ZERO,
+            stripe: StripeConfig::default(),
+            indexed_ack_timeout: Duration::from_secs(30),
+        })
+        .expect("store opens");
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![
+                        Metric {
+                            name: "requests_total".into(),
+                            data: Some(metric::Data::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    time_unix_nano: 10,
+                                    value: Some(number_data_point::Value::AsInt(7)),
+                                    ..NumberDataPoint::default()
+                                }],
+                            })),
+                            ..Metric::default()
+                        },
+                        Metric {
+                            name: "in_flight".into(),
+                            data: Some(metric::Data::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    time_unix_nano: 11,
+                                    value: Some(number_data_point::Value::AsInt(3)),
+                                    ..NumberDataPoint::default()
+                                }],
+                            })),
+                            ..Metric::default()
+                        },
+                    ],
+                    ..ScopeMetrics::default()
+                }],
+                ..ResourceMetrics::default()
+            }],
+        };
+        let points = crate::OtlpTelemetryDecoder
+            .decode_metrics("tenant-a", &request.encode_to_vec())
+            .expect("decode")
+            .into_iter()
+            .map(|event| {
+                event.into_durable(
+                    shard_stream_core::ShardId::new(0),
+                    TopicPartition::new(crate::METRICS_TOPIC_ID, LogicalPartitionId::new(0)),
+                    LogicalOffset::new(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut singleton = points[0].clone();
+        singleton.timestamp_unix_nanos = singleton.timestamp_unix_nanos.saturating_sub(1);
+        let singleton_acknowledgement = store
+            .append_metric_point(singleton, true)
+            .expect("singleton direct append");
+        assert_eq!(singleton_acknowledgement.partitions.len(), 1);
+        let acknowledgement = store
+            .append_metric_points(points, true)
+            .expect("direct append");
+        assert_eq!(acknowledgement.partitions.len(), 2);
+        let points = store
+            .query_metrics(&crate::MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                limit: 10,
+                ..crate::MetricQuery::default()
+            })
+            .expect("query");
+        assert_eq!(points.len(), 3);
+        assert_eq!(
+            points
+                .iter()
+                .filter(|point| point.identity.name.as_ref() == "requests_total")
+                .count(),
+            2
+        );
+        assert_eq!(
+            points
+                .iter()
+                .filter(|point| point.identity.name.as_ref() == "in_flight")
+                .count(),
+            1
+        );
+        drop(store);
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[test]
@@ -2023,6 +3154,10 @@ mod tests {
             .unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name.as_ref(), "checkout");
+        assert_eq!(
+            spans[0].stream_shard_id,
+            ShardId::new(trace_partition.partition_id.get() % 2)
+        );
         let points = store
             .query_metrics(&crate::MetricQuery {
                 tenant: Arc::from("tenant-a"),
@@ -2032,6 +3167,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(points.len(), 1);
+        assert_eq!(
+            points[0].stream_shard_id,
+            ShardId::new(metric_partition.partition_id.get() % 2)
+        );
         assert_eq!(
             points[0].value,
             crate::MetricValue::Gauge(crate::NumberValue::Integer(7))
@@ -2075,6 +3214,24 @@ mod tests {
                 Some(relation.signal())
             );
         }
+        let mut exact_log =
+            crate::AnalyticsScanRequest::for_relation("tenant-a", crate::AnalyticsRelation::Logs);
+        exact_log.trace_id = Some(trace_id);
+        exact_log.span_id = Some(crate::SpanId::from_bytes([2; 8]).unwrap());
+        exact_log.limit = Some(1);
+        exact_log.columns = vec![
+            crate::AnalyticsColumn::Timestamp,
+            crate::AnalyticsColumn::Message,
+        ];
+        let mut exact_log_rows = Vec::new();
+        store
+            .scan_analytics(&exact_log, &mut |batch| {
+                exact_log_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(exact_log_rows.len(), 1);
+
         let mut exact_trace =
             crate::AnalyticsScanRequest::for_relation("tenant-a", crate::AnalyticsRelation::Spans);
         exact_trace.trace_id = Some(trace_id);
