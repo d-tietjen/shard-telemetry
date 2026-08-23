@@ -51,6 +51,11 @@ pub struct SinkObjectTierConfig {
     pub control_cache: SsdCacheConfig,
     /// Recoverable payload cache bounds.
     pub payload_cache: SsdCacheConfig,
+    /// Admit newly published payloads and indexes to the local caches.
+    ///
+    /// This is enabled for S3-backed embedded stores so recent data is local
+    /// immediately after upload instead of only after its first query.
+    pub warm_local_cache_on_publish: bool,
 }
 
 /// Cache occupancy and object-read counters for the isolated cold tiers.
@@ -208,6 +213,7 @@ struct SignalTierState {
     spool_directory: PathBuf,
     control_cache: Arc<SsdObjectCache>,
     payload_cache: Arc<SsdObjectCache>,
+    warm_local_cache_on_publish: bool,
     config: ObjectTierConfig,
 }
 
@@ -225,8 +231,9 @@ impl SignalTierState {
         spool_directory: PathBuf,
         caches: &TierCaches,
         partitions: Vec<TopicPartition>,
-        config: ObjectTierConfig,
+        publication: (ObjectTierConfig, bool),
     ) -> TelemetryResult<Option<OpenedSignalTier>> {
+        let (config, warm_local_cache_on_publish) = publication;
         if partitions.is_empty() {
             return Ok(None);
         }
@@ -293,6 +300,7 @@ impl SignalTierState {
                     .join(signal_name),
                 control_cache: Arc::clone(&caches.control),
                 payload_cache: Arc::clone(&caches.payload),
+                warm_local_cache_on_publish,
                 config,
             },
             checkpoints,
@@ -391,10 +399,10 @@ impl TelemetrySinkFactory {
                     for checkpoint in logs.attach_object_tier(
                         tier.store.clone(),
                         tier.spool_directory.clone(),
-                        Arc::clone(&caches.control),
-                        Arc::clone(&caches.payload),
+                        (Arc::clone(&caches.control), Arc::clone(&caches.payload)),
                         log_partitions,
                         tier.tier,
+                        tier.warm_local_cache_on_publish,
                     )? {
                         merge_recovered_checkpoint(&mut recovered_checkpoints, checkpoint)?;
                     }
@@ -427,7 +435,7 @@ impl TelemetrySinkFactory {
                         tier.spool_directory.clone(),
                         caches,
                         partitions,
-                        tier.tier,
+                        (tier.tier, tier.warm_local_cache_on_publish),
                     )? {
                         for checkpoint in opened.checkpoints {
                             merge_recovered_checkpoint(&mut recovered_checkpoints, checkpoint)?;
@@ -650,6 +658,7 @@ enum SinkCommand {
     },
     RetainObjectTier {
         cutoff_timestamp_unix_nanos: u64,
+        max_payload_bytes_per_partition: Option<u64>,
         response: SyncSender<TelemetryResult<TierRetentionReport>>,
     },
     RetainedPayloadBytes {
@@ -784,11 +793,13 @@ fn run_sink_worker(
             }
             SinkCommand::RetainObjectTier {
                 cutoff_timestamp_unix_nanos,
+                max_payload_bytes_per_partition,
                 response,
             } => {
                 let _ = response.send(retain_object_tiers(
                     &mut stripe,
                     cutoff_timestamp_unix_nanos,
+                    max_payload_bytes_per_partition,
                 ));
             }
             SinkCommand::RetainedPayloadBytes { response } => {
@@ -1028,6 +1039,16 @@ impl TelemetryService {
         &self,
         cutoff_timestamp_unix_nanos: u64,
     ) -> TelemetryResult<TierRetentionReport> {
+        self.retain_object_tier(cutoff_timestamp_unix_nanos, None)
+    }
+
+    /// Applies time and optional per-partition payload-cap retention to every
+    /// signal catalog in parallel.
+    pub fn retain_object_tier(
+        &self,
+        cutoff_timestamp_unix_nanos: u64,
+        max_payload_bytes_per_partition: Option<u64>,
+    ) -> TelemetryResult<TierRetentionReport> {
         let workers = self.worker_senders()?;
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
@@ -1035,6 +1056,7 @@ impl TelemetryService {
             sender
                 .send(SinkCommand::RetainObjectTier {
                     cutoff_timestamp_unix_nanos,
+                    max_payload_bytes_per_partition,
                     response,
                 })
                 .map_err(|_| {
@@ -1541,7 +1563,28 @@ fn offload_signal_partition(
         .iter()
         .map(|artifact| artifact.path.clone())
         .collect::<Vec<_>>();
-    tier.publish_group(source)?;
+    let manifest = tier.publish_group(source)?;
+    if state.warm_local_cache_on_publish {
+        let entry = tier
+            .latest_group_cached(&state.control_cache)?
+            .ok_or_else(|| {
+                TelemetryError::CorruptTier(
+                    "published signal group is missing from its catalog".into(),
+                )
+            })?;
+        let _ = tier.load_group_cached(&entry, &state.control_cache)?;
+        for (artifact, source_path) in manifest.artifacts.iter().zip(&staged_paths) {
+            match artifact.kind {
+                TierArtifactKind::PayloadPack => {
+                    state.payload_cache.admit_file(artifact, source_path)?;
+                }
+                TierArtifactKind::QueryIndex => {
+                    state.control_cache.admit_file(artifact, source_path)?;
+                }
+                TierArtifactKind::Dictionary | TierArtifactKind::DictionaryCatalog => {}
+            }
+        }
+    }
     for path in staged_paths {
         if let Err(error) = fs::remove_file(&path)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -1600,6 +1643,7 @@ fn flush_object_tiers(
 fn retain_object_tiers(
     stripe: &mut TelemetryStripeState,
     cutoff_timestamp_unix_nanos: u64,
+    max_payload_bytes_per_partition: Option<u64>,
 ) -> TelemetryResult<TierRetentionReport> {
     stripe
         .correlations
@@ -1607,17 +1651,33 @@ fn retain_object_tiers(
     let mut total = stripe
         .logs
         .retain_object_tier_since(cutoff_timestamp_unix_nanos)?;
+    if let Some(max_payload_bytes) = max_payload_bytes_per_partition {
+        add_retention_report(
+            &mut total,
+            stripe
+                .logs
+                .retain_object_tier_to_payload_bytes(max_payload_bytes)?,
+        );
+    }
     for state in stripe.signal_tiers.values_mut() {
         for tier in state.tiers.values_mut() {
             let report = tier.retain_since_timestamp(cutoff_timestamp_unix_nanos)?;
-            total.retired_groups = total.retired_groups.saturating_add(report.retired_groups);
-            total.retired_payload_bytes = total
-                .retired_payload_bytes
-                .saturating_add(report.retired_payload_bytes);
-            total.retired_objects = total.retired_objects.saturating_add(report.retired_objects);
+            add_retention_report(&mut total, report);
+            if let Some(max_payload_bytes) = max_payload_bytes_per_partition {
+                let report = tier.retain_to_payload_bytes(max_payload_bytes)?;
+                add_retention_report(&mut total, report);
+            }
         }
     }
     Ok(total)
+}
+
+fn add_retention_report(total: &mut TierRetentionReport, report: TierRetentionReport) {
+    total.retired_groups = total.retired_groups.saturating_add(report.retired_groups);
+    total.retired_payload_bytes = total
+        .retired_payload_bytes
+        .saturating_add(report.retired_payload_bytes);
+    total.retired_objects = total.retired_objects.saturating_add(report.retired_objects);
 }
 
 fn read_signal_tier_payloads(
@@ -2542,6 +2602,7 @@ mod tests {
                     memory_bytes: 4 * 1024 * 1024,
                     parsed_memory_bytes: 0,
                 },
+                warm_local_cache_on_publish: false,
             }),
             ..OtlpSinkConfig::default()
         };

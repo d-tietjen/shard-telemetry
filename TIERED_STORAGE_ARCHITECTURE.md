@@ -35,6 +35,16 @@ The defaults are represented by `ObjectTierConfig` and `SsdCacheConfig`.
 Deployments may close a group before its byte target for age, durability, or
 partition-idleness reasons, but may not cross the configured hard limits.
 
+Embedded deployments additionally use `DurableTelemetryLimits` and
+`EmbeddedTelemetryConfig::with_storage_budgets` to divide a node-local budget
+between signal heads, control cache, payload cache, and local immutable
+payloads. The payload budget is enforced per signal partition; complete groups
+are retired in event-time order and the newest group remains the recovery
+anchor. Embedded group sizing is reduced to keep that anchor within its
+partition budget. Byte accounting covers engine-controlled payload/cache state;
+filesystem metadata and one in-flight WAL/spool group remain bounded bursts
+that operators must reserve headroom for.
+
 At the worst case of one PiB of already-compressed payload and 1 GiB groups,
 there are 1,048,576 groups and 1,024 catalog pages. A root therefore has about
 one thousand references, not one million block entries. With highly
@@ -173,6 +183,12 @@ two roles:
 - an unpublished write spool for newly sealed groups; and
 - a recoverable range cache for already published objects.
 
+An S3-backed embedded writer admits each newly published payload and query
+index directly from its staging file. It also warms the corresponding catalog
+page and group manifest. The newest data is therefore locally queryable without
+an initial range download, while cache eviction leaves the immutable S3 object
+and catalog ownership unchanged.
+
 `SsdObjectCache` is byte bounded and uses fixed-size chunks. Its cache identity
 is the BLAKE3 hash of object key, immutable version token, and chunk index. Each local
 chunk has its own length and BLAKE3 integrity header. A corrupt chunk is
@@ -244,6 +260,20 @@ Retention is metadata first:
    by exact key during bounded maintenance passes.
 6. Evict matching SSD cache chunks opportunistically; correctness does not
    depend on immediate eviction.
+
+For embedded local-delete mode, the same catalog transaction also runs when a
+partition exceeds its configured payload capacity, selecting the oldest
+complete groups first. For embedded S3-archive mode, time retention is logical
+on the device: old raw objects remain in S3, while the byte-bounded local cache
+expels chunks as newer publications arrive.
+
+Before either source WAL reclamation path advances, the embedded store folds
+all metric points through the durable WAL into a local lifetime-rollup catalog
+and atomically synchronizes it. Cumulative sums and histograms derive deltas
+across snapshots and detect resets; gauges retain latest/min/max outcomes. A
+decode, cardinality-limit, or persistence failure aborts reclamation without
+advancing the rollup checkpoint, preventing both data loss and double counting
+on retry.
 
 Boundary groups remain intact until every block in them expires. Optional
 compaction may rewrite a partially expired group under a new sequence, but it

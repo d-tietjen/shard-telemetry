@@ -22,6 +22,10 @@ exclude = [
 # an unrelated Cargo workspace (as on a dedicated benchmark host).
 [workspace]
 
+[features]
+default = []
+fast-telemetry = ["dep:fast-telemetry"]
+
 [dependencies]
 arrow-array = "59.2"
 arrow-ipc = "59.2"
@@ -37,6 +41,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 crc32c = "0.6"
 foldhash = "0.2"
+fast-telemetry = { version = "=0.9.0", default-features = false, features = ["runtime"], optional = true }
 futures-util = "0.3"
 form_urlencoded = "1.2"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
