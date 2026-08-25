@@ -44,10 +44,9 @@ body:
     attributes:
       label: Submission checks
       options:
-        - label: I searched existing issues and discussions for related proposals.
+        - label: I searched existing issues for related proposals.
           required: true
         - label: This issue contains no secrets, customer telemetry, or private deterministic-simulation material.
           required: true
         - label: I have read and agree to follow the Code of Conduct.
           required: true
-
