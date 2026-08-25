@@ -6,9 +6,10 @@ license = "Apache-2.0"
 description = "Signal-native, object-tiered observability storage for shard-stream"
 repository = "https://github.com/d-tietjen/shard-telemetry"
 homepage = "https://github.com/d-tietjen/shard-telemetry"
+documentation = "https://docs.rs/shard-telemetry"
 readme = "README.md"
 rust-version = "1.93"
-publish = false
+publish = ["crates-io"]
 keywords = ["telemetry", "observability", "opentelemetry", "prometheus", "database"]
 categories = ["database", "development-tools::debugging"]
 exclude = [
@@ -16,7 +17,11 @@ exclude = [
     "deploy/",
     "scripts/",
     "clickhouse/",
+    "competitive/",
 ]
+
+[package.metadata.docs.rs]
+all-features = true
 
 # Keep this standalone repository independent when it is checked out beneath
 # an unrelated Cargo workspace (as on a dedicated benchmark host).
@@ -68,9 +73,9 @@ rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
-shard-stream-core = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "799f9775c694ec2b35299f7d84412eb3f827e6d4", version = "=0.1.0" }
-shard-stream-engine = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "799f9775c694ec2b35299f7d84412eb3f827e6d4", version = "=0.1.0" }
-shard-stream-protocol = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "799f9775c694ec2b35299f7d84412eb3f827e6d4", version = "=0.1.0" }
+shard-stream-core = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "74c8584bc1b21661360f04bb1f55d28985e0f972", version = "=0.1.0" }
+shard-stream-engine = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "74c8584bc1b21661360f04bb1f55d28985e0f972", version = "=0.1.0" }
+shard-stream-protocol = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "74c8584bc1b21661360f04bb1f55d28985e0f972", version = "=0.1.0" }
 snap = "1"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"

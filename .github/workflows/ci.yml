@@ -58,6 +58,8 @@ jobs:
           test -s NOTICE
           grep -q '^                                 Apache License$' LICENSE
           grep -q '^license = "Apache-2.0"$' Cargo.toml
+      - name: Verify crates.io package manifest
+        run: scripts/check-publish-artifacts.sh
 
   minimum-supported-rust:
     name: Rust 1.93 contract

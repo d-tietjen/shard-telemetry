@@ -14,6 +14,7 @@ grep -q '^                                 Apache License$' LICENSE || {
 }
 grep -q '^license = "Apache-2.0"$' Cargo.toml
 
+scripts/check-publish-artifacts.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked

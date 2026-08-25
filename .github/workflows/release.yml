@@ -35,6 +35,10 @@ jobs:
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           cargo test --workspace --all-targets --all-features --locked
           cargo build --release --locked --bin shard-telemetry-server
+      - name: Verify crates.io package
+        run: |
+          scripts/check-publish-artifacts.sh
+          cargo publish --dry-run --locked
       - name: Assemble distribution
         run: |
           version="${GITHUB_REF_NAME#v}"
