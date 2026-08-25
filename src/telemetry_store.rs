@@ -24,6 +24,7 @@ use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest};
 use crate::deletion::DeleteCatalog;
 use crate::ingest_pack::decode_ingest_pack;
 use crate::loki_api::{LogicalDeleteFilter, LokiApiError, apply_logical_deletes};
+use crate::rollup::MetricRollupCatalog;
 use crate::storage_format::DataDirectoryLease;
 use crate::{
     AnalyticsRelation, AnalyticsRow, AnalyticsScanOrder, AnalyticsScanRequest, CaseSensitivity,
@@ -103,6 +104,51 @@ pub struct DurableTelemetryConfig {
     pub indexed_ack_timeout: Duration,
 }
 
+/// Bounded memory, journal, and SSD-cache limits for one local durable store.
+///
+/// These limits are independent of time-based retention. Retention controls
+/// which timestamps remain queryable and eligible for physical reclamation;
+/// this configuration bounds the hot in-memory heads and recoverable local
+/// caches while that maintenance catches up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableTelemetryLimits {
+    /// Per-signal in-memory head and query limits.
+    pub signals: crate::ShardTelemetryConfig,
+    /// Maximum bytes retained in each recovery index journal.
+    pub max_index_journal_bytes: u64,
+    /// Enables the local lifetime rollup with this distinct-series bound.
+    pub max_lifetime_rollup_series: Option<usize>,
+    /// Maximum encoded bytes for the enabled lifetime-rollup catalog.
+    pub max_lifetime_rollup_bytes: u64,
+    /// SSD and parsed-memory bounds for catalogs, manifests, and indexes.
+    pub control_cache: SsdCacheConfig,
+    /// SSD and verified-memory bounds for compressed payload ranges.
+    pub payload_cache: SsdCacheConfig,
+    /// Optional compressed object payload bound for each signal partition.
+    ///
+    /// This applies to a local object-store backend. S3-backed stores retain
+    /// their complete archive remotely and use `payload_cache.max_bytes` as
+    /// the bounded local recent-data tier.
+    pub max_object_payload_bytes_per_partition: Option<u64>,
+}
+
+impl Default for DurableTelemetryLimits {
+    fn default() -> Self {
+        Self {
+            signals: crate::ShardTelemetryConfig::default(),
+            max_index_journal_bytes: 64 * 1024 * 1024 * 1024,
+            max_lifetime_rollup_series: None,
+            max_lifetime_rollup_bytes: 512 * 1024 * 1024,
+            control_cache: SsdCacheConfig {
+                max_bytes: 8 * 1024 * 1024 * 1024,
+                ..SsdCacheConfig::default()
+            },
+            payload_cache: SsdCacheConfig::default(),
+            max_object_payload_bytes_per_partition: None,
+        }
+    }
+}
+
 impl DurableTelemetryConfig {
     fn validate(&self) -> Result<(), LokiApiError> {
         if self.shard_count == 0 {
@@ -156,6 +202,7 @@ pub struct DurableTelemetryStore {
     append_submission_pool: ThreadPool,
     next_request_id: AtomicU64,
     append_receipts: AppendReceiptCatalog,
+    lifetime_rollups: Option<Mutex<MetricRollupCatalog>>,
     remote_write_append: Mutex<()>,
     deletes: DeleteCatalog,
     retention: Option<Duration>,
@@ -163,6 +210,8 @@ pub struct DurableTelemetryStore {
     retention_advanced_offsets: AtomicU64,
     retention_failures: AtomicU64,
     object_tier_enabled: bool,
+    archive_object_tier: bool,
+    max_object_payload_bytes_per_partition: Option<u64>,
     source_reclaimed_offsets: AtomicU64,
     retired_object_groups: AtomicU64,
     retired_object_payload_bytes: AtomicU64,
@@ -625,6 +674,15 @@ pub struct RetentionReport {
     pub retired_object_keys: u64,
 }
 
+/// Result of one durable local lifetime-rollup checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LifetimeRollupReport {
+    /// Distinct metric series represented by the local rollup catalog.
+    pub series: usize,
+    /// Raw metric points newly incorporated during this checkpoint.
+    pub incorporated_points: u64,
+}
+
 impl std::fmt::Debug for DurableTelemetryStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -649,13 +707,38 @@ impl DurableTelemetryStore {
 
     /// Opens or recovers a standalone durable store.
     pub fn open(config: DurableTelemetryConfig) -> Result<Self, LokiApiError> {
-        Self::open_with_object_tier_config(config, ObjectTierConfig::default())
+        Self::open_with_local_limits(config, DurableTelemetryLimits::default())
+    }
+
+    /// Opens a store with explicit bounded local memory and SSD-cache limits.
+    pub fn open_with_local_limits(
+        config: DurableTelemetryConfig,
+        limits: DurableTelemetryLimits,
+    ) -> Result<Self, LokiApiError> {
+        Self::open_with_object_tier_config_and_local_limits(
+            config,
+            ObjectTierConfig::default(),
+            limits,
+        )
     }
 
     /// Opens a store with explicit object publication and reader-lease bounds.
     pub fn open_with_object_tier_config(
         config: DurableTelemetryConfig,
         object_tier_config: ObjectTierConfig,
+    ) -> Result<Self, LokiApiError> {
+        Self::open_with_object_tier_config_and_local_limits(
+            config,
+            object_tier_config,
+            DurableTelemetryLimits::default(),
+        )
+    }
+
+    /// Opens a store with explicit object-tier policy and bounded local limits.
+    pub fn open_with_object_tier_config_and_local_limits(
+        config: DurableTelemetryConfig,
+        object_tier_config: ObjectTierConfig,
+        limits: DurableTelemetryLimits,
     ) -> Result<Self, LokiApiError> {
         config.validate()?;
         let append_submission_pool = build_append_submission_pool(config.shard_count)?;
@@ -674,12 +757,44 @@ impl DurableTelemetryStore {
             })?,
         )
         .expect("configuration validation rejects zero shards");
-        let mut signals = crate::ShardTelemetryConfig::default();
+        if limits.max_lifetime_rollup_series == Some(0)
+            || (limits.max_lifetime_rollup_series.is_some()
+                && limits.max_lifetime_rollup_bytes == 0)
+        {
+            return Err(LokiApiError::configuration(
+                "lifetime metric rollup series and byte limits must be nonzero when enabled",
+            ));
+        }
+        let max_lifetime_rollup_series = limits.max_lifetime_rollup_series;
+        if limits
+            .max_object_payload_bytes_per_partition
+            .is_some_and(|bytes| bytes == 0)
+        {
+            return Err(LokiApiError::configuration(
+                "object payload bytes per partition must be nonzero when configured",
+            ));
+        }
+        let max_object_payload_bytes_per_partition = limits.max_object_payload_bytes_per_partition;
+        let mut signals = limits.signals;
         for signal in [&mut signals.logs, &mut signals.traces, &mut signals.metrics] {
             signal.logical_partitions = logical_partitions;
             signal.physical_stripes = physical_stripes;
+            signal.retention = config.retention;
         }
         let data_directory_lease = DataDirectoryLease::acquire(&config.data_directory)?;
+        let lifetime_rollups = max_lifetime_rollup_series
+            .map(|max_series| {
+                MetricRollupCatalog::open(
+                    config
+                        .data_directory
+                        .join("lifetime-metric-rollups-v1.msgpack"),
+                    max_series,
+                    limits.max_lifetime_rollup_bytes,
+                )
+                .map(Mutex::new)
+            })
+            .transpose()
+            .map_err(|error| LokiApiError::internal(error.to_string()))?;
         let deletes = DeleteCatalog::open(config.data_directory.join("delete-catalog-v1.json"))?;
         let append_receipts = AppendReceiptCatalog::open(&config.data_directory)?;
         let engine_config = EngineConfig {
@@ -700,6 +815,7 @@ impl DurableTelemetryStore {
             max_fetch_bytes: 64 * 1024 * 1024,
             append_linger: config.append_linger,
         };
+        let archive_object_tier = config.s3_object_store.is_some();
         let object_store = match (
             config.object_store_directory.as_ref(),
             config.s3_object_store.clone(),
@@ -725,11 +841,9 @@ impl DurableTelemetryStore {
                     payload_cache_directory: config.data_directory.join("tier-payload-cache"),
                     partitions: object_tier_partitions(config.tenant_partitions),
                     tier: object_tier_config,
-                    control_cache: SsdCacheConfig {
-                        max_bytes: 8 * 1024 * 1024 * 1024,
-                        ..SsdCacheConfig::default()
-                    },
-                    payload_cache: SsdCacheConfig::default(),
+                    control_cache: limits.control_cache,
+                    payload_cache: limits.payload_cache,
+                    warm_local_cache_on_publish: archive_object_tier,
                 })
             })
             .transpose()
@@ -740,6 +854,7 @@ impl DurableTelemetryStore {
             state_directory: config
                 .recovery_journal
                 .then(|| config.data_directory.join("index-journal")),
+            max_journal_bytes: limits.max_index_journal_bytes,
             object_tier: sink_object_tier,
             ..OtlpSinkConfig::default()
         };
@@ -791,6 +906,7 @@ impl DurableTelemetryStore {
             append_submission_pool,
             next_request_id: AtomicU64::new(1),
             append_receipts,
+            lifetime_rollups,
             remote_write_append: Mutex::new(()),
             deletes,
             retention: config.retention,
@@ -798,6 +914,8 @@ impl DurableTelemetryStore {
             retention_advanced_offsets: AtomicU64::new(0),
             retention_failures: AtomicU64::new(0),
             object_tier_enabled,
+            archive_object_tier,
+            max_object_payload_bytes_per_partition,
             source_reclaimed_offsets: AtomicU64::new(0),
             retired_object_groups: AtomicU64::new(0),
             retired_object_payload_bytes: AtomicU64::new(0),
@@ -912,6 +1030,7 @@ impl DurableTelemetryStore {
             append_submission_pool,
             next_request_id: AtomicU64::new(1),
             append_receipts,
+            lifetime_rollups: None,
             remote_write_append: Mutex::new(()),
             deletes,
             retention,
@@ -919,6 +1038,8 @@ impl DurableTelemetryStore {
             retention_advanced_offsets: AtomicU64::new(0),
             retention_failures: AtomicU64::new(0),
             object_tier_enabled,
+            archive_object_tier: false,
+            max_object_payload_bytes_per_partition: None,
             source_reclaimed_offsets: AtomicU64::new(0),
             retired_object_groups: AtomicU64::new(0),
             retired_object_payload_bytes: AtomicU64::new(0),
@@ -983,14 +1104,104 @@ impl DurableTelemetryStore {
         }
     }
 
+    /// Incorporates every not-yet-checkpointed metric WAL point into the
+    /// crash-safe local lifetime rollup catalog.
+    ///
+    /// Source WAL/object reclamation calls this first. If rollup persistence
+    /// fails or its configured series bound is exhausted, reclamation fails
+    /// closed and the raw source remains available.
+    pub fn checkpoint_lifetime_rollups(&self) -> Result<LifetimeRollupReport, LokiApiError> {
+        let Some(lifetime_rollups) = &self.lifetime_rollups else {
+            return Ok(LifetimeRollupReport::default());
+        };
+        let mut catalog = lifetime_rollups
+            .lock()
+            .map_err(|_| LokiApiError::internal("lifetime metric rollup lock poisoned"))?;
+        // Work on a private generation. A series-cap, decode, or persistence
+        // failure must not leave partially accumulated in-memory state that a
+        // retry would count twice.
+        let mut staged = catalog.clone();
+        staged.clear_pending_report();
+        for partition in self.signal_partitions(crate::METRICS_TOPIC_ID) {
+            let watermarks = self.engine.watermarks(partition).map_err(engine_error)?;
+            let mut next = match staged.checkpoint(partition) {
+                Some(checkpoint) if checkpoint < watermarks.log_start => {
+                    return Err(LokiApiError::internal(format!(
+                        "metric rollup checkpoint {} precedes retained WAL start {} for {partition:?}",
+                        checkpoint.get(),
+                        watermarks.log_start.get()
+                    )));
+                }
+                Some(checkpoint) => checkpoint,
+                None => watermarks.log_start,
+            };
+            while next < watermarks.last_stable_offset {
+                let batches = self.fetch_telemetry_batches(partition, next, 16 * 1024 * 1024)?;
+                if batches.is_empty() {
+                    break;
+                }
+                for batch in batches {
+                    let points = crate::decode_metric_chunk(&batch.envelope.payload)
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                    let encoded_points = batch
+                        .last_offset
+                        .get()
+                        .saturating_sub(batch.first_offset.get())
+                        .saturating_add(1);
+                    if u64::try_from(points.len()).unwrap_or(u64::MAX) != encoded_points {
+                        return Err(LokiApiError::internal(
+                            "metric rollup WAL offsets disagree with decoded point count",
+                        ));
+                    }
+                    staged
+                        .apply_batch(partition, batch.first_offset, points)
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                    next =
+                        LogicalOffset::new(batch.last_offset.get().checked_add(1).ok_or_else(
+                            || LokiApiError::internal("metric rollup offset exhausted"),
+                        )?);
+                }
+            }
+        }
+        let incorporated_points = staged
+            .persist()
+            .map_err(|error| LokiApiError::internal(error.to_string()))?;
+        let series = staged.len();
+        *catalog = staged;
+        Ok(LifetimeRollupReport {
+            series,
+            incorporated_points,
+        })
+    }
+
+    /// Returns locally persisted lifetime metric outcomes without reading raw
+    /// object-tier data.
+    pub fn query_lifetime_metric_rollups(
+        &self,
+        tenant: &str,
+        name: Option<&str>,
+    ) -> Result<Vec<crate::LifetimeMetricRollup>, LokiApiError> {
+        self.checkpoint_lifetime_rollups()?;
+        self.lifetime_rollups
+            .as_ref()
+            .ok_or_else(|| LokiApiError::configuration("lifetime metric rollups are not enabled"))?
+            .lock()
+            .map(|catalog| catalog.query(tenant, name))
+            .map_err(|_| LokiApiError::internal("lifetime metric rollup lock poisoned"))
+    }
+
     /// Advances shard-stream retention at whole append-batch boundaries.
     ///
     /// The durable sink checkpoint is an engine-level retention pin, so this
     /// cannot reclaim a source pack before its query index has applied it.
     pub fn compact_retention(&self) -> Result<RetentionReport, LokiApiError> {
-        let Some(cutoff) = self.retention_cutoff() else {
+        let cutoff = self.retention_cutoff();
+        if cutoff.is_none()
+            && (self.archive_object_tier || self.max_object_payload_bytes_per_partition.is_none())
+        {
             return Ok(RetentionReport::default());
-        };
+        }
+        let cutoff = cutoff.unwrap_or(0);
         let result = self.compact_retention_before(cutoff);
         self.retention_runs.fetch_add(1, Ordering::Relaxed);
         match &result {
@@ -1008,7 +1219,7 @@ impl DurableTelemetryStore {
                 self.retention_failures.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if result.is_ok() {
+        if result.is_ok() && cutoff > 0 {
             self.append_receipts.retain_since(cutoff)?;
         }
         result
@@ -1020,10 +1231,10 @@ impl DurableTelemetryStore {
             cutoff_timestamp_unix_nanos: cutoff,
             ..RetentionReport::default()
         };
-        if self.object_tier_enabled {
+        if self.object_tier_enabled && !self.archive_object_tier {
             let tier = self
                 .service
-                .retain_object_tier_since(cutoff)
+                .retain_object_tier(cutoff, self.max_object_payload_bytes_per_partition)
                 .map_err(|error| LokiApiError::internal(error.to_string()))?;
             report.retired_object_groups = tier.retired_groups;
             report.retired_object_payload_bytes = tier.retired_payload_bytes;
@@ -2391,6 +2602,7 @@ impl LokiStore for DurableTelemetryStore {
                 )));
             }
             if stats.pending_items == 0 && stats.pending_bytes == 0 {
+                self.checkpoint_lifetime_rollups()?;
                 self.service
                     .flush_object_tier()
                     .map_err(|error| LokiApiError::internal(error.to_string()))?;
