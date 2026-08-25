@@ -3742,9 +3742,9 @@ dependencies = [
 
 [[package]]
 name = "zrip"
-version = "0.8.6"
+version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ef05d0a0abfcffec1d7dabdbd73373fef2b5838c20dc86ad8b6b6ee1a48a3cb"
+checksum = "edd02f990082191d398ad4ffb08dc3d92174f275b0b5e8b76d12eddd3e486bcf"
 dependencies = [
  "zrip-core",
  "zrip-decode",
