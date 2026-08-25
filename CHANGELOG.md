@@ -8,6 +8,11 @@ and protocol interfaces when called out in release notes.
 
 ### Added
 
+- Bounded embedded recent-history retention with independent RAM, SSD, and
+  time limits, oldest-first eviction, delete or S3 offload policies, and
+  crash-safe lifetime metric rollups.
+- An optional fast-telemetry snapshot bridge for exporting application metrics
+  directly into the embedded runtime without changing its recording hot path.
 - Rust-native S3/S3-compatible durable object storage with workload
   credentials, conditional catalog publication, streaming multipart uploads,
   and BLAKE3 verification.
@@ -21,9 +26,8 @@ and protocol interfaces when called out in release notes.
 - Object publication and retention now use bounded, crash-replayable ownership
   records, immutable catalog leases, and exact-key reclamation. No bucket
   listing or tracing garbage collector is required.
-- shard-stream is pinned to `8eca7d9311b2b738f85f79d0f59a003d1f6c3752`,
-  which durably checkpoints sequencer floors and recovers partitions whose
-  retained prefix was completely reclaimed.
+- shard-stream is pinned to the public 0.1.0 crates.io release candidate
+  `74c8584bc1b21661360f04bb1f55d28985e0f972`.
 
 ## [0.1.0] - 2026-08-03
 

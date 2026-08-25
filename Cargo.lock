@@ -1865,7 +1865,7 @@ dependencies = [
 [[package]]
 name = "ordered-segment-map"
 version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=799f9775c694ec2b35299f7d84412eb3f827e6d4#799f9775c694ec2b35299f7d84412eb3f827e6d4"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
 dependencies = [
  "hashbrown",
  "xxhash-rust",
@@ -2610,7 +2610,7 @@ dependencies = [
 [[package]]
 name = "shard-stream-core"
 version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=799f9775c694ec2b35299f7d84412eb3f827e6d4#799f9775c694ec2b35299f7d84412eb3f827e6d4"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
 dependencies = [
  "serde",
  "shardlog",
@@ -2619,7 +2619,7 @@ dependencies = [
 [[package]]
 name = "shard-stream-engine"
 version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=799f9775c694ec2b35299f7d84412eb3f827e6d4#799f9775c694ec2b35299f7d84412eb3f827e6d4"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
 dependencies = [
  "bytes",
  "ordered-segment-map",
@@ -2632,7 +2632,7 @@ dependencies = [
 [[package]]
 name = "shard-stream-protocol"
 version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=799f9775c694ec2b35299f7d84412eb3f827e6d4#799f9775c694ec2b35299f7d84412eb3f827e6d4"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2703,7 +2703,7 @@ dependencies = [
 [[package]]
 name = "shardlog"
 version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=799f9775c694ec2b35299f7d84412eb3f827e6d4#799f9775c694ec2b35299f7d84412eb3f827e6d4"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
 dependencies = [
  "blake3",
  "bytes",

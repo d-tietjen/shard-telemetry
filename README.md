@@ -10,11 +10,11 @@ deployments.
 
 ## Project status
 
-This is a pre-release source project. The package is versioned 0.1.0 and is
-not published to crates.io. Storage formats, network protocol details, and
-operational defaults may change before a stable release. Evaluate it against a
-representative workload and follow the compatibility documents before relying
-on it for production data.
+This is a pre-release project. The package is versioned 0.1.0; published
+releases use the `shard-telemetry` crate name. Storage formats, network
+protocol details, and operational defaults may change before a stable release.
+Evaluate it against a representative workload and follow the compatibility
+documents before relying on it for production data.
 
 The project is distributed under Apache-2.0. The security policy, release
 process, and contributor expectations are public and linked below.
@@ -44,11 +44,11 @@ following related projects.
 - [shard-kv](https://github.com/d-tietjen/shard-kv) is a separate
   cache-oriented key-value project. It is a useful companion where a workload
   needs local cache state as well as durable telemetry storage.
-- [fast-telemetry](https://github.com/eden-dev-inc/fast-telemetry) is a
-  separate Rust instrumentation library for hot-path counters, gauges,
-  histograms, distributions, and spans. The optional `fast-telemetry` feature
-  adds a direct metric-snapshot bridge into the embedded runtime; recording
-  remains on fast-telemetry's original hot path.
+- [fast-telemetry](https://crates.io/crates/fast-telemetry) is a separate Rust
+  instrumentation library for hot-path counters, gauges, histograms,
+  distributions, and spans. The optional `fast-telemetry` feature adds a
+  direct metric-snapshot bridge into the embedded runtime; recording remains on
+  fast-telemetry's original hot path.
 
 Each project has its own release process, APIs, and support boundary.
 
