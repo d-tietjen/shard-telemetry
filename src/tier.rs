@@ -2489,6 +2489,58 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         Ok(report)
     }
 
+    /// Removes the oldest complete groups until selected compressed payloads
+    /// fit `max_payload_bytes`.
+    ///
+    /// The newest group remains as the recovery anchor even when it alone is
+    /// larger than the configured budget. Callers should therefore configure
+    /// a budget at least as large as one maximum group payload.
+    pub fn retain_to_payload_bytes(
+        &mut self,
+        max_payload_bytes: u64,
+    ) -> TelemetryResult<TierRetentionReport> {
+        if max_payload_bytes == 0 {
+            return Err(TelemetryError::InvalidConfig(
+                "object-tier payload budget must be nonzero",
+            ));
+        }
+        let Some(final_group_sequence) =
+            self.root.pages.last().map(|page| page.last_group_sequence)
+        else {
+            return Ok(TierRetentionReport::default());
+        };
+        let mut total = 0_u64;
+        let mut candidates = Vec::new();
+        for page_ref in &self.root.pages {
+            let page = self.load_page(page_ref)?;
+            for group in &page.groups {
+                total = total.saturating_add(group.payload_bytes);
+                if group.group_sequence != final_group_sequence {
+                    candidates.push((
+                        group.max_timestamp_unix_nanos,
+                        group.group_sequence,
+                        group.payload_bytes,
+                    ));
+                }
+            }
+        }
+        if total <= max_payload_bytes {
+            return Ok(TierRetentionReport::default());
+        }
+        candidates.sort_unstable();
+        let mut cutoff = None;
+        for (timestamp, _, bytes) in candidates {
+            if total <= max_payload_bytes {
+                break;
+            }
+            total = total.saturating_sub(bytes);
+            cutoff = Some(timestamp.saturating_add(1));
+        }
+        cutoff.map_or(Ok(TierRetentionReport::default()), |cutoff| {
+            self.retain_since_timestamp(cutoff)
+        })
+    }
+
     /// Returns group entries whose coarse bounds overlap the query.
     ///
     /// Only overlapping catalog pages are loaded. This never lists objects.
@@ -3063,6 +3115,47 @@ impl SsdObjectCache {
     #[must_use]
     pub const fn max_read_bytes(&self) -> u64 {
         self.config.max_read_bytes
+    }
+
+    /// Admits a newly published immutable artifact directly from its local
+    /// staging file.
+    ///
+    /// S3-backed embedded deployments use this write-through path so the most
+    /// recently published payloads and indexes remain locally queryable without
+    /// first downloading them. The ordinary LRU budget expels older chunks.
+    pub fn admit_file(&self, artifact: &TierArtifact, source: &Path) -> TelemetryResult<()> {
+        let source_metadata = hash_file(source)?;
+        if source_metadata.bytes != artifact.bytes
+            || source_metadata.content_digest != artifact.checksum
+        {
+            return Err(TelemetryError::CorruptTier(
+                "published artifact source changed before SSD-cache admission".into(),
+            ));
+        }
+        let mut file = File::open(source)
+            .map_err(|error| storage_io("open SSD-cache admission source", error))?;
+        let mut chunk_index = 0_u64;
+        let mut remaining = artifact.bytes;
+        while remaining > 0 {
+            let chunk_bytes = remaining.min(self.config.chunk_bytes);
+            let chunk_len = usize::try_from(chunk_bytes).map_err(|_| {
+                TelemetryError::StorageIo("SSD-cache admission chunk cannot fit in memory".into())
+            })?;
+            let mut bytes = vec![0; chunk_len];
+            file.read_exact(&mut bytes)
+                .map_err(|error| storage_io("read SSD-cache admission source", error))?;
+            let cache_key = checksum_bytes(
+                format!(
+                    "{}\0{}\0{chunk_index}",
+                    artifact.object_key, artifact.checksum
+                )
+                .as_bytes(),
+            );
+            self.install_chunk(&cache_key, &bytes)?;
+            remaining -= chunk_bytes;
+            chunk_index = chunk_index.saturating_add(1);
+        }
+        Ok(())
     }
 
     /// Reads an object range, filling and reusing fixed immutable SSD chunks.
@@ -4757,6 +4850,44 @@ mod tests {
     }
 
     #[test]
+    fn payload_budget_retires_oldest_complete_groups_first() {
+        let directory = TestDirectory::new("tier-capacity-retention");
+        let artifacts = directory.path.join("sources");
+        fs::create_dir_all(&artifacts).expect("artifact directory is created");
+        let store =
+            LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
+        let config = ObjectTierConfig {
+            retirement_grace: std::time::Duration::ZERO,
+            ..tier_config(8)
+        };
+        let mut tier = TelemetryObjectTier::open(store, ShardId::new(4), partition(), config)
+            .expect("tier opens");
+        for sequence in 0..4 {
+            tier.publish_group(group_source(
+                &artifacts,
+                sequence,
+                sequence * 10,
+                (sequence + 1) * 1_000,
+            ))
+            .expect("group publishes");
+        }
+
+        let report = tier
+            .retain_to_payload_bytes(64)
+            .expect("capacity retention");
+        assert_eq!(report.retired_groups, 2);
+        assert_eq!(report.retired_payload_bytes, 64);
+        assert_eq!(
+            tier.candidate_groups(TierQueryRange::default())
+                .expect("retained groups")
+                .into_iter()
+                .map(|group| group.group_sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
     fn startup_is_shallow_and_touched_pages_are_verified() {
         let directory = TestDirectory::new("lazy-verification");
         let artifacts = directory.path.join("sources");
@@ -5024,6 +5155,52 @@ mod tests {
             .read_range(&store, "payload/object", 4..8)
             .expect("evicted chunk can be fetched again");
         assert_eq!(store.range_reads.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn ssd_cache_admits_a_published_staging_file_without_a_remote_read() {
+        let directory = TestDirectory::new("ssd-cache-admit-file");
+        let source = directory.path.join("payload.pack");
+        let bytes = b"abcdefghijklmnop";
+        write_test_file(&source, bytes);
+        let checksum = checksum_bytes(bytes);
+        let artifact = TierArtifact {
+            kind: TierArtifactKind::PayloadPack,
+            name: "payload.pack".into(),
+            object_key: "remote/payload".into(),
+            bytes: u64::try_from(bytes.len()).expect("length"),
+            checksum_algorithm: CHECKSUM_ALGORITHM.into(),
+            checksum: checksum.clone(),
+        };
+        let cache = SsdObjectCache::open(
+            directory.path.join("cache"),
+            SsdCacheConfig {
+                max_bytes: 4 * (CACHE_HEADER_BYTES as u64 + 4),
+                chunk_bytes: 4,
+                max_read_bytes: 16,
+                memory_bytes: 0,
+                parsed_memory_bytes: 0,
+            },
+        )
+        .expect("cache opens");
+        cache.admit_file(&artifact, &source).expect("file admits");
+
+        let empty_store =
+            LocalObjectStore::open(directory.path.join("empty-remote")).expect("store opens");
+        let cached = cache
+            .read_range_with_metadata(
+                &empty_store,
+                &artifact.object_key,
+                &ObjectMetadata {
+                    bytes: artifact.bytes,
+                    version_token: checksum.clone(),
+                    content_digest: checksum,
+                },
+                0..artifact.bytes,
+            )
+            .expect("cache serves without the remote object");
+        assert_eq!(cached, bytes);
+        assert!(cache.used_bytes() <= cache.config.max_bytes);
     }
 
     #[test]

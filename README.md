@@ -46,8 +46,9 @@ following related projects.
   needs local cache state as well as durable telemetry storage.
 - [fast-telemetry](https://github.com/eden-dev-inc/fast-telemetry) is a
   separate Rust instrumentation library for hot-path counters, gauges,
-  histograms, distributions, and spans. It is complementary to
-  ShardTelemetry's durable ingestion and query role.
+  histograms, distributions, and spans. The optional `fast-telemetry` feature
+  adds a direct metric-snapshot bridge into the embedded runtime; recording
+  remains on fast-telemetry's original hot path.
 
 Each project has its own release process, APIs, and support boundary.
 
@@ -81,6 +82,58 @@ durable object backend. Keep the native listener on loopback or behind
 transport encryption, use a dedicated object-store prefix, and follow the
 object-storage and recovery guidance in SECURITY.md and
 TIERED_STORAGE_ARCHITECTURE.md.
+
+## Bounded embedded recent history
+
+An embedded runtime can retain an exact recent window for local decisions while
+the central telemetry service continues to receive the normal durable stream.
+Enable the crate's `fast-telemetry` feature for the direct snapshot bridge. The
+local policy has independent RAM, SSD, and time bounds:
+
+~~~rust
+use std::sync::Arc;
+use std::time::Duration;
+use fast_telemetry::{Runtime, RuntimeConfig};
+use shard_telemetry::{
+    EmbeddedEvictionPolicy, EmbeddedTelemetryConfig, EmbeddedTelemetryRuntime,
+    FastTelemetryConfig, FastTelemetryExporter,
+};
+
+let embedded = Arc::new(EmbeddedTelemetryRuntime::open(
+    EmbeddedTelemetryConfig::bounded(
+        "/var/lib/my-app/telemetry",
+        Duration::from_secs(15 * 60),
+        EmbeddedEvictionPolicy::Delete,
+    )
+    .with_storage_budgets(256 * 1024 * 1024, 8 * 1024 * 1024 * 1024),
+)?);
+let metrics = Runtime::new(RuntimeConfig::default());
+let exporter = embedded.attach(|| FastTelemetryExporter::new(
+    metrics,
+    Arc::clone(&embedded),
+    FastTelemetryConfig::new("device", "my-app"),
+))?;
+embedded.mark_ready()?;
+~~~
+
+Drive `exporter.export_once()` at `exporter.interval()` and call
+`embedded.compact_retention()` periodically. Queries against the embedded
+runtime are immediately clipped to the configured recent window. Complete
+groups beyond the time or local payload budget are removed oldest-first.
+
+Use `EmbeddedEvictionPolicy::OffloadToS3` instead of `Delete` to preserve full
+raw history. Publication is write-through: a group becomes authoritative in a
+dedicated S3 prefix before its payload and index are admitted to the bounded
+local SSD cache. Do not reuse the central server's catalog prefix.
+
+`query_lifetime_metric_rollups` returns a crash-safe, bounded-cardinality local
+summary without reading S3 or expired raw records. Monotonic cumulative
+counters and histograms are reset-aware lifetime totals; gauges retain their
+latest value and lifetime minimum/maximum. Rollup persistence precedes reclamation,
+so a rollup failure leaves the raw WAL in place. The configured byte limits
+bound storage-engine state and steady-state local data; transient request/query
+allocations, filesystem metadata, and one in-flight WAL/spool group require
+operational headroom.
 
 ## Documentation
 

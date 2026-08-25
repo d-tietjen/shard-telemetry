@@ -338,6 +338,7 @@ struct StripeTierState {
     spool_directory: PathBuf,
     control_cache: Arc<SsdObjectCache>,
     payload_cache: Arc<SsdObjectCache>,
+    warm_local_cache_on_publish: bool,
     config: ObjectTierConfig,
 }
 
@@ -703,10 +704,10 @@ impl LogStripe {
         &mut self,
         store: SharedTelemetryObjectStore,
         spool_directory: PathBuf,
-        control_cache: Arc<SsdObjectCache>,
-        payload_cache: Arc<SsdObjectCache>,
+        caches: (Arc<SsdObjectCache>, Arc<SsdObjectCache>),
         partitions: impl IntoIterator<Item = TopicPartition>,
         config: ObjectTierConfig,
+        warm_local_cache_on_publish: bool,
     ) -> TelemetryResult<Vec<DurableSinkCheckpoint>> {
         if self.tier.is_some() {
             return Err(TelemetryError::InvalidConfig(
@@ -744,11 +745,13 @@ impl LogStripe {
             ));
         }
         self.next_frame_id = next_frame_id;
+        let (control_cache, payload_cache) = caches;
         self.tier = Some(StripeTierState {
             tiers,
             spool_directory,
             control_cache,
             payload_cache,
+            warm_local_cache_on_publish,
             config,
         });
         Ok(checkpoints)
@@ -1234,6 +1237,25 @@ impl LogStripe {
         Ok(total)
     }
 
+    pub(crate) fn retain_object_tier_to_payload_bytes(
+        &mut self,
+        max_payload_bytes_per_partition: u64,
+    ) -> TelemetryResult<TierRetentionReport> {
+        let Some(state) = self.tier.as_mut() else {
+            return Ok(TierRetentionReport::default());
+        };
+        let mut total = TierRetentionReport::default();
+        for tier in state.tiers.values_mut() {
+            let report = tier.retain_to_payload_bytes(max_payload_bytes_per_partition)?;
+            total.retired_groups = total.retired_groups.saturating_add(report.retired_groups);
+            total.retired_payload_bytes = total
+                .retired_payload_bytes
+                .saturating_add(report.retired_payload_bytes);
+            total.retired_objects = total.retired_objects.saturating_add(report.retired_objects);
+        }
+        Ok(total)
+    }
+
     fn offload_one_indexed_group(
         &mut self,
         partition: TopicPartition,
@@ -1341,7 +1363,7 @@ impl LogStripe {
         let payload_path = group_directory.join("payload.pack");
         let query_index_path = group_directory.join("query-index.sltqix");
         let blocks = write_tier_ingest_group(&sources, &payload_path, &query_index_path)?;
-        tier.publish_group(TierGroupSource {
+        let manifest = tier.publish_group(TierGroupSource {
             group_sequence,
             checkpoint: TierCheckpoint {
                 next_placement_sequence: checkpoint.next_placement_sequence.get(),
@@ -1361,6 +1383,31 @@ impl LogStripe {
                 },
             ],
         })?;
+        if state.warm_local_cache_on_publish {
+            let entry = tier
+                .latest_group_cached(&state.control_cache)?
+                .ok_or_else(|| {
+                    TelemetryError::CorruptTier(
+                        "published log group is missing from its catalog".into(),
+                    )
+                })?;
+            let _ = tier.load_group_cached(&entry, &state.control_cache)?;
+            let payload_artifact = manifest
+                .artifact(TierArtifactKind::PayloadPack)
+                .ok_or_else(|| TelemetryError::CorruptTier("log group has no payload".into()))?;
+            state
+                .payload_cache
+                .admit_file(payload_artifact, &payload_path)?;
+            let query_index_artifact =
+                manifest
+                    .artifact(TierArtifactKind::QueryIndex)
+                    .ok_or_else(|| {
+                        TelemetryError::CorruptTier("log group has no query index".into())
+                    })?;
+            state
+                .control_cache
+                .admit_file(query_index_artifact, &query_index_path)?;
+        }
         self.indexed_frame_partitions
             .get_mut(&partition)
             .expect("resident partition remains present")

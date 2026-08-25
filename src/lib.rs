@@ -16,6 +16,8 @@ mod dictionary;
 mod embedded;
 mod envelope;
 mod error;
+#[cfg(feature = "fast-telemetry")]
+mod fast_telemetry;
 mod ingest_pack;
 mod locality;
 mod loki_api;
@@ -36,6 +38,7 @@ mod query;
 mod query_index;
 mod realtime_dictionary;
 mod remote_write;
+mod rollup;
 mod s3_object_store;
 mod signal_ingest;
 mod sink;
@@ -66,9 +69,14 @@ pub use dictionary::{
     CompressionCohortId, DictionaryCache, DictionaryCatalog, DictionaryCatalogSnapshot,
     DictionaryId, DictionaryInsert, DictionaryPublication,
 };
-pub use embedded::{EmbeddedTelemetryConfig, EmbeddedTelemetryRuntime, EmbeddedTelemetryState};
+pub use embedded::{
+    EmbeddedEvictionPolicy, EmbeddedTelemetryConfig, EmbeddedTelemetryRuntime,
+    EmbeddedTelemetryState,
+};
 pub use envelope::{MAX_TELEMETRY_ENVELOPE_BYTES, TelemetryEnvelope};
 pub use error::{TelemetryError, TelemetryResult};
+#[cfg(feature = "fast-telemetry")]
+pub use fast_telemetry::{FastTelemetryConfig, FastTelemetryExportReport, FastTelemetryExporter};
 pub use locality::{
     CompressionBlockAssignment, CompressionBlockCollator, CompressionBlockScore,
     CompressionLocalityConfig, CompressionLocalityRecord, CompressionLocalityStats,
@@ -125,6 +133,7 @@ pub use remote_write::{
     DecodedRemoteWrite, METRIC_FLAG_STALE, PROMETHEUS_STALE_NAN_BITS, RemoteWriteDecoder,
     RemoteWriteStats, RemoteWriteVersion,
 };
+pub use rollup::LifetimeMetricRollup;
 pub use s3_object_store::{S3ObjectStore, S3ObjectStoreConfig};
 pub use signal_ingest::{
     DockerLogRecord, DockerLogStream, decode_log_envelope, prepare_docker_log_envelope,
@@ -147,8 +156,9 @@ pub use telemetry::{
     TelemetryValue, TraceId,
 };
 pub use telemetry_store::{
-    DurableTelemetryConfig, DurableTelemetryStore, FetchedTelemetryBatch, RetentionReport,
-    TelemetryAppendDurability, TelemetryAppendGate, TelemetryHostAttachment,
+    DurableTelemetryConfig, DurableTelemetryLimits, DurableTelemetryStore, FetchedTelemetryBatch,
+    LifetimeRollupReport, RetentionReport, TelemetryAppendDurability, TelemetryAppendGate,
+    TelemetryHostAttachment,
 };
 pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};
 pub use tier::{
