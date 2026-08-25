@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a reproducible defect or regression
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve ShardTelemetry. For security vulnerabilities,
+        use the private reporting link instead of filing a public issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The crate version or full commit SHA where the problem occurs.
+      placeholder: v0.1.0 or 264ab2acfcc9f0914e5998c062411356dddc1a06
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Deployment mode
+      options:
+        - Embedded
+        - Server
+        - Both
+        - Build or tooling
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include configuration, commands, and the smallest public example that reproduces the issue.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and logs
+      description: Include OS, Rust version, enabled features, and sanitized logs when relevant.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues for duplicates.
+          required: true
+        - label: I removed secrets, customer telemetry, and private deterministic-simulation code or evidence.
+          required: true
+        - label: I have read and agree to follow the Code of Conduct.
+          required: true
+
