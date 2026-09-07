@@ -1865,8 +1865,8 @@ dependencies = [
 
 [[package]]
 name = "ordered-segment-map"
-version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
+version = "0.2.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
 dependencies = [
  "hashbrown",
  "xxhash-rust",
@@ -2610,8 +2610,8 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-core"
-version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
+version = "0.2.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
 dependencies = [
  "serde",
  "shardlog",
@@ -2619,8 +2619,8 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-engine"
-version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
+version = "0.2.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
 dependencies = [
  "bytes",
  "ordered-segment-map",
@@ -2632,8 +2632,8 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-protocol"
-version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
+version = "0.2.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2643,7 +2643,7 @@ dependencies = [
 
 [[package]]
 name = "shard-telemetry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -2703,8 +2703,8 @@ dependencies = [
 
 [[package]]
 name = "shardlog"
-version = "0.1.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=74c8584bc1b21661360f04bb1f55d28985e0f972#74c8584bc1b21661360f04bb1f55d28985e0f972"
+version = "0.2.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
 dependencies = [
  "blake3",
  "bytes",

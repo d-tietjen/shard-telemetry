@@ -10,7 +10,7 @@ deployments.
 
 ## Project status
 
-This is a pre-release project. The package is versioned 0.1.0; published
+This is a pre-release project. The package is versioned 0.2.0; published
 releases use the `shard-telemetry` crate name. Storage formats, network
 protocol details, and operational defaults may change before a stable release.
 Evaluate it against a representative workload and follow the compatibility
