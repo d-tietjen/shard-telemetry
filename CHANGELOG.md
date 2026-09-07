@@ -6,6 +6,8 @@ and protocol interfaces when called out in release notes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-07
+
 ### Added
 
 - Bounded embedded recent-history retention with independent RAM, SSD, and
@@ -26,8 +28,8 @@ and protocol interfaces when called out in release notes.
 - Object publication and retention now use bounded, crash-replayable ownership
   records, immutable catalog leases, and exact-key reclamation. No bucket
   listing or tracing garbage collector is required.
-- shard-stream is pinned to the public 0.1.0 crates.io release candidate
-  `74c8584bc1b21661360f04bb1f55d28985e0f972`.
+- shard-stream is pinned to the public 0.2.0 crates.io release candidate
+  `fef8695b1724e04e10aa26e500e68b8b535efa13`.
 
 ## [0.1.0] - 2026-08-03
 

@@ -30,8 +30,8 @@ documentation="$(
 )"
 test "$documentation" = "https://docs.rs/shard-telemetry" || fail "docs.rs package metadata is missing"
 
-expected_shard_stream_rev="74c8584bc1b21661360f04bb1f55d28985e0f972"
-expected_shard_stream_version="=0.1.0"
+expected_shard_stream_rev="fef8695b1724e04e10aa26e500e68b8b535efa13"
+expected_shard_stream_version="=0.2.0"
 shard_stream_dependencies=0
 while IFS=$'\t' read -r dependency requirement source; do
   test -n "$dependency" || continue

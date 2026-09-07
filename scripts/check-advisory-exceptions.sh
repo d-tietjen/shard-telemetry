@@ -4,11 +4,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-expected=$'bincode v1.3.3\nlrpar v0.13.10\nlrlex v0.13.10\npromql-parser v0.10.0\nshard-telemetry v0.1.0'
+expected=$'bincode v1.3.3\nlrpar v0.13.10\nlrlex v0.13.10\npromql-parser v0.10.0\nshard-telemetry v0.2.0'
 observed="$({
   CARGO_TERM_COLOR=never cargo tree --locked -e normal -i bincode@1.3.3 --prefix none |
     sed -e '/^promql-parser v0.10.0 (\*)$/d' \
-        -e "s#shard-telemetry v0.1.0 (.*)#shard-telemetry v0.1.0#"
+        -e "s#shard-telemetry v0.2.0 (.*)#shard-telemetry v0.2.0#"
 })"
 
 if [[ "$observed" != "$expected" ]]; then
