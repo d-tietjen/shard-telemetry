@@ -38,7 +38,7 @@ arrow-schema = "59.2"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
 blake3 = "1"
-brotli = "8"
+brotli = "9"
 bzip2 = "0.6"
 bytes = "1.12"
 bytes-handoff = "1.3"
