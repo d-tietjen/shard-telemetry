@@ -5,6 +5,11 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Annotated release tag to build (for example v0.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,15 +24,18 @@ jobs:
     name: Build Linux x86_64 release
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      RELEASE_REF: ${{ inputs.release_ref || github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ inputs.release_ref || github.ref }}
       - name: Validate tag and package version
         run: |
           package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
-          test "${GITHUB_REF_NAME}" = "v${package_version}"
-          test "$(git cat-file -t "${GITHUB_REF_NAME}")" = tag
+          test "${RELEASE_REF}" = "v${package_version}"
+          test "$(git cat-file -t "${RELEASE_REF}")" = tag
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.93.0 --profile minimal --component rustfmt,clippy
       - name: Build and test release
@@ -42,7 +50,7 @@ jobs:
           cargo publish --dry-run --locked
       - name: Assemble distribution
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_REF#v}"
           package="shard-telemetry-${version}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/${package}"
           cp target/release/shard-telemetry-server "dist/${package}/"
@@ -64,7 +72,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          gh release create "${GITHUB_REF_NAME}"
+          gh release create "${RELEASE_REF}"
           dist/*.tar.gz
           dist/SHA256SUMS
           dist/shard-telemetry.spdx.json
