@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -62,4 +63,9 @@ jobs:
       - name: Publish immutable release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          dist/*.tar.gz
+          dist/SHA256SUMS
+          dist/shard-telemetry.spdx.json
+          --verify-tag --generate-notes
