@@ -34,12 +34,14 @@ jobs:
           TEST_REGION: ${{ vars.SHARD_TELEMETRY_S3_TEST_REGION }}
           TEST_ACCESS_KEY: ${{ secrets.SHARD_TELEMETRY_S3_TEST_ACCESS_KEY_ID }}
           TEST_SECRET_KEY: ${{ secrets.SHARD_TELEMETRY_S3_TEST_SECRET_ACCESS_KEY }}
+          TEST_SESSION_TOKEN: ${{ secrets.SHARD_TELEMETRY_S3_TEST_SESSION_TOKEN }}
         run: |
           test -n "$TEST_BUCKET"
           test -n "$TEST_PREFIX"
           test -n "$TEST_REGION"
           test -n "$TEST_ACCESS_KEY"
           test -n "$TEST_SECRET_KEY"
+          test -n "$TEST_SESSION_TOKEN"
           case "$TEST_PREFIX" in
             production/*|prod/*|/) exit 1 ;;
           esac
@@ -47,6 +49,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.SHARD_TELEMETRY_S3_TEST_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SHARD_TELEMETRY_S3_TEST_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.SHARD_TELEMETRY_S3_TEST_SESSION_TOKEN }}
           AWS_REGION: ${{ vars.SHARD_TELEMETRY_S3_TEST_REGION }}
           AWS_DEFAULT_REGION: ${{ vars.SHARD_TELEMETRY_S3_TEST_REGION }}
           SHARD_TELEMETRY_S3_TEST_BUCKET: ${{ vars.SHARD_TELEMETRY_S3_TEST_BUCKET }}
