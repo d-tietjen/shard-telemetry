@@ -84,7 +84,7 @@ tower = { version = "0.5", features = ["util"] }
 xz2 = "0.1"
 zlib-rs = "0.6"
 zopfli = "0.8"
-zstd = { version = "0.13", features = ["zdict_builder"] }
+zstd = { version = "0.14", features = ["zdict_builder"] }
 zrip = "0.8"
 
 [lints.rust]
