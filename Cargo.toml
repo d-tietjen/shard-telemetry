@@ -33,7 +33,7 @@ dial9 = ["dep:dial9"]
 fast-telemetry = ["dep:fast-telemetry"]
 
 [dependencies]
-arrow-array = "59.2"
+arrow-array = "60.0"
 arrow-ipc = "59.2"
 arrow-schema = "59.2"
 axum = { version = "0.8", features = ["ws"] }
