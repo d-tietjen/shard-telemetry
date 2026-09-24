@@ -71,6 +71,7 @@ CREATE TABLE shardtelemetry.logs
     trace_id Nullable(String),
     span_id Nullable(String),
     message Nullable(String),
+    score Nullable(Float64),
     body_json Nullable(String),
     severity_number Nullable(Int32),
     severity_text Nullable(String),
