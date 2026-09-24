@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use shard_stream_core::LogicalOffset;
@@ -24,7 +25,7 @@ pub(crate) struct TierIngestFrameSource {
     pub(crate) min_timestamp_unix_nanos: u64,
     pub(crate) max_timestamp_unix_nanos: u64,
     pub(crate) compressed: Bytes,
-    pub(crate) index: EmbeddedFrameIndex,
+    pub(crate) index: Arc<EmbeddedFrameIndex>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,7 +37,7 @@ pub(crate) struct TierIngestAppendSource {
     pub(crate) frames: Vec<TierIngestFrameSource>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DecodedTierIngestFrame {
     pub(crate) frame_id: u64,
     pub(crate) cohort: CompressionCohortId,
@@ -47,10 +48,10 @@ pub(crate) struct DecodedTierIngestFrame {
     pub(crate) payload_offset: u64,
     pub(crate) payload_bytes: u64,
     pub(crate) payload_checksum: String,
-    pub(crate) index: EmbeddedFrameIndex,
+    pub(crate) index: Arc<EmbeddedFrameIndex>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DecodedTierIngestAppend {
     pub(crate) tenant: String,
     pub(crate) first_offset: LogicalOffset,
@@ -165,7 +166,7 @@ pub(crate) fn write_tier_ingest_group(
         return Err(TelemetryError::RecordTooLarge);
     }
     payload
-        .sync_all()
+        .sync_data()
         .map_err(|error| storage_io("sync ingest payload pack", error))?;
     let compressed_index = zstd::bulk::compress(&raw_index, QUERY_INDEX_LEVEL)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
@@ -174,7 +175,7 @@ pub(crate) fn write_tier_ingest_group(
         .write_all(QUERY_INDEX_MAGIC)
         .and_then(|()| index_file.write_all(&(raw_index.len() as u64).to_le_bytes()))
         .and_then(|()| index_file.write_all(&compressed_index))
-        .and_then(|()| index_file.sync_all())
+        .and_then(|()| index_file.sync_data())
         .map_err(|error| storage_io("write ingest query index", error))?;
     sync_parent(payload_path)?;
     if payload_path.parent() != query_index_path.parent() {
@@ -279,7 +280,7 @@ pub(crate) fn decode_tier_ingest_group(
                 payload_offset,
                 payload_bytes,
                 payload_checksum: block.payload_checksum.clone(),
-                index,
+                index: Arc::new(index),
             });
             block_index += 1;
         }

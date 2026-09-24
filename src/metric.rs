@@ -13,7 +13,9 @@ use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, Top
 use crate::{
     CorrelationBlockFilter, ResourceContext, ScopeContext, SeriesFingerprint, SignalTierPayload,
     SpanId, TelemetryAttribute, TelemetryError, TelemetryRecordRef, TelemetryResult,
-    TelemetrySignal, TraceId,
+    TelemetrySignal, TraceId, estimated_arc_str_bytes, estimated_arc_vec_storage,
+    estimated_resource_context_bytes, estimated_scope_context_bytes,
+    estimated_telemetry_attribute_bytes,
 };
 
 const METRIC_CHUNK_MAGIC: [u8; 4] = *b"STMP";
@@ -25,8 +27,21 @@ const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_CHUNK_POINTS: usize = 4_096;
 const DEFAULT_CHUNK_NANOS: u64 = 2 * 60 * 60 * 1_000_000_000;
 const SERIES_ID_CACHE_ENTRIES: usize = 1_024;
-const DECODED_METRIC_CACHE_ENTRIES: usize = 256;
+// Resident chunk IDs are allocated across all series in a stripe.  A small
+// fixed-entry cache keyed by resident ID avoids interleaved series evicting
+// one another when the working set for one queried series is small.  Keep the
+// lazy cache bounded by both entries and bytes.
+const DECODED_METRIC_CACHE_ENTRIES: usize = 2_048;
 const MAX_DECODED_METRIC_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+thread_local! {
+    static METRIC_COMPRESSOR: RefCell<zstd::bulk::Compressor<'static>> =
+        RefCell::new(zstd::bulk::Compressor::new(METRIC_SIDECAR_ZSTD_LEVEL)
+            .expect("metric zstd level is valid"));
+    static METRIC_DECOMPRESSOR: RefCell<zstd::bulk::Decompressor<'static>> =
+        RefCell::new(zstd::bulk::Decompressor::new()
+            .expect("metric zstd decompressor initializes"));
+}
 
 /// Exact scalar number used by gauges, sums, and exemplars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -284,9 +299,100 @@ impl DurableMetricPoint {
         self.identity.fingerprint()
     }
 
+    /// Estimates resident head storage without serializing the point.
+    ///
+    /// This is deliberately conservative because it bounds memory admission;
+    /// it is not a wire-size calculation.
     fn estimated_head_bytes(&self) -> usize {
-        rmp_serde::to_vec(self).map_or(usize::MAX, |value| value.len())
+        size_of::<Self>()
+            .saturating_add(estimated_metric_identity_bytes(&self.identity))
+            .saturating_add(estimated_arc_str_bytes(&self.description))
+            .saturating_add(estimated_arc_attributes_bytes(&self.metadata))
+            .saturating_add(estimated_metric_value_bytes(&self.value))
+            .saturating_add(estimated_arc_exemplars_bytes(&self.exemplars))
     }
+}
+
+fn estimated_metric_identity_bytes(identity: &Arc<MetricIdentity>) -> usize {
+    size_of::<MetricIdentity>()
+        .saturating_add(estimated_arc_str_bytes(&identity.tenant))
+        .saturating_add(estimated_resource_context_bytes(&identity.resource))
+        .saturating_add(estimated_scope_context_bytes(&identity.scope))
+        .saturating_add(estimated_arc_str_bytes(&identity.name))
+        .saturating_add(estimated_arc_str_bytes(&identity.unit))
+        .saturating_add(estimated_arc_vec_storage::<TelemetryAttribute>(
+            identity.point_attributes.capacity(),
+        ))
+        .saturating_add(
+            identity
+                .point_attributes
+                .iter()
+                .map(estimated_telemetry_attribute_bytes)
+                .sum(),
+        )
+}
+
+fn estimated_arc_attributes_bytes(attributes: &Arc<Vec<TelemetryAttribute>>) -> usize {
+    estimated_arc_vec_storage::<TelemetryAttribute>(attributes.capacity()).saturating_add(
+        attributes
+            .iter()
+            .map(estimated_telemetry_attribute_bytes)
+            .sum(),
+    )
+}
+
+fn estimated_arc_exemplars_bytes(exemplars: &Arc<Vec<MetricExemplar>>) -> usize {
+    estimated_arc_vec_storage::<MetricExemplar>(exemplars.capacity()).saturating_add(
+        exemplars
+            .iter()
+            .map(|exemplar| {
+                size_of::<MetricExemplar>().saturating_add(estimated_arc_attributes_bytes(
+                    &exemplar.filtered_attributes,
+                ))
+            })
+            .sum(),
+    )
+}
+
+fn estimated_metric_value_bytes(value: &MetricValue) -> usize {
+    match value {
+        MetricValue::Gauge(_) | MetricValue::Sum(_) => 0,
+        MetricValue::ExplicitHistogram(value) => {
+            estimated_arc_vec_storage::<HistogramCount>(value.bucket_counts.capacity())
+                .saturating_add(estimated_arc_vec_storage::<u64>(
+                    value.explicit_bounds_bits.capacity(),
+                ))
+        }
+        MetricValue::ExponentialHistogram(value) => value
+            .positive
+            .as_ref()
+            .map_or(0, estimated_exponential_histogram_bucket_bytes)
+            .saturating_add(
+                value
+                    .negative
+                    .as_ref()
+                    .map_or(0, estimated_exponential_histogram_bucket_bytes),
+            ),
+        MetricValue::Summary(value) => {
+            estimated_arc_vec_storage::<SummaryQuantileValue>(value.quantiles.capacity())
+        }
+    }
+}
+
+fn estimated_exponential_histogram_bucket_bytes(buckets: &ExponentialHistogramBuckets) -> usize {
+    estimated_arc_vec_storage::<HistogramBucketSpan>(buckets.spans.capacity()).saturating_add(
+        estimated_arc_vec_storage::<HistogramCount>(buckets.bucket_counts.capacity()),
+    )
+}
+
+fn same_metric_sample_payload(
+    existing: &DurableMetricPoint,
+    candidate: &DurableMetricPoint,
+) -> bool {
+    existing.value == candidate.value
+        && existing.flags == candidate.flags
+        && existing.exemplars == candidate.exemplars
+        && existing.start_time_unix_nanos == candidate.start_time_unix_nanos
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,8 +447,11 @@ pub fn encode_metric_chunk(points: &[DurableMetricPoint]) -> TelemetryResult<Vec
     let sidecars = encode_metric_sidecars(&sorted)?;
     let sidecar_bytes = rmp_serde::to_vec(&sidecars)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
-    let compressed_sidecars = zstd::bulk::compress(&sidecar_bytes, METRIC_SIDECAR_ZSTD_LEVEL)
-        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    let compressed_sidecars = METRIC_COMPRESSOR.with_borrow_mut(|compressor| {
+        compressor
+            .compress(&sidecar_bytes)
+            .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))
+    })?;
 
     let mut encoded = Vec::new();
     encoded.extend_from_slice(&METRIC_CHUNK_MAGIC);
@@ -419,8 +528,11 @@ pub fn decode_metric_chunk(encoded: &[u8]) -> TelemetryResult<Vec<DurableMetricP
             "trailing metric chunk sections",
         ));
     }
-    let sidecar_bytes = zstd::bulk::decompress(compressed_sidecars, 64 * 1024 * 1024)
-        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric sidecar compression"))?;
+    let sidecar_bytes = METRIC_DECOMPRESSOR.with_borrow_mut(|decompressor| {
+        decompressor
+            .decompress(compressed_sidecars, 64 * 1024 * 1024)
+            .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric sidecar compression"))
+    })?;
     let sidecars: MetricChunkSidecars = rmp_serde::from_slice(&sidecar_bytes)
         .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric sidecars"))?;
     if sidecars.points.len() != count || sidecars.identity.fingerprint() != expected_fingerprint {
@@ -894,8 +1006,11 @@ fn decode_double_value_lane(encoded: &[u8], count: usize) -> TelemetryResult<Vec
 fn encode_zstd_value_lane<T: Serialize>(codec: u8, values: &[T]) -> TelemetryResult<Vec<u8>> {
     let raw = rmp_serde::to_vec(values)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
-    let compressed = zstd::bulk::compress(&raw, METRIC_SIDECAR_ZSTD_LEVEL)
-        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    let compressed = METRIC_COMPRESSOR.with_borrow_mut(|compressor| {
+        compressor
+            .compress(&raw)
+            .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))
+    })?;
     let mut encoded = Vec::with_capacity(5 + compressed.len());
     encoded.push(codec);
     encoded.extend_from_slice(
@@ -922,8 +1037,11 @@ fn decode_zstd_value_lane<T: for<'de> Deserialize<'de>>(
             "metric value lane exceeds safety limit",
         ));
     }
-    let raw = zstd::bulk::decompress(&encoded[4..], raw_len)
-        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric value compression"))?;
+    let raw = METRIC_DECOMPRESSOR.with_borrow_mut(|decompressor| {
+        decompressor
+            .decompress(&encoded[4..], raw_len)
+            .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric value compression"))
+    })?;
     let values: Vec<T> = rmp_serde::from_slice(&raw)
         .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric value lane"))?;
     if values.len() != count {
@@ -1437,14 +1555,13 @@ struct SealedMetricChunk {
 
 #[derive(Debug)]
 struct CachedDecodedMetricChunk {
-    resident_id: u64,
     estimated_bytes: usize,
     points: Arc<[DurableMetricPoint]>,
 }
 
 #[derive(Debug)]
 struct DecodedMetricCache {
-    slots: Vec<Option<CachedDecodedMetricChunk>>,
+    chunks: HashMap<u64, CachedDecodedMetricChunk>,
     max_bytes: usize,
     used_bytes: usize,
     hits: u64,
@@ -1454,9 +1571,7 @@ struct DecodedMetricCache {
 impl DecodedMetricCache {
     fn new(max_bytes: usize) -> Self {
         Self {
-            slots: std::iter::repeat_with(|| None)
-                .take(DECODED_METRIC_CACHE_ENTRIES)
-                .collect(),
+            chunks: HashMap::new(),
             max_bytes,
             used_bytes: 0,
             hits: 0,
@@ -1465,10 +1580,7 @@ impl DecodedMetricCache {
     }
 
     fn get(&mut self, resident_id: u64) -> Option<Arc<[DurableMetricPoint]>> {
-        let slot = resident_id as usize & (DECODED_METRIC_CACHE_ENTRIES - 1);
-        if let Some(cached) = &self.slots[slot]
-            && cached.resident_id == resident_id
-        {
+        if let Some(cached) = self.chunks.get(&resident_id) {
             self.hits = self.hits.saturating_add(1);
             return Some(Arc::clone(&cached.points));
         }
@@ -1485,34 +1597,34 @@ impl DecodedMetricCache {
         if estimated_bytes > self.max_bytes {
             return;
         }
-        let slot = resident_id as usize & (DECODED_METRIC_CACHE_ENTRIES - 1);
-        if let Some(previous) = self.slots[slot].take() {
+        if let Some(previous) = self.chunks.remove(&resident_id) {
             self.used_bytes = self.used_bytes.saturating_sub(previous.estimated_bytes);
         }
-        while self.used_bytes.saturating_add(estimated_bytes) > self.max_bytes {
-            let Some(index) = self.slots.iter().position(Option::is_some) else {
+        while self.used_bytes.saturating_add(estimated_bytes) > self.max_bytes
+            || self.chunks.len() >= DECODED_METRIC_CACHE_ENTRIES
+        {
+            let Some(evicted_id) = self.chunks.keys().next().copied() else {
                 break;
             };
-            let previous = self.slots[index]
-                .take()
-                .expect("position selected an occupied metric cache slot");
+            let previous = self
+                .chunks
+                .remove(&evicted_id)
+                .expect("selected metric cache entry was present");
             self.used_bytes = self.used_bytes.saturating_sub(previous.estimated_bytes);
         }
         self.used_bytes = self.used_bytes.saturating_add(estimated_bytes);
-        self.slots[slot] = Some(CachedDecodedMetricChunk {
+        self.chunks.insert(
             resident_id,
-            estimated_bytes,
-            points,
-        });
+            CachedDecodedMetricChunk {
+                estimated_bytes,
+                points,
+            },
+        );
     }
 
     fn remove(&mut self, resident_ids: &[u64]) {
-        for slot in &mut self.slots {
-            if slot
-                .as_ref()
-                .is_some_and(|cached| resident_ids.contains(&cached.resident_id))
-            {
-                let removed = slot.take().expect("cache slot was occupied");
+        for resident_id in resident_ids {
+            if let Some(removed) = self.chunks.remove(resident_id) {
                 self.used_bytes = self.used_bytes.saturating_sub(removed.estimated_bytes);
             }
         }
@@ -1585,6 +1697,17 @@ impl MetricStripe {
         point: DurableMetricPoint,
         protocol: MetricIngestProtocol,
     ) -> TelemetryResult<MetricApplyOutcome> {
+        self.apply_ref(&point, protocol)
+    }
+
+    /// Applies a borrowed durable metric point, cloning it only when it is
+    /// accepted into the mutable series head. This avoids copying duplicate
+    /// and obsolete retries on the durable sink path.
+    pub fn apply_ref(
+        &mut self,
+        point: &DurableMetricPoint,
+        protocol: MetricIngestProtocol,
+    ) -> TelemetryResult<MetricApplyOutcome> {
         if point.record_ref.signal != TelemetrySignal::Metrics {
             return Err(TelemetryError::InvalidBlockEncoding(
                 "non-metric record applied to metric stripe",
@@ -1632,8 +1755,10 @@ impl MetricStripe {
             ));
         }
         self.recovered_accumulators.remove(&fingerprint);
+        // Keep decoded sealed chunks alive across the mutable head update, but
+        // avoid cloning every matching point just to inspect conflict metadata.
         let sealed_same_timestamp =
-            self.sealed_points_at(fingerprint, point.timestamp_unix_nanos)?;
+            self.sealed_chunks_at(fingerprint, point.timestamp_unix_nanos)?;
         let (outcome, should_seal) = {
             let head = self
                 .series
@@ -1661,32 +1786,43 @@ impl MetricStripe {
                     "metric point exceeds the 10 minute out-of-order window".into(),
                 ));
             }
-            let mut same_timestamp = head
+            let mut head_timestamp_keys = head
                 .points
                 .range(
                     (point.timestamp_unix_nanos, LogicalOffset::new(0))
                         ..=(point.timestamp_unix_nanos, LogicalOffset::new(u64::MAX)),
                 )
-                .map(|(key, value)| (*key, value.clone()))
+                .map(|(key, _)| *key)
                 .collect::<Vec<_>>();
-            same_timestamp.extend(sealed_same_timestamp.into_iter().map(|existing| {
-                (
-                    (existing.timestamp_unix_nanos, existing.record_ref.offset),
-                    existing,
-                )
-            }));
-            if same_timestamp.iter().any(|(_, existing)| {
-                existing.value == point.value
-                    && existing.flags == point.flags
-                    && existing.exemplars == point.exemplars
-                    && existing.start_time_unix_nanos == point.start_time_unix_nanos
-            }) {
+            let mut winner_offset: Option<LogicalOffset> = None;
+            let mut duplicate = false;
+            for key in &head_timestamp_keys {
+                let existing = head
+                    .points
+                    .get(key)
+                    .expect("metric timestamp key is present");
+                duplicate |= same_metric_sample_payload(existing, point);
+                winner_offset = Some(match winner_offset {
+                    Some(winner) => winner.max(existing.record_ref.offset),
+                    None => existing.record_ref.offset,
+                });
+            }
+            for decoded in &sealed_same_timestamp {
+                for existing in decoded
+                    .iter()
+                    .filter(|existing| existing.timestamp_unix_nanos == point.timestamp_unix_nanos)
+                {
+                    duplicate |= same_metric_sample_payload(existing, point);
+                    winner_offset = Some(match winner_offset {
+                        Some(winner) => winner.max(existing.record_ref.offset),
+                        None => existing.record_ref.offset,
+                    });
+                }
+            }
+            if duplicate {
                 return Ok(MetricApplyOutcome::Duplicate);
             }
-            if let Some((_, winner)) = same_timestamp
-                .iter()
-                .max_by_key(|(_, existing)| existing.record_ref.offset)
-            {
+            if let Some(winner_offset) = winner_offset {
                 if protocol == MetricIngestProtocol::RemoteWrite {
                     return Err(TelemetryError::MetricSampleConflict {
                         series: fingerprint.get(),
@@ -1694,11 +1830,11 @@ impl MetricStripe {
                     });
                 }
                 head.conflicts = head.conflicts.saturating_add(1);
-                if winner.record_ref.offset >= point.record_ref.offset {
+                if winner_offset >= point.record_ref.offset {
                     return Ok(MetricApplyOutcome::Obsolete);
                 }
-                for (key, _) in &same_timestamp {
-                    if let Some(removed) = head.points.remove(key) {
+                for key in head_timestamp_keys.drain(..) {
+                    if let Some(removed) = head.points.remove(&key) {
                         let bytes = removed.estimated_head_bytes();
                         head.bytes = head.bytes.saturating_sub(bytes);
                         self.head_bytes = self.head_bytes.saturating_sub(bytes);
@@ -1706,7 +1842,7 @@ impl MetricStripe {
                 }
             }
             let out_of_order = point.timestamp_unix_nanos < head.latest_timestamp;
-            let outcome = if same_timestamp.is_empty() {
+            let outcome = if winner_offset.is_none() {
                 if out_of_order {
                     MetricApplyOutcome::OutOfOrder
                 } else {
@@ -1716,11 +1852,13 @@ impl MetricStripe {
                 MetricApplyOutcome::Replaced
             };
             head.latest_timestamp = head.latest_timestamp.max(point.timestamp_unix_nanos);
-            update_accumulator(head, &point);
+            update_accumulator(head, point);
             head.bytes = head.bytes.saturating_add(estimated);
             self.head_bytes = self.head_bytes.saturating_add(estimated);
-            head.points
-                .insert((point.timestamp_unix_nanos, point.record_ref.offset), point);
+            head.points.insert(
+                (point.timestamp_unix_nanos, point.record_ref.offset),
+                point.clone(),
+            );
             let should_seal = head.points.len() >= self.chunk_points
                 || head.bytes >= self.chunk_bytes
                 || head
@@ -1861,43 +1999,32 @@ impl MetricStripe {
         }
         let mut winners = BTreeMap::<(SeriesFingerprint, u64), DurableMetricPoint>::new();
         let candidates = self.query_candidates(query);
-        for (series, head) in &self.series {
-            if candidates
-                .as_ref()
-                .is_some_and(|values| !values.contains(series))
-                || query.series.is_some_and(|requested| requested != *series)
-                || head.identity.tenant != query.tenant
-                || query
-                    .name
-                    .as_ref()
-                    .is_some_and(|name| name.as_ref() != head.identity.name.as_ref())
-            {
-                continue;
-            }
-            for point in head
-                .points
-                .values()
-                .filter(|point| metric_query_matches(query, point))
-            {
-                retain_metric_winner(&mut winners, *series, point.clone());
-            }
-        }
-        for (series, chunks) in &self.chunks {
-            if candidates
-                .as_ref()
-                .is_some_and(|values| !values.contains(series))
-                || query.series.is_some_and(|requested| requested != *series)
-            {
-                continue;
-            }
-            for chunk in chunks {
-                let decoded = self.decode_chunk(chunk)?;
-                for point in decoded
-                    .iter()
-                    .filter(|point| metric_query_matches(query, point))
+        if let Some(candidates) = candidates {
+            for series in candidates {
+                let Some(head) = self.series.get(&series) else {
+                    continue;
+                };
+                if head.identity.tenant != query.tenant
+                    || query
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| name.as_ref() != head.identity.name.as_ref())
                 {
-                    retain_metric_winner(&mut winners, *series, point.clone());
+                    continue;
                 }
+                self.collect_metric_series_matches(query, series, head, &mut winners)?;
+            }
+        } else {
+            for (series, head) in &self.series {
+                if head.identity.tenant != query.tenant
+                    || query
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| name.as_ref() != head.identity.name.as_ref())
+                {
+                    continue;
+                }
+                self.collect_metric_series_matches(query, *series, head, &mut winners)?;
             }
         }
         let mut points = winners
@@ -1913,6 +2040,89 @@ impl MetricStripe {
         }
         points.truncate(limit);
         Ok(points)
+    }
+
+    /// Queries a bounded set of exact timestamps for one series without
+    /// materializing unrelated points in the surrounding time range.
+    pub(crate) fn query_exact_timestamps(
+        &self,
+        query: &MetricQuery,
+        timestamps: &[u64],
+    ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        let Some(series) = query.series else {
+            return Ok(Vec::new());
+        };
+        if timestamps.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(head) = self.series.get(&series) else {
+            return Ok(Vec::new());
+        };
+        if !metric_identity_matches(query, &head.identity) {
+            return Ok(Vec::new());
+        }
+        let mut winners = BTreeMap::<u64, DurableMetricPoint>::new();
+        for chunk in self
+            .chunks
+            .get(&series)
+            .into_iter()
+            .flatten()
+            .filter(|chunk| timestamps_intersect_chunk(timestamps, chunk))
+        {
+            let decoded = self.decode_chunk(chunk)?;
+            for point in decoded.iter().filter(|point| {
+                metric_exact_series_point_matches(query, point)
+                    && timestamps
+                        .binary_search(&point.timestamp_unix_nanos)
+                        .is_ok()
+            }) {
+                retain_exact_metric_winner(&mut winners, point.clone());
+            }
+        }
+        for point in head.points.values().filter(|point| {
+            metric_exact_series_point_matches(query, point)
+                && timestamps
+                    .binary_search(&point.timestamp_unix_nanos)
+                    .is_ok()
+        }) {
+            retain_exact_metric_winner(&mut winners, point.clone());
+        }
+        Ok(winners.into_values().collect())
+    }
+
+    fn collect_metric_series_matches(
+        &self,
+        query: &MetricQuery,
+        series: SeriesFingerprint,
+        head: &SeriesHead,
+        winners: &mut BTreeMap<(SeriesFingerprint, u64), DurableMetricPoint>,
+    ) -> TelemetryResult<()> {
+        for point in head
+            .points
+            .values()
+            .filter(|point| metric_exact_series_point_matches(query, point))
+        {
+            retain_metric_winner(winners, series, point.clone());
+        }
+        for chunk in self.chunks.get(&series).into_iter().flatten() {
+            if query
+                .start_time_unix_nanos
+                .is_some_and(|start| chunk.max_timestamp_unix_nanos < start)
+                || query
+                    .end_time_unix_nanos
+                    .is_some_and(|end| chunk.min_timestamp_unix_nanos > end)
+            {
+                continue;
+            }
+            let decoded = self.decode_chunk(chunk)?;
+            for point in decoded
+                .iter()
+                .filter(|point| metric_exact_series_point_matches(query, point))
+            {
+                retain_metric_winner(winners, series, point.clone());
+            }
+        }
+        Ok(())
     }
 
     fn query_exact_series(
@@ -1974,7 +2184,7 @@ impl MetricStripe {
                     for point in head
                         .points
                         .values()
-                        .filter(|point| metric_query_matches(query, point))
+                        .filter(|point| metric_exact_series_point_matches(query, point))
                     {
                         retain_exact_metric_winner(&mut winners, point.clone());
                     }
@@ -1983,7 +2193,7 @@ impl MetricStripe {
                     let decoded = self.decode_chunk(chunk)?;
                     for point in decoded
                         .iter()
-                        .filter(|point| metric_query_matches(query, point))
+                        .filter(|point| metric_exact_series_point_matches(query, point))
                     {
                         retain_exact_metric_winner(&mut winners, point.clone());
                     }
@@ -2013,7 +2223,7 @@ impl MetricStripe {
             let decoded = self.decode_chunk(chunk)?;
             for point in decoded
                 .iter()
-                .filter(|point| metric_query_matches(query, point))
+                .filter(|point| metric_exact_series_point_matches(query, point))
             {
                 retain_exact_metric_winner(&mut winners, point.clone());
             }
@@ -2021,7 +2231,7 @@ impl MetricStripe {
         for point in head
             .points
             .values()
-            .filter(|point| metric_query_matches(query, point))
+            .filter(|point| metric_exact_series_point_matches(query, point))
         {
             retain_exact_metric_winner(&mut winners, point.clone());
         }
@@ -2065,7 +2275,30 @@ impl MetricStripe {
         head: &SeriesHead,
         limit: usize,
     ) -> TelemetryResult<Vec<DurableMetricPoint>> {
-        let mut selected = Vec::with_capacity(limit.min(4_096));
+        let chunks = self.chunks.get(&series).into_iter().flatten();
+        let unbounded = query.partition.is_none()
+            && query.start_offset.is_none()
+            && query.start_time_unix_nanos.is_none()
+            && query.end_time_unix_nanos.is_none();
+        let initial_capacity = if self.chunks.get(&series).is_none_or(Vec::is_empty) {
+            limit.min(head.points.len())
+        } else {
+            limit.min(head.points.len().saturating_add(4_096))
+        };
+        let mut selected = Vec::with_capacity(initial_capacity);
+        if unbounded {
+            for chunk in chunks {
+                let decoded = self.decode_chunk(chunk)?;
+                let remaining = limit.saturating_sub(selected.len());
+                selected.extend(decoded.iter().take(remaining).cloned());
+                if selected.len() == limit {
+                    return Ok(selected);
+                }
+            }
+            let remaining = limit.saturating_sub(selected.len());
+            selected.extend(head.points.values().take(remaining).cloned());
+            return Ok(selected);
+        }
         for chunk in self.chunks.get(&series).into_iter().flatten() {
             if query
                 .start_time_unix_nanos
@@ -2079,7 +2312,7 @@ impl MetricStripe {
             let decoded = self.decode_chunk(chunk)?;
             for point in decoded
                 .iter()
-                .filter(|point| metric_query_matches(query, point))
+                .filter(|point| metric_exact_series_point_matches(query, point))
             {
                 selected.push(point.clone());
                 if selected.len() == limit {
@@ -2090,7 +2323,7 @@ impl MetricStripe {
         for point in head
             .points
             .values()
-            .filter(|point| metric_query_matches(query, point))
+            .filter(|point| metric_exact_series_point_matches(query, point))
         {
             selected.push(point.clone());
             if selected.len() == limit {
@@ -2120,12 +2353,12 @@ impl MetricStripe {
         Ok(points)
     }
 
-    fn sealed_points_at(
+    fn sealed_chunks_at(
         &self,
         series: SeriesFingerprint,
         timestamp_unix_nanos: u64,
-    ) -> TelemetryResult<Vec<DurableMetricPoint>> {
-        let mut points = Vec::new();
+    ) -> TelemetryResult<Vec<Arc<[DurableMetricPoint]>>> {
+        let mut chunks = Vec::new();
         for chunk in self
             .chunks
             .get(&series)
@@ -2136,15 +2369,9 @@ impl MetricStripe {
                     && timestamp_unix_nanos <= chunk.max_timestamp_unix_nanos
             })
         {
-            let decoded = self.decode_chunk(chunk)?;
-            points.extend(
-                decoded
-                    .iter()
-                    .filter(|point| point.timestamp_unix_nanos == timestamp_unix_nanos)
-                    .cloned(),
-            );
+            chunks.push(self.decode_chunk(chunk)?);
         }
-        Ok(points)
+        Ok(chunks)
     }
 
     fn query_candidates(&self, query: &MetricQuery) -> Option<HashSet<SeriesFingerprint>> {
@@ -2360,6 +2587,23 @@ fn metric_point_time_matches(query: &MetricQuery, point: &DurableMetricPoint) ->
         && query
             .end_time_unix_nanos
             .is_none_or(|end| point.timestamp_unix_nanos <= end)
+}
+
+#[inline]
+pub(crate) fn metric_exact_series_point_matches(
+    query: &MetricQuery,
+    point: &DurableMetricPoint,
+) -> bool {
+    query
+        .partition
+        .is_none_or(|partition| partition == point.record_ref.topic_partition)
+        && metric_point_time_matches(query, point)
+}
+
+fn timestamps_intersect_chunk(timestamps: &[u64], chunk: &SealedMetricChunk) -> bool {
+    timestamps
+        .get(timestamps.partition_point(|timestamp| *timestamp < chunk.min_timestamp_unix_nanos))
+        .is_some_and(|timestamp| *timestamp <= chunk.max_timestamp_unix_nanos)
 }
 
 /// Native metric selector used by PromQL storage scans and direct APIs.
@@ -2674,6 +2918,78 @@ mod tests {
         assert!(cache.hits > 0);
         assert!(cache.misses > 0);
         assert!(cache.used_bytes <= cache.max_bytes);
+    }
+
+    #[test]
+    fn decoded_metric_cache_retains_a_series_working_set() {
+        let mut stripe = MetricStripe::new(64 * 1024 * 1024).unwrap();
+        stripe.chunk_points = 1;
+        let first = point(1, 100, NumberValue::Integer(1));
+        let series = first.series_fingerprint();
+        stripe.apply(first, MetricIngestProtocol::Otlp).unwrap();
+        for offset in 2..=257 {
+            stripe
+                .apply(
+                    point(offset, 100 + offset, NumberValue::Integer(offset as i64)),
+                    MetricIngestProtocol::Otlp,
+                )
+                .unwrap();
+        }
+
+        let query = MetricQuery {
+            tenant: Arc::from("tenant-a"),
+            series: Some(series),
+            limit: usize::MAX,
+            ..MetricQuery::default()
+        };
+        assert_eq!(stripe.query(&query).unwrap().len(), 257);
+        let warmed_misses = stripe.decoded_chunks.borrow().misses;
+        assert_eq!(warmed_misses, 257);
+
+        assert_eq!(stripe.query(&query).unwrap().len(), 257);
+        let cache = stripe.decoded_chunks.borrow();
+        assert_eq!(cache.misses, warmed_misses);
+        assert!(cache.hits >= 257);
+    }
+
+    #[test]
+    fn exact_timestamp_query_skips_unrequested_points_and_keeps_winners() {
+        let mut stripe = MetricStripe::new(1024 * 1024).unwrap();
+        stripe.chunk_points = 2;
+        let first = point(1, 100, NumberValue::Integer(1));
+        let series = first.series_fingerprint();
+        for value in [
+            first.clone(),
+            point(2, 200, NumberValue::Integer(2)),
+            point(3, 300, NumberValue::Integer(3)),
+            point(4, 400, NumberValue::Integer(4)),
+        ] {
+            stripe.apply(value, MetricIngestProtocol::Otlp).unwrap();
+        }
+        let replacement = point(5, 300, NumberValue::Integer(9));
+        assert_eq!(
+            stripe
+                .apply(replacement.clone(), MetricIngestProtocol::Otlp)
+                .unwrap(),
+            MetricApplyOutcome::Replaced
+        );
+
+        let queried = stripe
+            .query_exact_timestamps(
+                &MetricQuery {
+                    tenant: Arc::from("tenant-a"),
+                    partition: Some(first.record_ref.topic_partition),
+                    series: Some(series),
+                    ..MetricQuery::default()
+                },
+                &[100, 300],
+            )
+            .unwrap();
+        assert_eq!(
+            queried,
+            vec![first, replacement],
+            "the exact probe must omit timestamp 200 and 400"
+        );
     }
 
     #[test]

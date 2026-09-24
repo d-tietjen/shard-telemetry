@@ -5,8 +5,8 @@ use std::sync::Arc;
 use axum::serve::ListenerExt;
 use clap::Parser;
 use shard_telemetry::{
-    DurableTelemetryConfig, DurableTelemetryStore, LokiApiConfig, NativeServerConfig,
-    ObjectTierConfig, OtlpIngestService, OtlpReceiverConfig, ProductionRuntime,
+    DurableTelemetryConfig, DurableTelemetryLimits, DurableTelemetryStore, LokiApiConfig,
+    NativeServerConfig, ObjectTierConfig, OtlpIngestService, OtlpReceiverConfig, ProductionRuntime,
     PrometheusApiConfig, PrometheusService, S3ObjectStoreConfig, ServiceLifecycle,
     ShardTelemetryConfig, SignalConfig, SingleTenantConfig, StripeConfig, TempoApiConfig,
     TempoService, loki_router, loki_router_with_clickhouse, otlp_http_router, prometheus_router,
@@ -77,8 +77,15 @@ struct Arguments {
     #[arg(long, default_value_t = 1_800)]
     object_store_writer_lease_seconds: u64,
     /// Retain a duplicate raw-payload journal to accelerate hot-index recovery.
-    #[arg(long, default_value_t = false)]
+    ///
+    /// Enabled by default because it reduces restart recovery time substantially.
+    /// Use `--no-recovery-journal` when append throughput and storage are more
+    /// important than restart latency.
+    #[arg(long, default_value_t = true)]
     recovery_journal: bool,
+    /// Disable the default hot-index recovery journal.
+    #[arg(long, default_value_t = false)]
+    no_recovery_journal: bool,
     /// Retain logs, traces, and metrics for this many seconds; zero is indefinite.
     #[arg(long, default_value_t = 0)]
     retention_seconds: u64,
@@ -88,6 +95,10 @@ struct Arguments {
     /// Number of physical owner stripes.
     #[arg(long, default_value_t = 16)]
     shards: u32,
+    /// Tokio async worker threads. Defaults to the shard count capped at the
+    /// host's available parallelism.
+    #[arg(long)]
+    runtime_worker_threads: Option<usize>,
     /// Stable tenant partitions spread over physical stripes.
     #[arg(long, default_value_t = 256)]
     tenant_partitions: u32,
@@ -137,9 +148,85 @@ struct Arguments {
     flush_timeout_seconds: u64,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+const MAX_BLOCKING_WORKER_THREADS: usize = 64;
+const MAX_APPEND_SUBMISSION_WORKER_THREADS: usize = 64;
+const MAX_DURABLE_SINK_WORKER_THREADS: usize = 256;
+const MIN_OBJECT_STORE_WORKER_THREADS: usize = 4;
+const MAX_OBJECT_STORE_WORKER_THREADS: usize = 64;
+
+fn runtime_worker_threads(
+    shards: u32,
+    configured: Option<usize>,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(configured) = configured {
+        if configured == 0 {
+            return Err("--runtime-worker-threads must be nonzero".into());
+        }
+        return Ok(configured);
+    }
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    Ok(usize::try_from(shards)
+        .unwrap_or(available)
+        .clamp(1, available))
+}
+
+fn blocking_worker_threads(shards: u32, runtime_workers: usize) -> usize {
+    let shard_budget = usize::try_from(shards)
+        .unwrap_or(MAX_BLOCKING_WORKER_THREADS)
+        .saturating_mul(4);
+    runtime_workers
+        // Append tasks synchronously wait for shard-stream's WAL lane and
+        // durable sink checkpoint. Keep enough blocking capacity to overlap
+        // those waits across the physical owner stripes.
+        .saturating_mul(4)
+        .clamp(8, MAX_BLOCKING_WORKER_THREADS)
+        .min(shard_budget.max(8))
+}
+
+fn object_store_worker_threads(runtime_workers: usize) -> usize {
+    runtime_workers.clamp(
+        MIN_OBJECT_STORE_WORKER_THREADS,
+        MAX_OBJECT_STORE_WORKER_THREADS,
+    )
+}
+
+#[cfg(feature = "dial9")]
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let arguments = Arguments::parse();
+    let worker_threads =
+        runtime_worker_threads(arguments.shards, arguments.runtime_worker_threads)?;
+    let blocking_threads = blocking_worker_threads(arguments.shards, worker_threads);
+    let (recorder, runtime) = dial9::recorder_from_env_with(move |builder| {
+        builder
+            .worker_threads(worker_threads)
+            .max_blocking_threads(blocking_threads);
+    })?;
+    let result = dial9::block_on(&runtime, run(arguments, worker_threads));
+    drop(runtime);
+    recorder.graceful_shutdown(std::time::Duration::from_secs(1));
+    result
+}
+
+#[cfg(not(feature = "dial9"))]
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let arguments = Arguments::parse();
+    let worker_threads =
+        runtime_worker_threads(arguments.shards, arguments.runtime_worker_threads)?;
+    let blocking_threads = blocking_worker_threads(arguments.shards, worker_threads);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(blocking_threads)
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(arguments, worker_threads))
+}
+
+async fn run(
+    arguments: Arguments,
+    worker_threads: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if arguments.max_query_limit == 0 {
         return Err("--max-query-limit must be nonzero".into());
     }
@@ -259,24 +346,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
     let native_listener = tokio::net::TcpListener::bind(arguments.native_listen).await?;
     let otlp_http_listener = tokio::net::TcpListener::bind(arguments.otlp_http_listen).await?;
-    let store = Arc::new(DurableTelemetryStore::open_with_object_tier_config(
-        DurableTelemetryConfig {
-            data_directory: arguments.data_directory,
-            object_store_directory: arguments.object_store_directory,
-            s3_object_store,
-            recovery_journal: arguments.recovery_journal,
-            retention: (arguments.retention_seconds > 0)
-                .then(|| std::time::Duration::from_secs(arguments.retention_seconds)),
-            shard_count: arguments.shards,
-            tenant_partitions: arguments.tenant_partitions,
-            append_linger: std::time::Duration::from_micros(arguments.append_linger_micros),
-            stripe: StripeConfig::default(),
-            indexed_ack_timeout: std::time::Duration::from_secs(
-                arguments.indexed_ack_timeout_seconds,
-            ),
-        },
-        object_tier_config,
-    )?);
+    let storage_limits = DurableTelemetryLimits {
+        append_submission_threads: Some(worker_threads.min(MAX_APPEND_SUBMISSION_WORKER_THREADS)),
+        durable_sink_threads: Some(worker_threads.min(MAX_DURABLE_SINK_WORKER_THREADS)),
+        object_store_threads: Some(object_store_worker_threads(worker_threads)),
+        ..DurableTelemetryLimits::default()
+    };
+    let store = Arc::new(
+        DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+            DurableTelemetryConfig {
+                data_directory: arguments.data_directory,
+                object_store_directory: arguments.object_store_directory,
+                s3_object_store,
+                recovery_journal: arguments.recovery_journal && !arguments.no_recovery_journal,
+                retention: (arguments.retention_seconds > 0)
+                    .then(|| std::time::Duration::from_secs(arguments.retention_seconds)),
+                shard_count: arguments.shards,
+                tenant_partitions: arguments.tenant_partitions,
+                append_linger: std::time::Duration::from_micros(arguments.append_linger_micros),
+                stripe: StripeConfig::default(),
+                indexed_ack_timeout: std::time::Duration::from_secs(
+                    arguments.indexed_ack_timeout_seconds,
+                ),
+            },
+            object_tier_config,
+            storage_limits,
+        )?,
+    );
     let api_config = LokiApiConfig {
         default_tenant: Arc::from(arguments.default_tenant.as_str()),
         max_query_limit: arguments.max_query_limit,
@@ -286,6 +382,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(std::num::NonZeroU16::new)
         .ok_or("--tenant-partitions must be in 1..=65535")?;
+    let physical_stripes = std::num::NonZeroU16::new(
+        u16::try_from(arguments.shards).map_err(|_| "--shards must be in 1..=65535")?,
+    )
+    .ok_or("--shards must be nonzero")?;
     let otlp_service = OtlpIngestService::new(
         Arc::clone(&store),
         OtlpReceiverConfig {
@@ -293,14 +393,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             signals: ShardTelemetryConfig {
                 logs: SignalConfig {
                     logical_partitions,
+                    physical_stripes,
                     ..ShardTelemetryConfig::default().logs
                 },
                 traces: SignalConfig {
                     logical_partitions,
+                    physical_stripes,
                     ..ShardTelemetryConfig::default().traces
                 },
                 metrics: SignalConfig {
                     logical_partitions,
+                    physical_stripes,
                     ..ShardTelemetryConfig::default().metrics
                 },
                 ..ShardTelemetryConfig::default()
@@ -501,7 +604,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn read_secret(
     path: &std::path::Path,
     purpose: &str,
-) -> Result<Arc<str>, Box<dyn std::error::Error>> {
+) -> Result<Arc<str>, Box<dyn std::error::Error + Send + Sync>> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() {
         return Err(format!("{purpose} token path {} is not a file", path.display()).into());
@@ -535,5 +638,27 @@ async fn shutdown_signal() {
     tokio::select! {
         () = interrupt => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{blocking_worker_threads, object_store_worker_threads};
+
+    #[test]
+    fn blocking_worker_budget_tracks_runtime_and_shards() {
+        assert_eq!(blocking_worker_threads(1, 1), 8);
+        assert_eq!(blocking_worker_threads(4, 4), 16);
+        assert_eq!(blocking_worker_threads(16, 4), 16);
+        assert_eq!(blocking_worker_threads(16, 16), 64);
+        assert_eq!(blocking_worker_threads(256, 64), 64);
+    }
+
+    #[test]
+    fn object_store_worker_budget_tracks_runtime_budget() {
+        assert_eq!(object_store_worker_threads(1), 4);
+        assert_eq!(object_store_worker_threads(4), 4);
+        assert_eq!(object_store_worker_threads(16), 16);
+        assert_eq!(object_store_worker_threads(128), 64);
     }
 }

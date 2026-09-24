@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use foldhash::{HashMap, HashMapExt};
 use opentelemetry_proto::tonic::{
     collector::{metrics::v1::ExportMetricsServiceRequest, trace::v1::ExportTraceServiceRequest},
     common::v1::KeyValue,
@@ -64,6 +65,7 @@ impl OtlpSpanEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtlpMetricEvent {
     point: DurableMetricPoint,
+    fingerprint: crate::SeriesFingerprint,
 }
 
 impl OtlpMetricEvent {
@@ -77,13 +79,14 @@ impl OtlpMetricEvent {
                 "metric event requires the metrics signal, tenant, and name".into(),
             ));
         }
-        Ok(Self { point })
+        let fingerprint = point.series_fingerprint();
+        Ok(Self { point, fingerprint })
     }
 
     /// Returns the canonical series fingerprint used for routing.
     #[must_use]
     pub fn series_fingerprint(&self) -> crate::SeriesFingerprint {
-        self.point.series_fingerprint()
+        self.fingerprint
     }
 
     /// Returns the authenticated tenant.
@@ -121,14 +124,31 @@ impl OtlpTelemetryDecoder {
         tenant: &str,
         payload: &[u8],
     ) -> TelemetryResult<Vec<OtlpSpanEvent>> {
+        let request = ExportTraceServiceRequest::decode(payload)
+            .map_err(|error| TelemetryError::InvalidOtlpPayload(error.to_string()))?;
+        self.decode_trace_request(tenant, &request)
+    }
+
+    /// Decodes an already parsed OTLP trace request without a protobuf
+    /// encode/decode round trip.
+    pub(crate) fn decode_trace_request(
+        &self,
+        tenant: &str,
+        request: &ExportTraceServiceRequest,
+    ) -> TelemetryResult<Vec<OtlpSpanEvent>> {
         if tenant.is_empty() {
             return Err(TelemetryError::InvalidOtlpPayload(
                 "tenant must not be empty".into(),
             ));
         }
-        let request = ExportTraceServiceRequest::decode(payload)
-            .map_err(|error| TelemetryError::InvalidOtlpPayload(error.to_string()))?;
-        let mut events = Vec::new();
+        let event_count = request
+            .resource_spans
+            .iter()
+            .flat_map(|resource_spans| &resource_spans.scope_spans)
+            .fold(0usize, |count, scope_spans| {
+                count.saturating_add(scope_spans.spans.len())
+            });
+        let mut events = Vec::with_capacity(event_count);
         for resource_spans in &request.resource_spans {
             validate_attributes(
                 resource_spans
@@ -167,14 +187,32 @@ impl OtlpTelemetryDecoder {
         tenant: &str,
         payload: &[u8],
     ) -> TelemetryResult<Vec<OtlpMetricEvent>> {
+        let request = ExportMetricsServiceRequest::decode(payload)
+            .map_err(|error| TelemetryError::InvalidOtlpPayload(error.to_string()))?;
+        self.decode_metric_request(tenant, &request)
+    }
+
+    /// Decodes an already parsed OTLP metrics request without a protobuf
+    /// encode/decode round trip.
+    pub(crate) fn decode_metric_request(
+        &self,
+        tenant: &str,
+        request: &ExportMetricsServiceRequest,
+    ) -> TelemetryResult<Vec<OtlpMetricEvent>> {
         if tenant.is_empty() {
             return Err(TelemetryError::InvalidOtlpPayload(
                 "tenant must not be empty".into(),
             ));
         }
-        let request = ExportMetricsServiceRequest::decode(payload)
-            .map_err(|error| TelemetryError::InvalidOtlpPayload(error.to_string()))?;
-        let mut events = Vec::new();
+        let point_count = request
+            .resource_metrics
+            .iter()
+            .flat_map(|resource_metrics| &resource_metrics.scope_metrics)
+            .flat_map(|scope_metrics| &scope_metrics.metrics)
+            .fold(0usize, |count, metric| {
+                count.saturating_add(metric_point_count(metric))
+            });
+        let mut events = Vec::with_capacity(point_count);
         for resource_metrics in &request.resource_metrics {
             validate_attributes(
                 resource_metrics
@@ -229,6 +267,24 @@ impl OtlpTelemetryDecoder {
         partitions
     }
 
+    /// Groups validated spans without imposing an ordering on the partitions.
+    ///
+    /// The server sorts the resulting appends at the storage boundary, so an
+    /// ordered tree here would only add comparator work and allocations to the
+    /// request hot path.
+    pub(crate) fn partition_traces_unordered(
+        &self,
+        router: &TelemetryRouter,
+        events: Vec<OtlpSpanEvent>,
+    ) -> HashMap<TopicPartition, Vec<OtlpSpanEvent>> {
+        let mut partitions = HashMap::<TopicPartition, Vec<OtlpSpanEvent>>::new();
+        for event in events {
+            let partition = router.trace(event.tenant(), event.trace_id());
+            partitions.entry(partition).or_default().push(event);
+        }
+        partitions
+    }
+
     /// Groups validated metric points by deterministic series partition.
     #[must_use]
     pub fn partition_metrics(
@@ -245,6 +301,41 @@ impl OtlpTelemetryDecoder {
                 .push(event);
         }
         partitions
+    }
+
+    /// Groups validated metric series without imposing an ordering on the
+    /// partitions.
+    ///
+    /// Metric series are sorted by partition and fingerprint immediately
+    /// before append-round construction, which preserves deterministic output
+    /// without paying tree-map costs while decoding the request.
+    pub(crate) fn partition_metrics_unordered(
+        &self,
+        router: &TelemetryRouter,
+        events: Vec<OtlpMetricEvent>,
+    ) -> HashMap<(TopicPartition, crate::SeriesFingerprint), Vec<OtlpMetricEvent>> {
+        let mut partitions =
+            HashMap::<(TopicPartition, crate::SeriesFingerprint), Vec<OtlpMetricEvent>>::new();
+        for event in events {
+            let fingerprint = event.series_fingerprint();
+            let partition = router.metric(event.tenant(), fingerprint);
+            partitions
+                .entry((partition, fingerprint))
+                .or_default()
+                .push(event);
+        }
+        partitions
+    }
+}
+
+fn metric_point_count(metric: &Metric) -> usize {
+    match metric.data.as_ref() {
+        Some(metric::Data::Gauge(gauge)) => gauge.data_points.len(),
+        Some(metric::Data::Sum(sum)) => sum.data_points.len(),
+        Some(metric::Data::Histogram(histogram)) => histogram.data_points.len(),
+        Some(metric::Data::ExponentialHistogram(histogram)) => histogram.data_points.len(),
+        Some(metric::Data::Summary(summary)) => summary.data_points.len(),
+        None => 0,
     }
 }
 
@@ -660,24 +751,22 @@ fn push_point(
         kind,
         point_attributes,
     });
-    output.push(OtlpMetricEvent {
-        point: DurableMetricPoint {
-            stream_shard_id: ShardId::new(0),
-            record_ref: TelemetryRecordRef::for_signal(
-                TelemetrySignal::Metrics,
-                TopicPartition::new(METRICS_TOPIC_ID, LogicalPartitionId::new(0)),
-                LogicalOffset::new(0),
-            ),
-            identity,
-            description: Arc::from(metric.description.as_str()),
-            metadata,
-            start_time_unix_nanos,
-            timestamp_unix_nanos,
-            flags,
-            value,
-            exemplars: Arc::new(decode_exemplars(exemplars)?),
-        },
-    });
+    output.push(OtlpMetricEvent::from_durable(DurableMetricPoint {
+        stream_shard_id: ShardId::new(0),
+        record_ref: TelemetryRecordRef::for_signal(
+            TelemetrySignal::Metrics,
+            TopicPartition::new(METRICS_TOPIC_ID, LogicalPartitionId::new(0)),
+            LogicalOffset::new(0),
+        ),
+        identity,
+        description: Arc::from(metric.description.as_str()),
+        metadata,
+        start_time_unix_nanos,
+        timestamp_unix_nanos,
+        flags,
+        value,
+        exemplars: Arc::new(decode_exemplars(exemplars)?),
+    })?);
     Ok(())
 }
 

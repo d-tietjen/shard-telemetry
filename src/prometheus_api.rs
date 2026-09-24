@@ -660,24 +660,39 @@ async fn remote_write(
         }
         Err(error) => return write_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    let mut protobuf = vec![0_u8; decompressed_len];
-    if let Err(error) = snap::raw::Decoder::new().decompress(&body, &mut protobuf) {
-        return write_error(StatusCode::BAD_REQUEST, &error.to_string());
-    }
-    let decoded = match RemoteWriteDecoder.decode(&service.config.tenant, version, &protobuf) {
-        Ok(decoded) => decoded,
-        Err(error) => return write_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    let tenant = Arc::clone(&service.config.tenant);
+    let router = service.router;
+    let decoded = match tokio::task::spawn_blocking(move || {
+        let mut protobuf = vec![0_u8; decompressed_len];
+        snap::raw::Decoder::new()
+            .decompress(&body, &mut protobuf)
+            .map_err(|error| error.to_string())?;
+        let decoded = RemoteWriteDecoder
+            .decode(&tenant, version, &protobuf)
+            .map_err(|error| error.to_string())?;
+        let stats = decoded.stats;
+        let batch = decoded
+            .into_native_batch(&router)
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>((batch, stats))
+    })
+    .await
+    {
+        Ok(Ok(decoded)) => decoded,
+        Ok(Err(error)) => return write_error(StatusCode::BAD_REQUEST, &error),
+        Err(error) => {
+            return write_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Remote Write decode worker failed: {error}"),
+            );
+        }
     };
-    let stats = decoded.stats;
-    let batch = match decoded.into_native_batch(&service.router) {
-        Ok(batch) => batch,
-        Err(error) => return write_error(StatusCode::BAD_REQUEST, &error.to_string()),
-    };
+    let (batch, stats) = decoded;
     if batch.partitions.is_empty() {
         return write_success(stats);
     }
     let _ingest_permit = match &service.production {
-        Some(runtime) => match runtime.try_ingest(protobuf.len()) {
+        Some(runtime) => match runtime.try_ingest(decompressed_len) {
             Some(permit) => Some(permit),
             None if runtime.lifecycle().state() == ServiceState::Ready => {
                 return write_error(
@@ -700,7 +715,7 @@ async fn remote_write(
         Ok(Ok(_)) => {
             if let Some(runtime) = &service.production {
                 let records = stats.samples.saturating_add(stats.histograms);
-                runtime.record_ingest(protobuf.len(), records as usize);
+                runtime.record_ingest(decompressed_len, records as usize);
             }
             write_success(stats)
         }
@@ -747,13 +762,23 @@ async fn remote_read(
         }
         Err(error) => return write_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    let mut protobuf = vec![0_u8; decompressed_len];
-    if let Err(error) = snap::raw::Decoder::new().decompress(&body, &mut protobuf) {
-        return write_error(StatusCode::BAD_REQUEST, &error.to_string());
-    }
-    let request = match prometheus_v1::ReadRequest::decode(protobuf.as_slice()) {
-        Ok(request) => request,
-        Err(error) => return write_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    let request = match tokio::task::spawn_blocking(move || {
+        let mut protobuf = vec![0_u8; decompressed_len];
+        snap::raw::Decoder::new()
+            .decompress(&body, &mut protobuf)
+            .map_err(|error| error.to_string())?;
+        prometheus_v1::ReadRequest::decode(protobuf.as_slice()).map_err(|error| error.to_string())
+    })
+    .await
+    {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => return write_error(StatusCode::BAD_REQUEST, &error),
+        Err(error) => {
+            return write_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Remote Read decode worker failed: {error}"),
+            );
+        }
     };
     let response_type = if request.accepted_response_types.is_empty() {
         Some(prometheus_v1::ReadRequestResponseType::Samples)
@@ -848,10 +873,22 @@ async fn remote_read(
             );
         }
     };
-    let protobuf = response.encode_to_vec();
-    let compressed = match snap::raw::Encoder::new().compress_vec(&protobuf) {
-        Ok(compressed) => compressed,
-        Err(error) => return write_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    let compressed = match tokio::task::spawn_blocking(move || {
+        let protobuf = response.encode_to_vec();
+        snap::raw::Encoder::new()
+            .compress_vec(&protobuf)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    {
+        Ok(Ok(compressed)) => compressed,
+        Ok(Err(error)) => return write_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        Err(error) => {
+            return write_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Remote Read encode worker failed: {error}"),
+            );
+        }
     };
     (
         StatusCode::OK,

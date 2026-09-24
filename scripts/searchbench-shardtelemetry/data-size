@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+du -sb "${ST_ENGINE_DATA_DIR:?ST_ENGINE_DATA_DIR must be set}/data" | awk '{print $1}'

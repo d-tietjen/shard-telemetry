@@ -2,3 +2,5 @@
 .DS_Store
 .idea/
 benchmark-results/
+bench-results/
+scripts/searchbench-shardtelemetry/__pycache__/

@@ -349,6 +349,116 @@ fn query_keys(query: &CorrelationQuery) -> impl Iterator<Item = CorrelationKey> 
         )
 }
 
+fn correlation_posting_matches(query: &CorrelationQuery, posting: &CorrelationPosting) -> bool {
+    query
+        .signal
+        .is_none_or(|signal| posting.record_ref.signal == signal)
+        && query
+            .start_time_unix_nanos
+            .is_none_or(|start| posting.timestamp_unix_nanos >= start)
+        && query
+            .end_time_unix_nanos
+            .is_none_or(|end| posting.timestamp_unix_nanos <= end)
+}
+
+fn query_single_posting(
+    query: &CorrelationQuery,
+    postings: &[CorrelationPosting],
+    selected: &mut Vec<TelemetryRecordRef>,
+) {
+    let start = query.after.map_or(0, |after| {
+        postings.partition_point(|posting| posting.record_ref <= after)
+    });
+    selected.reserve(query.limit.min(postings.len().saturating_sub(start)));
+    if query.signal.is_none()
+        && query.start_time_unix_nanos.is_none()
+        && query.end_time_unix_nanos.is_none()
+    {
+        selected.extend(
+            postings[start..]
+                .iter()
+                .take(query.limit)
+                .map(|posting| posting.record_ref),
+        );
+        return;
+    }
+    for posting in &postings[start..] {
+        if correlation_posting_matches(query, posting) {
+            selected.push(posting.record_ref);
+            if selected.len() == query.limit {
+                break;
+            }
+        }
+    }
+}
+
+fn query_two_postings(
+    query: &CorrelationQuery,
+    left: &[CorrelationPosting],
+    right: &[CorrelationPosting],
+    selected: &mut Vec<TelemetryRecordRef>,
+) {
+    let (first, incoming) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let start = query.after.map_or(0, |after| {
+        first.partition_point(|posting| posting.record_ref <= after)
+    });
+    let mut incoming_cursor = query.after.map_or(0, |after| {
+        incoming.partition_point(|posting| posting.record_ref <= after)
+    });
+    selected.reserve(query.limit.min(first.len().saturating_sub(start)));
+    if query.signal.is_none()
+        && query.start_time_unix_nanos.is_none()
+        && query.end_time_unix_nanos.is_none()
+    {
+        for posting in &first[start..] {
+            let record = posting.record_ref;
+            while incoming
+                .get(incoming_cursor)
+                .is_some_and(|current| current.record_ref < record)
+            {
+                incoming_cursor += 1;
+            }
+            if incoming
+                .get(incoming_cursor)
+                .is_none_or(|current| current.record_ref != record)
+            {
+                continue;
+            }
+            selected.push(record);
+            if selected.len() == query.limit {
+                break;
+            }
+        }
+        return;
+    }
+    for posting in &first[start..] {
+        if !correlation_posting_matches(query, posting) {
+            continue;
+        }
+        let record = posting.record_ref;
+        while incoming
+            .get(incoming_cursor)
+            .is_some_and(|current| current.record_ref < record)
+        {
+            incoming_cursor += 1;
+        }
+        if incoming
+            .get(incoming_cursor)
+            .is_none_or(|current| current.record_ref != record)
+        {
+            continue;
+        }
+        selected.push(record);
+        if selected.len() == query.limit {
+            break;
+        }
+    }
+}
+
 fn correlation_filter_bits(tenant: &str, key: CorrelationKey) -> [usize; 4] {
     let (tag, value) = match key {
         CorrelationKey::Trace(value) => (0_u64, u128::from_be_bytes(*value.as_bytes())),
@@ -655,29 +765,48 @@ impl CorrelationIndex {
     /// Returns the deterministic intersection of every requested posting.
     #[must_use]
     pub fn query(&self, query: &CorrelationQuery) -> Vec<TelemetryRecordRef> {
-        let mut keys = Vec::with_capacity(3 + query.attributes.len());
-        if let Some(trace_id) = query.trace_id {
-            keys.push(CorrelationKey::Trace(trace_id));
-        }
-        if let Some(resource_id) = query.resource_id {
-            keys.push(CorrelationKey::Resource(resource_id));
-        }
-        if let Some(scope_id) = query.scope_id {
-            keys.push(CorrelationKey::Scope(scope_id));
-        }
-        keys.extend(
-            query
-                .attributes
-                .iter()
-                .copied()
-                .map(CorrelationKey::Attribute),
-        );
-        if keys.is_empty() || query.limit == 0 {
-            return Vec::new();
+        let mut selected = Vec::new();
+        self.query_into(query, &mut selected);
+        selected
+    }
+
+    /// Fills a reusable output buffer with the deterministic posting
+    /// intersection. The buffer is cleared before results are written.
+    pub fn query_into(&self, query: &CorrelationQuery, selected: &mut Vec<TelemetryRecordRef>) {
+        selected.clear();
+        if query.limit == 0 {
+            return;
         }
         let Some(tenant_id) = self.tenants.get(query.tenant.as_ref()).copied() else {
-            return Vec::new();
+            return;
         };
+        let mut key_iter = query_keys(query);
+        let Some(first_key) = key_iter.next() else {
+            return;
+        };
+        let first = self
+            .postings
+            .get(&(tenant_id, first_key))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let Some(second_key) = key_iter.next() else {
+            query_single_posting(query, first, selected);
+            return;
+        };
+        let second = self
+            .postings
+            .get(&(tenant_id, second_key))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if key_iter.next().is_none() {
+            query_two_postings(query, first, second, selected);
+            return;
+        }
+
+        let mut keys = Vec::with_capacity(3 + query.attributes.len());
+        keys.push(first_key);
+        keys.push(second_key);
+        keys.extend(key_iter);
         let mut lists = keys
             .into_iter()
             .map(|key| {
@@ -689,12 +818,12 @@ impl CorrelationIndex {
             .collect::<Vec<_>>();
         lists.sort_unstable_by_key(|list| list.len());
         let Some(first) = lists.first() else {
-            return Vec::new();
+            return;
         };
         let start = query.after.map_or(0, |after| {
             first.partition_point(|posting| posting.record_ref <= after)
         });
-        let mut selected = Vec::with_capacity(query.limit.min(first.len().saturating_sub(start)));
+        selected.reserve(query.limit.min(first.len().saturating_sub(start)));
         let mut cursors = lists[1..]
             .iter()
             .map(|incoming| {
@@ -705,16 +834,7 @@ impl CorrelationIndex {
             .collect::<Vec<_>>();
         'candidate: for posting in &first[start..] {
             let record = posting.record_ref;
-            if query.signal.is_some_and(|signal| record.signal != signal) {
-                continue;
-            }
-            if query
-                .start_time_unix_nanos
-                .is_some_and(|start| posting.timestamp_unix_nanos < start)
-                || query
-                    .end_time_unix_nanos
-                    .is_some_and(|end| posting.timestamp_unix_nanos > end)
-            {
+            if !correlation_posting_matches(query, posting) {
                 continue;
             }
             for (incoming, cursor) in lists[1..].iter().zip(&mut cursors) {
@@ -725,7 +845,7 @@ impl CorrelationIndex {
                     *cursor += 1;
                 }
                 let Some(current) = incoming.get(*cursor) else {
-                    return selected;
+                    return;
                 };
                 if current.record_ref != record {
                     continue 'candidate;
@@ -736,7 +856,6 @@ impl CorrelationIndex {
                 break;
             }
         }
-        selected
     }
 
     /// Drops expired bounded navigation postings without touching durable data.
@@ -1030,6 +1149,15 @@ mod tests {
                 .with_attribute(&service),
         );
         assert_eq!(refs, vec![log.record_ref]);
+        let query = CorrelationQuery::new("tenant-a")
+            .with_resource_id(log.resource_id())
+            .with_attribute(&service);
+        let mut reusable = Vec::with_capacity(8);
+        index.query_into(&query, &mut reusable);
+        let capacity = reusable.capacity();
+        index.query_into(&query, &mut reusable);
+        assert_eq!(reusable, refs);
+        assert_eq!(reusable.capacity(), capacity);
         assert_eq!(index.stats().refs, 3);
     }
 

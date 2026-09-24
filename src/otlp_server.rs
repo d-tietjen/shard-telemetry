@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
 use std::future::Future;
 use std::io::Read;
 use std::net::SocketAddr;
@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use flate2::read::GzDecoder;
+use foldhash::{HashMap, HashMapExt};
 use opentelemetry_proto::tonic::collector::{
     logs::v1::{
         ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -33,9 +34,9 @@ use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response as GrpcResponse, Status};
 
 use crate::{
-    DurableTelemetryStore, NativePartitionAppend, NativeTelemetryBatch, OtlpLogDecoder,
-    OtlpTelemetryDecoder, ProductionRuntime, ServiceState, ShardTelemetryConfig, TelemetryError,
-    TelemetryResult, TelemetryRouter, prepare_log_envelope_with_context, prepare_metric_envelope,
+    DurableTelemetryStore, NativePartitionAppend, OtlpLogDecoder, OtlpTelemetryDecoder,
+    ProductionRuntime, ServiceState, ShardTelemetryConfig, TelemetryError, TelemetryResult,
+    TelemetryRouter, prepare_log_envelope_with_context, prepare_metric_envelope,
     prepare_trace_envelope,
 };
 
@@ -123,34 +124,46 @@ impl OtlpIngestService {
 
     fn ingest_logs(&self, request: ExportLogsServiceRequest) -> Result<usize, String> {
         let events = OtlpLogDecoder
-            .decode(&request.encode_to_vec())
+            .decode_request(&request)
             .map_err(|error| error.to_string())?;
         let item_count = events.len();
-        let mut partitions = BTreeMap::new();
+        let mut partitions = HashMap::new();
+        let mut routing_identities = HashMap::<(usize, usize), Vec<u8>>::new();
         for event in events {
-            let identity = rmp_serde::to_vec(&(event.resource.as_ref(), event.scope.as_ref()))
-                .map_err(|error| error.to_string())?;
+            let identity_key = (
+                Arc::as_ptr(&event.resource) as usize,
+                Arc::as_ptr(&event.scope) as usize,
+            );
+            let identity = match routing_identities.entry(identity_key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    rmp_serde::to_vec(&(event.resource.as_ref(), event.scope.as_ref()))
+                        .map_err(|error| error.to_string())?,
+                ),
+            };
             let partition = self
                 .router
-                .log(&self.config.tenant, event.trace_id, &identity);
+                .log(&self.config.tenant, event.trace_id, identity);
             partitions
                 .entry(partition)
                 .or_insert_with(Vec::new)
                 .push(event);
         }
-        let mut appends = partitions
-            .into_par_iter()
-            .map(|(topic_partition, events)| {
-                let (envelope, transient_context) =
-                    prepare_log_envelope_with_context(&self.config.tenant, &events)
-                        .map_err(|error| error.to_string())?;
-                Ok(NativePartitionAppend {
-                    topic_partition,
-                    envelope,
-                    transient_context: Some(transient_context),
+        let mut appends = self.store.install_append_parallelism(|| {
+            partitions
+                .into_par_iter()
+                .map(|(topic_partition, events)| {
+                    let (envelope, transient_context) =
+                        prepare_log_envelope_with_context(&self.config.tenant, &events)
+                            .map_err(|error| error.to_string())?;
+                    Ok(NativePartitionAppend {
+                        topic_partition,
+                        envelope,
+                        transient_context: Some(transient_context),
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, String>>()
+        })?;
         appends.sort_unstable_by_key(|append| append.topic_partition);
         self.append(appends)?;
         Ok(item_count)
@@ -159,21 +172,23 @@ impl OtlpIngestService {
     fn ingest_traces(&self, request: ExportTraceServiceRequest) -> Result<usize, String> {
         let decoder = OtlpTelemetryDecoder;
         let events = decoder
-            .decode_traces(&self.config.tenant, &request.encode_to_vec())
+            .decode_trace_request(&self.config.tenant, &request)
             .map_err(|error| error.to_string())?;
         let item_count = events.len();
-        let partitions = decoder.partition_traces(&self.router, events);
-        let mut appends = partitions
-            .into_par_iter()
-            .map(|(topic_partition, events)| {
-                Ok(NativePartitionAppend {
-                    topic_partition,
-                    envelope: prepare_trace_envelope(topic_partition, events)
-                        .map_err(|error| error.to_string())?,
-                    transient_context: None,
+        let partitions = decoder.partition_traces_unordered(&self.router, events);
+        let mut appends = self.store.install_append_parallelism(|| {
+            partitions
+                .into_par_iter()
+                .map(|(topic_partition, events)| {
+                    Ok(NativePartitionAppend {
+                        topic_partition,
+                        envelope: prepare_trace_envelope(topic_partition, events)
+                            .map_err(|error| error.to_string())?,
+                        transient_context: None,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, String>>()
+        })?;
         appends.sort_unstable_by_key(|append| append.topic_partition);
         self.append(appends)?;
         Ok(item_count)
@@ -182,47 +197,45 @@ impl OtlpIngestService {
     fn ingest_metrics(&self, request: ExportMetricsServiceRequest) -> Result<usize, String> {
         let decoder = OtlpTelemetryDecoder;
         let events = decoder
-            .decode_metrics(&self.config.tenant, &request.encode_to_vec())
+            .decode_metric_request(&self.config.tenant, &request)
             .map_err(|error| error.to_string())?;
         let item_count = events.len();
-        let mut series = BTreeMap::new();
-        for event in events {
-            let fingerprint = event.series_fingerprint();
-            let topic_partition = self.router.metric(&self.config.tenant, fingerprint);
+        let series = decoder.partition_metrics_unordered(&self.router, events);
+        let mut appends = self.store.install_append_parallelism(|| {
             series
-                .entry((topic_partition, fingerprint))
-                .or_insert_with(Vec::new)
-                .push(event);
-        }
-        let mut appends = series
-            .into_par_iter()
-            .map(|((topic_partition, fingerprint), events)| {
-                Ok((
-                    topic_partition,
-                    fingerprint,
-                    NativePartitionAppend {
+                .into_par_iter()
+                .map(|((topic_partition, fingerprint), events)| {
+                    Ok((
                         topic_partition,
-                        envelope: prepare_metric_envelope(topic_partition, events)
-                            .map_err(|error| error.to_string())?,
-                        transient_context: None,
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+                        fingerprint,
+                        NativePartitionAppend {
+                            topic_partition,
+                            envelope: prepare_metric_envelope(topic_partition, events)
+                                .map_err(|error| error.to_string())?,
+                            transient_context: None,
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
         appends.sort_unstable_by_key(|(partition, fingerprint, _)| (*partition, *fingerprint));
-        let mut rounds = Vec::<(BTreeSet<_>, Vec<NativePartitionAppend>)>::new();
+        // Each partition is contiguous after sorting, so its nth series can
+        // go directly to round n without searching every prior round.
+        let mut rounds = Vec::<Vec<NativePartitionAppend>>::new();
+        let mut current_partition = None;
+        let mut partition_round = 0;
         for (topic_partition, _, append) in appends {
-            if let Some((partitions, appends)) = rounds
-                .iter_mut()
-                .find(|(partitions, _)| !partitions.contains(&topic_partition))
-            {
-                partitions.insert(topic_partition);
-                appends.push(append);
-            } else {
-                rounds.push((BTreeSet::from([topic_partition]), vec![append]));
+            if current_partition != Some(topic_partition) {
+                current_partition = Some(topic_partition);
+                partition_round = 0;
             }
+            if rounds.len() == partition_round {
+                rounds.push(Vec::new());
+            }
+            rounds[partition_round].push(append);
+            partition_round += 1;
         }
-        for (_, appends) in rounds {
+        for appends in rounds {
             self.append(appends)?;
         }
         Ok(item_count)
@@ -233,21 +246,19 @@ impl OtlpIngestService {
             return Ok(());
         }
         self.store
-            .append_telemetry_batch(
-                &NativeTelemetryBatch { partitions },
-                self.config.wait_for_index,
-            )
+            .append_prepared_telemetry_partitions(partitions, self.config.wait_for_index)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
 
-    fn validate_grpc_size<T: Message>(&self, request: &T) -> Result<(), Status> {
-        if request.encoded_len() > self.config.max_request_bytes {
+    fn grpc_request_size<T: Message>(&self, request: &T) -> Result<usize, Status> {
+        let encoded_len = request.encoded_len();
+        if encoded_len > self.config.max_request_bytes {
             return Err(Status::resource_exhausted(
                 "OTLP request exceeds the configured decompressed limit",
             ));
         }
-        Ok(())
+        Ok(encoded_len)
     }
 
     #[allow(clippy::result_large_err)]
@@ -408,7 +419,7 @@ where
     let request = if json {
         serde_json::from_slice(&decoded_body).map_err(|error| error.to_string())
     } else {
-        RequestMessage::decode(decoded_body.as_slice()).map_err(|error| error.to_string())
+        RequestMessage::decode(decoded_body.as_ref()).map_err(|error| error.to_string())
     };
     let request = match request {
         Ok(request) => request,
@@ -485,11 +496,11 @@ fn validate_http_tenant(headers: &HeaderMap, configured: &str) -> Result<(), Res
 }
 
 #[allow(clippy::result_large_err)]
-fn decode_http_body(
+fn decode_http_body<'a>(
     headers: &HeaderMap,
-    body: &[u8],
+    body: &'a [u8],
     max_request_bytes: usize,
-) -> Result<Vec<u8>, Response> {
+) -> Result<Cow<'a, [u8]>, Response> {
     let gzip = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
@@ -501,7 +512,7 @@ fn decode_http_body(
                 "OTLP request exceeds the configured limit",
             ));
         }
-        return Ok(body.to_vec());
+        return Ok(Cow::Borrowed(body));
     }
     let mut decoder = GzDecoder::new(body);
     let mut decoded = Vec::new();
@@ -516,7 +527,7 @@ fn decode_http_body(
             "decompressed OTLP request exceeds the configured limit",
         ));
     }
-    Ok(decoded)
+    Ok(Cow::Owned(decoded))
 }
 
 fn otlp_http_error(status: StatusCode, message: &str) -> Response {
@@ -538,8 +549,7 @@ impl LogsService for OtlpIngestService {
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<GrpcResponse<ExportLogsServiceResponse>, Status> {
         self.authorize_grpc(&request)?;
-        self.validate_grpc_size(request.get_ref())?;
-        let source_bytes = request.get_ref().encoded_len();
+        let source_bytes = self.grpc_request_size(request.get_ref())?;
         let _permit = self
             .reserve_ingest(source_bytes)
             .map_err(grpc_admission_status)?;
@@ -561,8 +571,7 @@ impl TraceService for OtlpIngestService {
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<GrpcResponse<ExportTraceServiceResponse>, Status> {
         self.authorize_grpc(&request)?;
-        self.validate_grpc_size(request.get_ref())?;
-        let source_bytes = request.get_ref().encoded_len();
+        let source_bytes = self.grpc_request_size(request.get_ref())?;
         let _permit = self
             .reserve_ingest(source_bytes)
             .map_err(grpc_admission_status)?;
@@ -584,8 +593,7 @@ impl MetricsService for OtlpIngestService {
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<GrpcResponse<ExportMetricsServiceResponse>, Status> {
         self.authorize_grpc(&request)?;
-        self.validate_grpc_size(request.get_ref())?;
-        let source_bytes = request.get_ref().encoded_len();
+        let source_bytes = self.grpc_request_size(request.get_ref())?;
         let _permit = self
             .reserve_ingest(source_bytes)
             .map_err(grpc_admission_status)?;
@@ -761,6 +769,15 @@ mod tests {
         let headers =
             HeaderMap::from_iter([(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"))]);
         assert!(decode_http_body(&headers, &body, 1_024).is_err());
+    }
+
+    #[test]
+    fn uncompressed_http_body_is_borrowed() {
+        let headers = HeaderMap::new();
+        let body = [1_u8, 2, 3];
+        let decoded = decode_http_body(&headers, &body, body.len()).expect("body is within limit");
+        assert!(matches!(decoded, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(decoded.as_ref(), body);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -17,7 +17,7 @@ if [[ "$observed" != "$expected" ]]; then
   exit 1
 fi
 
-if rg -n --glob '*.rs' '\bbincode\b' src; then
+if grep -R -n -E --include='*.rs' '\bbincode\b' src; then
   echo "bincode must not be used directly by ShardTelemetry" >&2
   exit 1
 fi

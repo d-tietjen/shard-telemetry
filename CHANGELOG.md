@@ -15,6 +15,11 @@ and protocol interfaces when called out in release notes.
   crash-safe lifetime metric rollups.
 - An optional fast-telemetry snapshot bridge for exporting application metrics
   directly into the embedded runtime without changing its recording hot path.
+- A fixed-registry embedded usage ledger with exact lifetime and monthly
+  counters, two-generation crash recovery, compression, checksums, and a hard
+  preallocated file quota.
+- Embedded storage-health snapshots, built-in retention maintenance, bounded
+  append workers/queues, and lifetime exporter cardinality admission.
 - Rust-native S3/S3-compatible durable object storage with workload
   credentials, conditional catalog publication, streaming multipart uploads,
   and BLAKE3 verification.
@@ -25,6 +30,9 @@ and protocol interfaces when called out in release notes.
 
 ### Changed
 
+- Updated the lockfile from yanked `chacha20` 0.10.1 to 0.10.2.
+- Embedded stores now derive append-submission and durable-sink dispatcher
+  workers from their physical shard count, preserving multi-shard parallelism.
 - Object publication and retention now use bounded, crash-replayable ownership
   records, immutable catalog leases, and exact-key reclamation. No bucket
   listing or tracing garbage collector is required.

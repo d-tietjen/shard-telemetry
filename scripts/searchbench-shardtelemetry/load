@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec "${ST_PYTHON:?ST_PYTHON must point to the SearchBench virtualenv Python}" \
+    "$ST_ADAPTER_DIR/adapter.py" load "$SEARCHBENCH_DATA_DIR"

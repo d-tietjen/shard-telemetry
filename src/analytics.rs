@@ -4,7 +4,7 @@ use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::builder::{
-    BooleanBuilder, Int32Builder, Int64Builder, MapBuilder, StringBuilder,
+    BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, MapBuilder, StringBuilder,
     TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt32Array, UInt64Array};
@@ -13,16 +13,17 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, HeaderValue, header};
 use axum::response::Response;
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::loki_api::LokiApiError;
 use crate::query::{message_has_clickhouse_token, message_has_term};
+use crate::trace::TraceProjection;
 use crate::{
-    CaseSensitivity, DurableLog, DurableMetricPoint, DurableSpan, LokiStore, MetadataField,
-    MetricKind, MetricValue, NumberValue, SeriesFingerprint, SpanId, TelemetryAttribute,
-    TelemetryValue, TraceId,
+    CaseSensitivity, DurableLog, DurableMetricPoint, DurableSpan, LogPredicate, LokiStore,
+    MetadataField, MetricKind, MetricValue, NumberValue, NumericComparison, SeriesFingerprint,
+    SpanId, TelemetryAttribute, TelemetryValue, TextMatchKind, TextMatcher, TraceId,
 };
 
 /// Pinned ClickHouse release whose evaluator defines ShardTelemetry SQL semantics.
@@ -42,6 +43,50 @@ pub enum AnalyticsScanOrder {
     TimestampAscending,
     /// Newest timestamp first, with durable offset as the stable tie-breaker.
     TimestampDescending,
+    /// Highest relevance score first, with newest timestamp and durable offset
+    /// as stable tie-breakers.
+    RelevanceDescending,
+}
+
+/// Supported analytical grouping keys for log scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticsGroupKey {
+    /// OpenTelemetry severity text.
+    SeverityText,
+    /// Scope name stored in the normalized metadata fields.
+    ScopeName,
+    /// Event timestamp truncated to a minute.
+    Minute,
+}
+
+impl AnalyticsGroupKey {
+    /// Parses a stable query parameter name.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "severity_text" | "SeverityText" => Some(Self::SeverityText),
+            "scope_name" | "ScopeName" => Some(Self::ScopeName),
+            "minute" => Some(Self::Minute),
+            _ => None,
+        }
+    }
+}
+
+/// Ordering applied to grouped analytical results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticsGroupOrder {
+    /// Order groups by descending count, then key.
+    CountDescending,
+    /// Order groups lexicographically by their keys.
+    KeyAscending,
+}
+
+/// One grouped analytical result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnalyticsGroupRow {
+    /// Group key values in the request order.
+    pub keys: Vec<Option<Arc<str>>>,
+    /// Number of matching records in the group.
+    pub count: u64,
 }
 
 /// Encoding used by the authenticated analytical scan boundary.
@@ -150,6 +195,7 @@ pub enum AnalyticsColumn {
     LinkedSpanId,
     SeriesId,
     Message,
+    Score,
     BodyJson,
     Name,
     EventName,
@@ -213,6 +259,7 @@ impl AnalyticsColumn {
             Self::LinkedSpanId => "linked_span_id",
             Self::SeriesId => "series_id",
             Self::Message => "message",
+            Self::Score => "score",
             Self::BodyJson => "body_json",
             Self::Name => "name",
             Self::EventName => "event_name",
@@ -295,6 +342,7 @@ impl AnalyticsColumn {
             | Self::DroppedEventsCount
             | Self::DroppedLinksCount => DataType::UInt32,
             Self::Offset | Self::DurationNanos | Self::ScalarDoubleBits => DataType::UInt64,
+            Self::Score => DataType::Float64,
             Self::SeverityNumber | Self::Kind | Self::StatusCode | Self::Temporality => {
                 DataType::Int32
             }
@@ -314,7 +362,7 @@ impl AnalyticsColumn {
     }
 }
 
-const ALL_COLUMNS: [AnalyticsColumn; 56] = [
+const ALL_COLUMNS: [AnalyticsColumn; 57] = [
     AnalyticsColumn::Tenant,
     AnalyticsColumn::Signal,
     AnalyticsColumn::Timestamp,
@@ -334,6 +382,7 @@ const ALL_COLUMNS: [AnalyticsColumn; 56] = [
     AnalyticsColumn::LinkedSpanId,
     AnalyticsColumn::SeriesId,
     AnalyticsColumn::Message,
+    AnalyticsColumn::Score,
     AnalyticsColumn::BodyJson,
     AnalyticsColumn::Name,
     AnalyticsColumn::EventName,
@@ -385,7 +434,7 @@ const BASE: [AnalyticsColumn; 9] = [
     AnalyticsColumn::SpanId,
 ];
 
-const LOG_COLUMNS: [AnalyticsColumn; 28] = [
+const LOG_COLUMNS: [AnalyticsColumn; 29] = [
     BASE[0],
     BASE[1],
     BASE[2],
@@ -397,6 +446,7 @@ const LOG_COLUMNS: [AnalyticsColumn; 28] = [
     BASE[7],
     BASE[8],
     AnalyticsColumn::Message,
+    AnalyticsColumn::Score,
     AnalyticsColumn::BodyJson,
     AnalyticsColumn::SeverityNumber,
     AnalyticsColumn::SeverityText,
@@ -559,7 +609,7 @@ const METRIC_EXEMPLAR_COLUMNS: [AnalyticsColumn; 21] = [
 ];
 
 /// Bounded storage-level scan requested by ClickHouse.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(missing_docs)]
 pub struct AnalyticsScanRequest {
     pub tenant: Arc<str>,
@@ -569,15 +619,32 @@ pub struct AnalyticsScanRequest {
     pub terms: Vec<Arc<str>>,
     pub message_tokens: Vec<Arc<str>>,
     pub case_insensitive_message_tokens: Vec<Arc<str>>,
+    /// Additional Boolean log predicate. It is pushed into the indexed log
+    /// query path and is combined with the legacy fields above using AND.
+    pub predicate: LogPredicate,
+    /// Combines the explicitly supplied predicate parts with OR when set.
+    /// Legacy field filters remain independent AND constraints.
+    pub predicate_any: bool,
     pub labels: Vec<MetadataField>,
     pub metadata: Vec<MetadataField>,
     pub attributes: Vec<MetadataField>,
     pub resource_attributes: Vec<MetadataField>,
     pub scope_attributes: Vec<MetadataField>,
     pub trace_id: Option<TraceId>,
+    /// Return the number of distinct non-empty trace IDs that also have a
+    /// record matching this service name.
+    pub trace_join_service: Option<Arc<str>>,
+    /// Deduplicate log results by trace ID for a cardinality query.
+    pub distinct_trace_id: bool,
     pub span_id: Option<SpanId>,
     pub series_id: Option<SeriesFingerprint>,
     pub name: Option<Arc<str>>,
+    /// Grouping keys for grouped log scans.
+    pub group_by: Vec<AnalyticsGroupKey>,
+    /// Optional maximum number of grouped results.
+    pub group_limit: Option<usize>,
+    /// Ordering for grouped results.
+    pub group_order: AnalyticsGroupOrder,
     pub columns: Vec<AnalyticsColumn>,
     pub limit: Option<usize>,
     pub cardinality_only: bool,
@@ -603,15 +670,22 @@ impl AnalyticsScanRequest {
             terms: Vec::new(),
             message_tokens: Vec::new(),
             case_insensitive_message_tokens: Vec::new(),
+            predicate: LogPredicate::MatchAll,
+            predicate_any: false,
             labels: Vec::new(),
             metadata: Vec::new(),
             attributes: Vec::new(),
             resource_attributes: Vec::new(),
             scope_attributes: Vec::new(),
             trace_id: None,
+            trace_join_service: None,
+            distinct_trace_id: false,
             span_id: None,
             series_id: None,
             name: None,
+            group_by: Vec::new(),
+            group_limit: None,
+            group_order: AnalyticsGroupOrder::KeyAscending,
             columns: relation.columns().to_vec(),
             limit: None,
             cardinality_only: false,
@@ -662,6 +736,16 @@ impl AnalyticsScanRequest {
                 "ordered analytical scans are currently log-only",
             ));
         }
+        if !self.group_by.is_empty() && self.relation != AnalyticsRelation::Logs {
+            return Err(LokiApiError::bad_request(
+                "grouping is currently available only on the logs relation",
+            ));
+        }
+        if !self.group_by.is_empty() && self.wire_format != AnalyticsWireFormat::JsonLines {
+            return Err(LokiApiError::bad_request(
+                "grouped analytical scans require JSON Lines output",
+            ));
+        }
         if self.order.is_some() && self.limit.is_none() {
             return Err(LokiApiError::bad_request(
                 "ordered analytical scans require a bounded limit",
@@ -679,10 +763,22 @@ impl AnalyticsScanRequest {
         if self.relation != AnalyticsRelation::Logs
             && (!self.terms.is_empty()
                 || !self.message_tokens.is_empty()
-                || !self.case_insensitive_message_tokens.is_empty())
+                || !self.case_insensitive_message_tokens.is_empty()
+                || self.predicate != LogPredicate::MatchAll)
         {
             return Err(LokiApiError::bad_request(
                 "term filtering is available only on the logs relation",
+            ));
+        }
+        if (self.trace_join_service.is_some() || self.distinct_trace_id)
+            && (self.relation != AnalyticsRelation::Logs
+                || !self.cardinality_only
+                || self.order.is_some()
+                || self.limit.is_some()
+                || !self.group_by.is_empty())
+        {
+            return Err(LokiApiError::bad_request(
+                "trace joins and distinct trace IDs require an unbounded log cardinality scan",
             ));
         }
         Ok(())
@@ -690,7 +786,7 @@ impl AnalyticsScanRequest {
 }
 
 /// One normalized row shared by the relation-specific Arrow writers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(missing_docs)]
 pub struct AnalyticsRow {
     pub tenant: Arc<str>,
@@ -712,6 +808,7 @@ pub struct AnalyticsRow {
     pub linked_span_id: Option<Arc<str>>,
     pub series_id: Option<Arc<str>>,
     pub message: Option<Arc<str>>,
+    pub score: Option<f64>,
     pub body_json: Option<Arc<str>>,
     pub name: Option<Arc<str>>,
     pub event_name: Option<Arc<str>>,
@@ -752,7 +849,7 @@ pub struct AnalyticsRow {
 }
 
 impl AnalyticsRow {
-    fn empty(
+    pub(crate) fn empty(
         tenant: Arc<str>,
         signal: &'static str,
         timestamp_unix_nanos: u64,
@@ -779,6 +876,7 @@ impl AnalyticsRow {
             linked_span_id: None,
             series_id: None,
             message: None,
+            score: None,
             body_json: None,
             name: None,
             event_name: None,
@@ -862,6 +960,11 @@ pub(crate) fn parse_scan_request(
     let mut cardinality_seen = false;
     let mut order_seen = false;
     let mut wire_seen = false;
+    let mut predicate_operator_seen = false;
+    let mut predicate_any = false;
+    let mut message_any = Vec::new();
+    let mut message_min_match = None;
+    let mut predicate_parts = Vec::new();
     for (key, value) in pairs {
         match key.as_str() {
             "relation" => {}
@@ -901,8 +1004,26 @@ pub(crate) fn parse_scan_request(
                 request.order = Some(match value.as_str() {
                     "timestamp_asc" => AnalyticsScanOrder::TimestampAscending,
                     "timestamp_desc" => AnalyticsScanOrder::TimestampDescending,
+                    "score_desc" | "relevance_desc" => AnalyticsScanOrder::RelevanceDescending,
                     _ => return Err(LokiApiError::bad_request("unknown analytics order")),
                 });
+            }
+            "predicate_operator" => {
+                if predicate_operator_seen {
+                    return Err(LokiApiError::bad_request(
+                        "predicate_operator may be specified only once",
+                    ));
+                }
+                predicate_operator_seen = true;
+                predicate_any = match value.as_str() {
+                    "and" => false,
+                    "or" => true,
+                    _ => {
+                        return Err(LokiApiError::bad_request(
+                            "predicate_operator must be and or or",
+                        ));
+                    }
+                };
             }
             "wire" => {
                 if wire_seen {
@@ -921,10 +1042,191 @@ pub(crate) fn parse_scan_request(
             "message_token_ci" => request
                 .case_insensitive_message_tokens
                 .push(Arc::from(value)),
+            "message_any" => message_any.push(Arc::from(value)),
+            "message_min_match" => {
+                message_min_match =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        LokiApiError::bad_request("message_min_match is not a usize")
+                    })?);
+            }
+            "message_contains" => predicate_parts.push(LogPredicate::message(TextMatcher::new(
+                value,
+                TextMatchKind::Contains,
+                CaseSensitivity::Insensitive,
+            ))),
+            "message_prefix" => predicate_parts.push(LogPredicate::message(TextMatcher::new(
+                value,
+                TextMatchKind::Prefix,
+                CaseSensitivity::Insensitive,
+            ))),
+            "message_suffix" => predicate_parts.push(LogPredicate::message(TextMatcher::new(
+                value,
+                TextMatchKind::Suffix,
+                CaseSensitivity::Insensitive,
+            ))),
+            "message_regex" | "message_regex_ci" => {
+                let sensitivity = if key == "message_regex_ci" {
+                    CaseSensitivity::Insensitive
+                } else {
+                    CaseSensitivity::Sensitive
+                };
+                let predicate = LogPredicate::message_regex(value, sensitivity)
+                    .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+                predicate_parts.push(predicate);
+            }
+            "message_token_regex" | "message_token_regex_ci" => {
+                let sensitivity = if key == "message_token_regex_ci" {
+                    CaseSensitivity::Insensitive
+                } else {
+                    CaseSensitivity::Sensitive
+                };
+                let predicate = LogPredicate::message_token_regex(value, sensitivity)
+                    .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+                predicate_parts.push(predicate);
+            }
+            "message_token_prefix" | "message_token_prefix_ci" => {
+                let sensitivity = if key == "message_token_prefix_ci" {
+                    CaseSensitivity::Insensitive
+                } else {
+                    CaseSensitivity::Sensitive
+                };
+                predicate_parts.push(LogPredicate::message_token_prefix(value, sensitivity));
+            }
+            "message_phrase" | "message_proximity" => {
+                let (raw_terms, raw_gap) = value.split_once(':').unwrap_or((&value, "0"));
+                let max_gap = raw_gap
+                    .parse::<usize>()
+                    .map_err(|_| LokiApiError::bad_request("message phrase gap is not a usize"))?;
+                let terms = raw_terms
+                    .split('|')
+                    .filter(|term| !term.is_empty())
+                    .map(Arc::<str>::from)
+                    .collect::<Vec<_>>();
+                if terms.is_empty() {
+                    return Err(LokiApiError::bad_request(
+                        "message phrase requires at least one term",
+                    ));
+                }
+                predicate_parts.push(LogPredicate::message_phrase(
+                    terms,
+                    max_gap,
+                    CaseSensitivity::Insensitive,
+                ));
+            }
+            "message_fuzzy" => {
+                let (term, raw_distance) = value.split_once(':').ok_or_else(|| {
+                    LokiApiError::bad_request("message_fuzzy must be encoded as term:distance")
+                })?;
+                let distance = raw_distance
+                    .parse::<u8>()
+                    .map_err(|_| LokiApiError::bad_request("message_fuzzy distance is not a u8"))?;
+                predicate_parts.push(LogPredicate::message_fuzzy(term, distance));
+            }
+            "message_like" => {
+                let predicate = LogPredicate::message_token_regex(
+                    wildcard_pattern_to_regex(&value),
+                    CaseSensitivity::Insensitive,
+                )
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+                predicate_parts.push(predicate);
+            }
+            "message_not" => predicate_parts.push(LogPredicate::negate(
+                LogPredicate::message_token(value, CaseSensitivity::Insensitive),
+            )),
+            "field_exists" => predicate_parts.push(LogPredicate::field_exists(value)),
+            key if key.starts_with("field_equals.") => predicate_parts.push(
+                LogPredicate::field_equals(&key["field_equals.".len()..], value),
+            ),
+            key if key.starts_with("field_contains.") => predicate_parts.push(LogPredicate::field(
+                &key["field_contains.".len()..],
+                TextMatcher::new(value, TextMatchKind::Contains, CaseSensitivity::Insensitive),
+            )),
+            key if key.starts_with("field_prefix.") => predicate_parts.push(LogPredicate::field(
+                &key["field_prefix.".len()..],
+                TextMatcher::new(value, TextMatchKind::Prefix, CaseSensitivity::Insensitive),
+            )),
+            key if key.starts_with("field_suffix.") => predicate_parts.push(LogPredicate::field(
+                &key["field_suffix.".len()..],
+                TextMatcher::new(value, TextMatchKind::Suffix, CaseSensitivity::Insensitive),
+            )),
+            key if key.starts_with("field_regex.") => {
+                let field = &key["field_regex.".len()..];
+                let predicate = LogPredicate::field_regex(field, value, CaseSensitivity::Sensitive)
+                    .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+                predicate_parts.push(predicate);
+            }
+            key if key.starts_with("field_in.") => {
+                predicate_parts.push(LogPredicate::field_in(
+                    &key["field_in.".len()..],
+                    value.split('|'),
+                ));
+            }
+            key if key.starts_with("field_numeric.") => {
+                let field = &key["field_numeric.".len()..];
+                let (operator, raw_value) = value.split_once(':').ok_or_else(|| {
+                    LokiApiError::bad_request("field_numeric must be encoded as operator:value")
+                })?;
+                let comparison = match operator {
+                    "eq" => NumericComparison::Equal,
+                    "ne" => NumericComparison::NotEqual,
+                    "lt" => NumericComparison::LessThan,
+                    "le" => NumericComparison::LessThanOrEqual,
+                    "gt" => NumericComparison::GreaterThan,
+                    "ge" => NumericComparison::GreaterThanOrEqual,
+                    _ => return Err(LokiApiError::bad_request("unknown numeric comparison")),
+                };
+                let number = raw_value
+                    .parse::<i128>()
+                    .map_err(|_| LokiApiError::bad_request("field_numeric value is not an i128"))?;
+                predicate_parts.push(LogPredicate::field_numeric(field, comparison, number));
+            }
             "trace_id" => request.trace_id = Some(parse_trace_id(&value)?),
+            "trace_join_service" => request.trace_join_service = Some(Arc::from(value)),
+            "distinct_trace_id" => {
+                request.distinct_trace_id = match value.as_str() {
+                    "1" | "true" => true,
+                    "0" | "false" => false,
+                    _ => {
+                        return Err(LokiApiError::bad_request(
+                            "distinct_trace_id is not a boolean",
+                        ));
+                    }
+                };
+            }
             "span_id" => request.span_id = Some(parse_span_id(&value)?),
             "series_id" => request.series_id = Some(parse_series_id(&value)?),
             "name" => request.name = Some(Arc::from(value)),
+            "group_by" => {
+                request.group_by = value
+                    .split(',')
+                    .map(|key| {
+                        AnalyticsGroupKey::parse(key).ok_or_else(|| {
+                            LokiApiError::bad_request(format!(
+                                "unknown analytics group key {key:?}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if request.group_by.is_empty() {
+                    return Err(LokiApiError::bad_request(
+                        "group_by requires at least one key",
+                    ));
+                }
+            }
+            "group_limit" => {
+                request.group_limit = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| LokiApiError::bad_request("group_limit is not a usize"))?,
+                );
+            }
+            "group_order" => {
+                request.group_order = match value.as_str() {
+                    "count_desc" => AnalyticsGroupOrder::CountDescending,
+                    "key_asc" => AnalyticsGroupOrder::KeyAscending,
+                    _ => return Err(LokiApiError::bad_request("unknown analytics group order")),
+                };
+            }
             "columns" => {
                 if columns_seen {
                     return Err(LokiApiError::bad_request(
@@ -963,8 +1265,83 @@ pub(crate) fn parse_scan_request(
             }
         }
     }
+    if !message_any.is_empty() {
+        let tokens = message_any
+            .into_iter()
+            .map(|value| LogPredicate::message_token(value, CaseSensitivity::Insensitive))
+            .collect::<Vec<_>>();
+        if let Some(minimum) = message_min_match {
+            predicate_parts.push(min_match_predicate(tokens, minimum)?);
+        } else {
+            predicate_parts.push(LogPredicate::or(tokens));
+        }
+    } else if message_min_match.is_some() {
+        return Err(LokiApiError::bad_request(
+            "message_min_match requires at least one message_any parameter",
+        ));
+    }
+    if predicate_any {
+        predicate_parts.extend(request.terms.drain(..).map(LogPredicate::Term));
+        predicate_parts.extend(
+            request
+                .message_tokens
+                .drain(..)
+                .map(|value| LogPredicate::message_token(value, CaseSensitivity::Sensitive)),
+        );
+        predicate_parts.extend(
+            request
+                .case_insensitive_message_tokens
+                .drain(..)
+                .map(|value| LogPredicate::message_token(value, CaseSensitivity::Insensitive)),
+        );
+        request.predicate = LogPredicate::or(predicate_parts);
+    } else {
+        request.predicate = LogPredicate::and(predicate_parts);
+    }
+    request.predicate_any = predicate_any;
     request.validate()?;
     Ok(request)
+}
+
+fn min_match_predicate(
+    predicates: Vec<LogPredicate>,
+    minimum: usize,
+) -> Result<LogPredicate, LokiApiError> {
+    if minimum == 0 {
+        return Ok(LogPredicate::MatchAll);
+    }
+    if minimum > predicates.len() {
+        return Err(LokiApiError::bad_request(
+            "message_min_match exceeds the number of message_any parameters",
+        ));
+    }
+    let mut combinations = Vec::new();
+    fn visit(
+        predicates: &[LogPredicate],
+        minimum: usize,
+        start: usize,
+        selected: &mut Vec<LogPredicate>,
+        combinations: &mut Vec<LogPredicate>,
+    ) {
+        if selected.len() == minimum {
+            combinations.push(LogPredicate::and(selected.clone()));
+            return;
+        }
+        let remaining = minimum - selected.len();
+        let last = predicates.len().saturating_sub(remaining);
+        for index in start..=last {
+            selected.push(predicates[index].clone());
+            visit(predicates, minimum, index + 1, selected, combinations);
+            selected.pop();
+        }
+    }
+    visit(&predicates, minimum, 0, &mut Vec::new(), &mut combinations);
+    if combinations.len() > 1_024 {
+        return Err(LokiApiError::bad_request(
+            "message_min_match expands to too many combinations",
+        ));
+    }
+    Ok(LogPredicate::or(combinations))
 }
 
 fn push_field(
@@ -1062,9 +1439,25 @@ pub(crate) fn scan_entries(
             })
             .collect::<Result<Vec<_>, LokiApiError>>()?;
         rows.retain(|row| row_matches(row, request));
-        rows.sort_unstable_by_key(|row| (row.timestamp_unix_nanos, row.offset));
-        if order == AnalyticsScanOrder::TimestampDescending {
-            rows.reverse();
+        if order == AnalyticsScanOrder::RelevanceDescending {
+            let scorer = RelevanceScorer::from_request(request);
+            for row in &mut rows {
+                row.score = Some(scorer.score(row.message.as_deref().unwrap_or_default()));
+            }
+            rows.sort_unstable_by(|left, right| {
+                right
+                    .score
+                    .unwrap_or_default()
+                    .partial_cmp(&left.score.unwrap_or_default())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right.timestamp_unix_nanos.cmp(&left.timestamp_unix_nanos))
+                    .then_with(|| right.offset.cmp(&left.offset))
+            });
+        } else {
+            rows.sort_unstable_by_key(|row| (row.timestamp_unix_nanos, row.offset));
+            if order == AnalyticsScanOrder::TimestampDescending {
+                rows.reverse();
+            }
         }
         rows.truncate(limit);
         for batch in rows.chunks(DEFAULT_SCAN_BATCH_ROWS) {
@@ -1141,16 +1534,69 @@ pub(crate) fn log_row(
     Ok(row)
 }
 
-/// Builds only the columns requested by the analytical boundary. Storage
-/// pushdown has already applied the predicate before this function is used,
-/// so omitted filter-only columns do not need to be materialized a second
-/// time. This keeps narrow ClickHouse scans from serializing every OTLP map
-/// and JSON sidecar for each selected record.
+/// Returns whether a log projection needs the typed OTLP metadata lane.
+/// Storage pushdown has already applied the predicate before the projection
+/// is built, so basic columns can avoid materializing omitted OTLP maps and
+/// JSON sidecars.
+#[must_use]
+pub(crate) fn log_columns_need_typed_metadata(columns: &[AnalyticsColumn]) -> bool {
+    columns.iter().any(|column| {
+        matches!(
+            column,
+            AnalyticsColumn::ObservedTimestamp
+                | AnalyticsColumn::ResourceId
+                | AnalyticsColumn::ScopeId
+                | AnalyticsColumn::TraceId
+                | AnalyticsColumn::SpanId
+                | AnalyticsColumn::BodyJson
+                | AnalyticsColumn::EventName
+                | AnalyticsColumn::SeverityNumber
+                | AnalyticsColumn::Flags
+                | AnalyticsColumn::DroppedAttributesCount
+                | AnalyticsColumn::Attributes
+                | AnalyticsColumn::ResourceAttributes
+                | AnalyticsColumn::ScopeAttributes
+                | AnalyticsColumn::AttributeIds
+                | AnalyticsColumn::ResourceAttributeIds
+                | AnalyticsColumn::ScopeAttributeIds
+                | AnalyticsColumn::AttributesJson
+                | AnalyticsColumn::ResourceAttributesJson
+                | AnalyticsColumn::ScopeAttributesJson
+        )
+    })
+}
+
+/// Returns whether a log projection needs the normalized structural field lane.
+///
+/// The lane is separate from typed OTLP metadata because labels and Loki
+/// metadata are stored as exact structural fields.
+#[must_use]
+pub(crate) fn log_columns_need_structural_fields(columns: &[AnalyticsColumn]) -> bool {
+    columns
+        .iter()
+        .any(|column| matches!(column, AnalyticsColumn::Labels | AnalyticsColumn::Metadata))
+}
+
 pub(crate) fn projected_log_row(
     tenant: &Arc<str>,
     record: &DurableLog,
     columns: &[AnalyticsColumn],
 ) -> Result<AnalyticsRow, LokiApiError> {
+    if has_only_columns(
+        columns,
+        AnalyticsColumn::Timestamp,
+        AnalyticsColumn::Message,
+    ) {
+        let mut row = AnalyticsRow::empty(
+            Arc::clone(tenant),
+            "logs",
+            record.timestamp_unix_nanos,
+            record.record_ref.topic_partition.partition_id.get(),
+            record.record_ref.offset.get(),
+        )?;
+        row.message = Some(Arc::clone(&record.message));
+        return Ok(row);
+    }
     let mut row = AnalyticsRow::empty(
         Arc::clone(tenant),
         "logs",
@@ -1219,6 +1665,170 @@ pub(crate) fn projected_log_row(
     Ok(row)
 }
 
+/// Computes a stable BM25-shaped relevance score for a matched log message.
+///
+/// The storage index supplies the candidate set and this scorer only ranks
+/// those candidates. It intentionally keeps document-frequency estimation
+/// local to the request so a bounded top-k query does not require a global
+/// scan or mutable statistics.
+#[derive(Clone)]
+pub(crate) struct RelevanceScorer {
+    terms: Vec<Arc<str>>,
+}
+
+impl RelevanceScorer {
+    pub(crate) fn terms(&self) -> &[Arc<str>] {
+        &self.terms
+    }
+
+    pub(crate) fn from_request(request: &AnalyticsScanRequest) -> Self {
+        fn add_term(terms: &mut Vec<Arc<str>>, value: &str) {
+            let lowered = value.to_ascii_lowercase();
+            if !lowered.is_empty() && !terms.iter().any(|known| known.as_ref() == lowered.as_str())
+            {
+                terms.push(Arc::from(lowered));
+            }
+        }
+        fn collect_predicate(predicate: &LogPredicate, terms: &mut Vec<Arc<str>>) {
+            match predicate {
+                LogPredicate::Term(value) | LogPredicate::MessageToken { value, .. } => {
+                    add_term(terms, value);
+                }
+                LogPredicate::MessagePhrase { terms: phrase, .. } => {
+                    for value in phrase {
+                        add_term(terms, value);
+                    }
+                }
+                LogPredicate::MessageFuzzy { value, .. } => add_term(terms, value),
+                LogPredicate::And(predicates) | LogPredicate::Or(predicates) => {
+                    for predicate in predicates {
+                        collect_predicate(predicate, terms);
+                    }
+                }
+                LogPredicate::Not(predicate) => collect_predicate(predicate, terms),
+                LogPredicate::MatchAll
+                | LogPredicate::MatchNone
+                | LogPredicate::Message(_)
+                | LogPredicate::MessageRegex(_)
+                | LogPredicate::MessageTokenRegex(_)
+                | LogPredicate::MessageTokenPrefix { .. }
+                | LogPredicate::FieldExists(_)
+                | LogPredicate::Field { .. }
+                | LogPredicate::FieldIn { .. }
+                | LogPredicate::FieldRegex { .. }
+                | LogPredicate::FieldNumeric { .. } => {}
+            }
+        }
+
+        let mut terms = Vec::new();
+        for term in &request.terms {
+            add_term(&mut terms, term);
+        }
+        for term in &request.message_tokens {
+            add_term(&mut terms, term);
+        }
+        for term in &request.case_insensitive_message_tokens {
+            add_term(&mut terms, term);
+        }
+        collect_predicate(&request.predicate, &mut terms);
+        Self { terms }
+    }
+
+    pub(crate) fn score(&self, message: &str) -> f64 {
+        if self.terms.is_empty() {
+            return 1.0;
+        }
+        let mut frequencies = vec![0_u32; self.terms.len()];
+        let mut document_length = 0_u32;
+        let mut score_token = |token: &[u8]| {
+            document_length = document_length.saturating_add(1);
+            for (index, expected) in self.terms.iter().enumerate() {
+                let expected = expected.as_bytes();
+                if token.len() == expected.len()
+                    && token
+                        .iter()
+                        .zip(expected)
+                        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+                {
+                    frequencies[index] = frequencies[index].saturating_add(1);
+                }
+            }
+        };
+        let message = message.as_bytes();
+        let mut start = 0usize;
+        for (index, byte) in message.iter().copied().enumerate() {
+            if crate::query::clickhouse_token_separator(byte) {
+                if start < index {
+                    score_token(&message[start..index]);
+                }
+                start = index.saturating_add(1);
+            }
+        }
+        if start < message.len() {
+            score_token(&message[start..]);
+        }
+        self.score_indexed(document_length, |term| {
+            let expected = term.as_bytes();
+            self.terms
+                .iter()
+                .position(|known| known.as_bytes() == expected)
+                .map(|index| frequencies[index])
+                .unwrap_or_default()
+        })
+    }
+
+    /// Scores a document whose token frequencies were materialized by the
+    /// structural frame index. Keeping the BM25 calculation here makes the
+    /// indexed and fallback paths use exactly the same ranking semantics.
+    pub(crate) fn score_indexed(
+        &self,
+        document_length: u32,
+        mut frequency_for: impl FnMut(&str) -> u32,
+    ) -> f64 {
+        if self.terms.is_empty() {
+            return 1.0;
+        }
+        let document_length = f64::from(document_length.max(1));
+        let average_document_length = 12.0;
+        let k1 = 1.2;
+        let b = 0.75;
+        let normalization = k1 * (1.0 - b + b * document_length / average_document_length);
+        self.terms
+            .iter()
+            .map(|term| {
+                let frequency = f64::from(frequency_for(term.as_ref()));
+                if frequency == 0.0 {
+                    return 0.0;
+                }
+                (frequency * (k1 + 1.0)) / (frequency + normalization)
+            })
+            .sum()
+    }
+
+    pub(crate) fn score_indexed_by_index(
+        &self,
+        document_length: u32,
+        mut frequency_for: impl FnMut(usize) -> u32,
+    ) -> f64 {
+        if self.terms.is_empty() {
+            return 1.0;
+        }
+        let document_length = f64::from(document_length.max(1));
+        let normalization = 1.2 * (1.0 - 0.75 + 0.75 * document_length / 12.0);
+        self.terms
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let frequency = f64::from(frequency_for(index));
+                if frequency == 0.0 {
+                    return 0.0;
+                }
+                (frequency * 2.2) / (frequency + normalization)
+            })
+            .sum()
+    }
+}
+
 pub(crate) fn span_rows(
     span: &DurableSpan,
     relation: AnalyticsRelation,
@@ -1265,6 +1875,17 @@ pub(crate) fn projected_span_row(
     span: &DurableSpan,
     columns: &[AnalyticsColumn],
 ) -> Result<AnalyticsRow, LokiApiError> {
+    if has_only_columns(columns, AnalyticsColumn::Timestamp, AnalyticsColumn::Name) {
+        let mut row = AnalyticsRow::empty(
+            Arc::clone(&span.tenant),
+            "traces",
+            span.start_time_unix_nanos,
+            span.record_ref.topic_partition.partition_id.get(),
+            span.record_ref.offset.get(),
+        )?;
+        row.name = Some(Arc::clone(&span.name));
+        return Ok(row);
+    }
     let mut row = AnalyticsRow::empty(
         Arc::clone(&span.tenant),
         "traces",
@@ -1326,6 +1947,40 @@ pub(crate) fn projected_span_row(
     }
     if wants(columns, AnalyticsColumn::LinksJson) {
         row.links_json = json(span.links.as_ref())?;
+    }
+    Ok(row)
+}
+
+pub(crate) fn projected_trace_row(
+    tenant: &Arc<str>,
+    span: &TraceProjection,
+    columns: &[AnalyticsColumn],
+) -> Result<AnalyticsRow, LokiApiError> {
+    let mut row = AnalyticsRow::empty(
+        Arc::clone(tenant),
+        "traces",
+        span.start_time_unix_nanos,
+        span.record_ref.topic_partition.partition_id.get(),
+        span.record_ref.offset.get(),
+    )?;
+    if wants(columns, AnalyticsColumn::EndTimestamp) {
+        row.end_timestamp_unix_nanos = span
+            .start_time_unix_nanos
+            .checked_add(span.duration_nanos)
+            .map(timestamp_i64)
+            .transpose()?;
+    }
+    if wants(columns, AnalyticsColumn::Name) {
+        row.name = Some(Arc::clone(&span.name));
+    }
+    if wants(columns, AnalyticsColumn::Kind) {
+        row.kind = Some(span.kind);
+    }
+    if wants(columns, AnalyticsColumn::DurationNanos) {
+        row.duration_nanos = Some(span.duration_nanos);
+    }
+    if wants(columns, AnalyticsColumn::StatusCode) {
+        row.status_code = span.status_code;
     }
     Ok(row)
 }
@@ -1408,6 +2063,25 @@ pub(crate) fn projected_metric_row(
     columns: &[AnalyticsColumn],
 ) -> Result<AnalyticsRow, LokiApiError> {
     let identity = &point.identity;
+    if has_only_columns(
+        columns,
+        AnalyticsColumn::Timestamp,
+        AnalyticsColumn::ScalarDoubleBits,
+    ) {
+        let mut row = AnalyticsRow::empty(
+            Arc::clone(&identity.tenant),
+            "metrics",
+            point.timestamp_unix_nanos,
+            point.record_ref.topic_partition.partition_id.get(),
+            point.record_ref.offset.get(),
+        )?;
+        if let MetricValue::Gauge(NumberValue::DoubleBits(bits))
+        | MetricValue::Sum(NumberValue::DoubleBits(bits)) = &point.value
+        {
+            row.scalar_double_bits = Some(*bits);
+        }
+        return Ok(row);
+    }
     let mut row = AnalyticsRow::empty(
         Arc::clone(&identity.tenant),
         "metrics",
@@ -1593,6 +2267,15 @@ fn populate_projected_attributes(
 
 fn wants(columns: &[AnalyticsColumn], column: AnalyticsColumn) -> bool {
     columns.contains(&column)
+}
+
+#[inline]
+fn has_only_columns(
+    columns: &[AnalyticsColumn],
+    first: AnalyticsColumn,
+    second: AnalyticsColumn,
+) -> bool {
+    columns.len() == 2 && columns.contains(&first) && columns.contains(&second)
 }
 
 fn metric_base_row(
@@ -1803,12 +2486,173 @@ pub(crate) fn row_matches(row: &AnalyticsRow, request: &AnalyticsScanRequest) ->
                 message_has_clickhouse_token(message, term, CaseSensitivity::Insensitive)
             })
         })
+        && predicate_matches_row(&request.predicate, row)
 }
 
 fn fields_match(values: &BTreeMap<String, String>, expected: &[MetadataField]) -> bool {
     expected.iter().all(|field| {
         values.get(field.key.as_ref()).map(String::as_str) == Some(field.value.as_ref())
     })
+}
+
+fn predicate_matches_row(predicate: &LogPredicate, row: &AnalyticsRow) -> bool {
+    let message = row.message.as_deref().unwrap_or_default();
+    match predicate {
+        LogPredicate::MatchAll => true,
+        LogPredicate::MatchNone => false,
+        LogPredicate::Term(term) => message_has_term(message, term),
+        LogPredicate::MessageToken {
+            value,
+            case_sensitivity,
+        } => message_has_clickhouse_token(message, value, *case_sensitivity),
+        LogPredicate::Message(matcher) => text_matches_row(message, matcher),
+        LogPredicate::MessageRegex(regex) => regex.is_match(message),
+        LogPredicate::MessageTokenRegex(regex) => {
+            crate::query::message_has_token_regex(message, regex)
+        }
+        LogPredicate::MessageTokenPrefix {
+            value,
+            case_sensitivity,
+        } => crate::query::message_has_token_prefix(message, value, *case_sensitivity),
+        LogPredicate::MessagePhrase {
+            terms,
+            max_gap,
+            case_sensitivity,
+        } => crate::query::message_has_phrase(message, terms, *max_gap, *case_sensitivity),
+        LogPredicate::MessageFuzzy {
+            value,
+            max_distance,
+        } => crate::query::message_has_fuzzy_token(message, value, *max_distance),
+        LogPredicate::FieldExists(key) => row_has_field(row, key, |_, _| true),
+        LogPredicate::Field { key, matcher } => {
+            row_has_field(row, key, |_, value| text_matches_row(value, matcher))
+        }
+        LogPredicate::FieldIn { key, values } => row_has_field(row, key, |_, value| {
+            values.iter().any(|expected| expected.as_ref() == value)
+        }),
+        LogPredicate::FieldRegex { key, regex } => {
+            row_has_field(row, key, |_, value| regex.is_match(value))
+        }
+        LogPredicate::FieldNumeric {
+            key,
+            comparison,
+            value,
+        } => row_has_field(row, key, |_, observed| {
+            observed
+                .parse::<i128>()
+                .is_ok_and(|observed| numeric_matches_row(observed, *comparison, *value))
+        }),
+        LogPredicate::And(predicates) => predicates
+            .iter()
+            .all(|predicate| predicate_matches_row(predicate, row)),
+        LogPredicate::Or(predicates) => predicates
+            .iter()
+            .any(|predicate| predicate_matches_row(predicate, row)),
+        LogPredicate::Not(predicate) => !predicate_matches_row(predicate, row),
+    }
+}
+
+fn wildcard_pattern_to_regex(pattern: &str) -> String {
+    let mut regex = String::from("^");
+    for character in pattern.chars() {
+        match character {
+            '%' => regex.push_str(".*"),
+            '_' => regex.push('.'),
+            '\\' => regex.push_str("\\\\"),
+            character if ".^$*+?()[]{}|".contains(character) => {
+                regex.push('\\');
+                regex.push(character);
+            }
+            character => regex.push(character),
+        }
+    }
+    regex.push('$');
+    regex
+}
+
+fn row_has_field(
+    row: &AnalyticsRow,
+    key: &str,
+    mut predicate: impl FnMut(&str, &str) -> bool,
+) -> bool {
+    if let Some(name) = key.strip_prefix("resource.loki.label.") {
+        return row
+            .labels
+            .get(name)
+            .is_some_and(|value| predicate(key, value));
+    }
+    if let Some(name) = key.strip_prefix("attr.loki.metadata.") {
+        return row
+            .metadata
+            .get(name)
+            .is_some_and(|value| predicate(key, value));
+    }
+    if let Some(name) = key.strip_prefix("resource.") {
+        return row
+            .resource_attributes
+            .get(name)
+            .is_some_and(|value| predicate(key, value));
+    }
+    if let Some(name) = key.strip_prefix("scope.") {
+        return row
+            .scope_attributes
+            .get(name)
+            .is_some_and(|value| predicate(key, value));
+    }
+    if key == "otel.severity_number" {
+        return row
+            .severity_number
+            .map(|value| value.to_string())
+            .is_some_and(|value| predicate(key, &value));
+    }
+    if key == "otel.severity_text" {
+        return row
+            .severity_text
+            .as_deref()
+            .is_some_and(|value| predicate(key, value));
+    }
+    row.attributes
+        .get(key)
+        .is_some_and(|value| predicate(key, value))
+}
+
+fn text_matches_row(observed: &str, matcher: &TextMatcher) -> bool {
+    let equal = |left: &str, right: &str| match matcher.case_sensitivity {
+        CaseSensitivity::Sensitive => left == right,
+        CaseSensitivity::Insensitive => left.eq_ignore_ascii_case(right),
+    };
+    match matcher.kind {
+        TextMatchKind::Exact => equal(observed, &matcher.value),
+        TextMatchKind::Contains => match matcher.case_sensitivity {
+            CaseSensitivity::Sensitive => observed.contains(&*matcher.value),
+            CaseSensitivity::Insensitive => observed
+                .to_ascii_lowercase()
+                .contains(&matcher.value.to_ascii_lowercase()),
+        },
+        TextMatchKind::Prefix => match matcher.case_sensitivity {
+            CaseSensitivity::Sensitive => observed.starts_with(&*matcher.value),
+            CaseSensitivity::Insensitive => observed
+                .get(..matcher.value.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&matcher.value)),
+        },
+        TextMatchKind::Suffix => match matcher.case_sensitivity {
+            CaseSensitivity::Sensitive => observed.ends_with(&*matcher.value),
+            CaseSensitivity::Insensitive => observed
+                .get(observed.len().saturating_sub(matcher.value.len())..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(&matcher.value)),
+        },
+    }
+}
+
+fn numeric_matches_row(observed: i128, comparison: NumericComparison, expected: i128) -> bool {
+    match comparison {
+        NumericComparison::Equal => observed == expected,
+        NumericComparison::NotEqual => observed != expected,
+        NumericComparison::LessThan => observed < expected,
+        NumericComparison::LessThanOrEqual => observed <= expected,
+        NumericComparison::GreaterThan => observed > expected,
+        NumericComparison::GreaterThanOrEqual => observed >= expected,
+    }
 }
 
 pub(crate) fn analytics_stream_response(
@@ -1957,12 +2801,165 @@ fn write_jsonlines_stream(
     writer: &mut dyn Write,
 ) -> Result<(), LokiApiError> {
     debug_assert!(!request.cardinality_only);
+    if !request.group_by.is_empty() {
+        return store.scan_analytics_grouped(request, &mut |groups| {
+            for group in groups {
+                serde_json::to_writer(&mut *writer, group)
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                writer.write_all(b"\n").map_err(rowbinary_error)?;
+            }
+            Ok(())
+        });
+    }
+    const JSON_WRITE_BATCH_BYTES: usize = 64 * 1024;
+    let mut encoded_row = Vec::with_capacity(1024);
+    let mut encoded_batch = Vec::with_capacity(JSON_WRITE_BATCH_BYTES);
     store.scan_analytics(request, &mut |rows| {
         for row in rows {
-            write_jsonlines_row(writer, row, &request.columns)?;
+            encoded_row.clear();
+            write_jsonlines_row(&mut encoded_row, row, &request.columns)?;
+            if !encoded_batch.is_empty()
+                && encoded_batch.len().saturating_add(encoded_row.len()) > JSON_WRITE_BATCH_BYTES
+            {
+                writer.write_all(&encoded_batch).map_err(rowbinary_error)?;
+                encoded_batch.clear();
+            }
+            encoded_batch.extend_from_slice(&encoded_row);
         }
         Ok(())
-    })
+    })?;
+    if !encoded_batch.is_empty() {
+        writer.write_all(&encoded_batch).map_err(rowbinary_error)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn group_analytics_rows<S: LokiStore + ?Sized>(
+    store: &S,
+    request: &AnalyticsScanRequest,
+    emit: &mut dyn FnMut(&[AnalyticsGroupRow]) -> Result<(), LokiApiError>,
+) -> Result<(), LokiApiError> {
+    request.validate()?;
+    if request.group_by.is_empty() {
+        return Err(LokiApiError::bad_request(
+            "grouping requires at least one group key",
+        ));
+    }
+    let mut scan = request.clone();
+    scan.group_by.clear();
+    scan.group_limit = None;
+    scan.group_order = AnalyticsGroupOrder::KeyAscending;
+    scan.cardinality_only = false;
+    scan.limit = None;
+    scan.order = None;
+    for key in &request.group_by {
+        let column = match key {
+            AnalyticsGroupKey::SeverityText => AnalyticsColumn::SeverityText,
+            AnalyticsGroupKey::ScopeName => AnalyticsColumn::Metadata,
+            AnalyticsGroupKey::Minute => AnalyticsColumn::Timestamp,
+        };
+        if !scan.columns.contains(&column) {
+            scan.columns.push(column);
+        }
+    }
+    let mut groups = BTreeMap::<Vec<Option<Arc<str>>>, u64>::new();
+    store.scan_analytics(&scan, &mut |rows| {
+        for row in rows {
+            let key = request
+                .group_by
+                .iter()
+                .map(|group| group_value(row, *group))
+                .collect::<Vec<_>>();
+            let count = groups.entry(key).or_default();
+            *count = count.saturating_add(1);
+        }
+        Ok(())
+    })?;
+    let mut grouped = groups
+        .into_iter()
+        .map(|(keys, count)| AnalyticsGroupRow { keys, count })
+        .collect::<Vec<_>>();
+    if request.group_order == AnalyticsGroupOrder::CountDescending {
+        grouped.sort_unstable_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.keys.cmp(&right.keys))
+        });
+    }
+    if let Some(limit) = request.group_limit {
+        grouped.truncate(limit);
+    }
+    if !grouped.is_empty() {
+        emit(&grouped)?;
+    }
+    Ok(())
+}
+
+fn group_value(row: &AnalyticsRow, key: AnalyticsGroupKey) -> Option<Arc<str>> {
+    match key {
+        AnalyticsGroupKey::SeverityText => row
+            .severity_text
+            .clone()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                row.metadata
+                    .get("severity_text")
+                    .map(|value| Arc::<str>::from(value.as_str()))
+            }),
+        AnalyticsGroupKey::ScopeName => row
+            .metadata
+            .get("scope_name")
+            .map(|value| Arc::<str>::from(value.as_str())),
+        AnalyticsGroupKey::Minute => Some(Arc::from(
+            (row.timestamp_unix_nanos.div_euclid(60_000_000_000)).to_string(),
+        )),
+    }
+}
+
+pub(crate) fn durable_group_value(record: &DurableLog, key: AnalyticsGroupKey) -> Option<Arc<str>> {
+    match key {
+        AnalyticsGroupKey::SeverityText => record
+            .fields
+            .iter()
+            .find(|field| field.key.as_ref() == "attr.loki.metadata.severity_text")
+            .map(|field| Arc::clone(&field.value))
+            .or_else(|| {
+                (!record.severity_text.is_empty()).then(|| Arc::clone(&record.severity_text))
+            }),
+        AnalyticsGroupKey::ScopeName => record
+            .fields
+            .iter()
+            .find(|field| field.key.as_ref() == "attr.loki.metadata.scope_name")
+            .map(|field| Arc::clone(&field.value)),
+        AnalyticsGroupKey::Minute => Some(Arc::from(
+            (record.timestamp_unix_nanos / 60_000_000_000).to_string(),
+        )),
+    }
+}
+
+pub(crate) fn decoded_group_value(
+    record: &crate::DecodedStructuralRecord,
+    key: AnalyticsGroupKey,
+) -> Option<Arc<str>> {
+    match key {
+        AnalyticsGroupKey::SeverityText => record
+            .fields
+            .iter()
+            .find(|field| field.key.as_ref() == "attr.loki.metadata.severity_text")
+            .map(|field| Arc::clone(&field.value))
+            .or_else(|| {
+                (!record.severity_text.is_empty()).then(|| Arc::clone(&record.severity_text))
+            }),
+        AnalyticsGroupKey::ScopeName => record
+            .fields
+            .iter()
+            .find(|field| field.key.as_ref() == "attr.loki.metadata.scope_name")
+            .map(|field| Arc::clone(&field.value)),
+        AnalyticsGroupKey::Minute => Some(Arc::from(
+            (record.timestamp_unix_nanos / 60_000_000_000).to_string(),
+        )),
+    }
 }
 
 fn write_jsonlines_row(
@@ -1970,48 +2967,60 @@ fn write_jsonlines_row(
     row: &AnalyticsRow,
     columns: &[AnalyticsColumn],
 ) -> Result<(), LokiApiError> {
-    let mut object = JsonMap::with_capacity(columns.len());
-    for column in columns {
-        object.insert(column.name().to_owned(), json_column_value(row, *column));
+    writer.write_all(b"{").map_err(rowbinary_error)?;
+    for (index, column) in columns.iter().copied().enumerate() {
+        if index != 0 {
+            writer.write_all(b",").map_err(rowbinary_error)?;
+        }
+        serde_json::to_writer(&mut *writer, column.name()).map_err(json_error)?;
+        writer.write_all(b":").map_err(rowbinary_error)?;
+        write_json_column(writer, row, column)?;
     }
-    serde_json::to_writer(&mut *writer, &JsonValue::Object(object))
-        .map_err(|error| LokiApiError::internal(error.to_string()))?;
-    writer.write_all(b"\n").map_err(rowbinary_error)
+    writer.write_all(b"}\n").map_err(rowbinary_error)
 }
 
-fn json_column_value(row: &AnalyticsRow, column: AnalyticsColumn) -> JsonValue {
+fn write_json_column(
+    writer: &mut dyn Write,
+    row: &AnalyticsRow,
+    column: AnalyticsColumn,
+) -> Result<(), LokiApiError> {
     match column.field().data_type() {
-        DataType::Utf8 => string_value(row, column)
-            .map(|value| JsonValue::String(value.to_owned()))
-            .unwrap_or(JsonValue::Null),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => timestamp_value(row, column)
-            .map(JsonValue::from)
-            .unwrap_or(JsonValue::Null),
-        DataType::UInt32 => u32_value(row, column)
-            .map(JsonValue::from)
-            .unwrap_or(JsonValue::Null),
-        DataType::UInt64 => u64_value(row, column)
-            .map(JsonValue::from)
-            .unwrap_or(JsonValue::Null),
-        DataType::Int32 => i32_value(row, column)
-            .map(JsonValue::from)
-            .unwrap_or(JsonValue::Null),
-        DataType::Int64 => row
-            .scalar_integer
-            .map(JsonValue::from)
-            .unwrap_or(JsonValue::Null),
-        DataType::Boolean => row
-            .monotonic
-            .map(JsonValue::from)
-            .unwrap_or(JsonValue::Null),
-        DataType::Map(_, _) => JsonValue::Object(
-            map_value(row, column)
-                .iter()
-                .map(|(key, value)| (key.clone(), JsonValue::String(value.clone())))
-                .collect(),
-        ),
+        DataType::Utf8 => write_json_scalar(writer, string_value(row, column)),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            write_json_scalar(writer, timestamp_value(row, column))
+        }
+        DataType::UInt32 => write_json_scalar(writer, u32_value(row, column)),
+        DataType::UInt64 => write_json_scalar(writer, u64_value(row, column)),
+        DataType::Float64 => write_json_scalar(writer, f64_value(row, column)),
+        DataType::Int32 => write_json_scalar(writer, i32_value(row, column)),
+        DataType::Int64 => write_json_scalar(writer, row.scalar_integer),
+        DataType::Boolean => write_json_scalar(writer, row.monotonic),
+        DataType::Map(_, _) => write_json_map(writer, map_value(row, column)),
         _ => unreachable!("public analytical columns use supported JSON types"),
     }
+}
+
+fn write_json_scalar<T: Serialize>(
+    writer: &mut dyn Write,
+    value: Option<T>,
+) -> Result<(), LokiApiError> {
+    serde_json::to_writer(&mut *writer, &value).map_err(json_error)
+}
+
+fn write_json_map(
+    writer: &mut dyn Write,
+    values: &BTreeMap<String, String>,
+) -> Result<(), LokiApiError> {
+    writer.write_all(b"{").map_err(rowbinary_error)?;
+    for (index, (key, value)) in values.iter().enumerate() {
+        if index != 0 {
+            writer.write_all(b",").map_err(rowbinary_error)?;
+        }
+        serde_json::to_writer(&mut *writer, key).map_err(json_error)?;
+        writer.write_all(b":").map_err(rowbinary_error)?;
+        serde_json::to_writer(&mut *writer, value).map_err(json_error)?;
+    }
+    writer.write_all(b"}").map_err(rowbinary_error)
 }
 
 fn rowbinary_default_value(column: AnalyticsColumn) -> Vec<u8> {
@@ -2022,7 +3031,10 @@ fn rowbinary_default_value(column: AnalyticsColumn) -> Vec<u8> {
     match field.data_type() {
         DataType::Utf8 | DataType::Boolean | DataType::Map(_, _) => vec![0],
         DataType::UInt32 | DataType::Int32 => vec![0; size_of::<u32>()],
-        DataType::Timestamp(TimeUnit::Nanosecond, _) | DataType::UInt64 | DataType::Int64 => {
+        DataType::Timestamp(TimeUnit::Nanosecond, _)
+        | DataType::UInt64
+        | DataType::Int64
+        | DataType::Float64 => {
             vec![0; size_of::<u64>()]
         }
         _ => unreachable!("public analytical columns use supported RowBinary types"),
@@ -2061,6 +3073,14 @@ fn write_rowbinary_row(
             }
             DataType::UInt64 => {
                 let value = u64_value(row, *column);
+                if write_rowbinary_presence(writer, value.is_some(), field.is_nullable())? {
+                    writer
+                        .write_all(&value.expect("presence was checked").to_le_bytes())
+                        .map_err(rowbinary_error)?;
+                }
+            }
+            DataType::Float64 => {
+                let value = f64_value(row, *column);
                 if write_rowbinary_presence(writer, value.is_some(), field.is_nullable())? {
                     writer
                         .write_all(&value.expect("presence was checked").to_le_bytes())
@@ -2144,6 +3164,10 @@ fn write_rowbinary_varuint(writer: &mut dyn Write, mut value: usize) -> Result<(
 }
 
 fn rowbinary_error(error: io::Error) -> LokiApiError {
+    LokiApiError::internal(error.to_string())
+}
+
+fn json_error(error: serde_json::Error) -> LokiApiError {
     LokiApiError::internal(error.to_string())
 }
 
@@ -2575,6 +3599,17 @@ fn column_array(rows: &[AnalyticsRow], column: AnalyticsColumn) -> Result<ArrayR
             }
             Arc::new(builder.finish())
         }
+        DataType::Float64 => {
+            let mut builder = Float64Builder::with_capacity(rows.len());
+            for row in rows {
+                if let Some(value) = f64_value(row, column) {
+                    builder.append_value(value);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        }
         DataType::Int32 => {
             let mut builder = Int32Builder::with_capacity(rows.len());
             for row in rows {
@@ -2678,6 +3713,13 @@ fn u64_value(row: &AnalyticsRow, column: AnalyticsColumn) -> Option<u64> {
         AnalyticsColumn::Offset => Some(row.offset),
         AnalyticsColumn::DurationNanos => row.duration_nanos,
         AnalyticsColumn::ScalarDoubleBits => row.scalar_double_bits,
+        _ => None,
+    }
+}
+
+fn f64_value(row: &AnalyticsRow, column: AnalyticsColumn) -> Option<f64> {
+    match column {
+        AnalyticsColumn::Score => row.score,
         _ => None,
     }
 }
@@ -2795,6 +3837,7 @@ mod tests {
 
     use arrow_array::{MapArray, StringArray, TimestampNanosecondArray};
     use arrow_ipc::reader::StreamReader;
+    use serde_json::Value as JsonValue;
 
     use super::*;
     use crate::LokiEntry;
@@ -2860,6 +3903,7 @@ mod tests {
             "relation=spans&term=error",
             "relation=spans&message_token=error",
             "relation=spans&message_token_ci=error",
+            "relation=spans&message_regex=error",
             "trace_id=00",
             "columns=offset&cardinality_only=maybe",
             "columns=offset&cardinality_only=1&cardinality_only=1",
@@ -2875,6 +3919,70 @@ mod tests {
                 "query must fail closed: {query}"
             );
         }
+    }
+
+    #[test]
+    fn request_parses_searchbench_token_predicates() {
+        let request = parse_scan_request(
+            "tenant-a".to_owned(),
+            Some("message_token_prefix=conn&message_token_regex=charg.*&message_phrase=failed|order:2&message_fuzzy=connection:1&message_like=%nnec%"),
+        )
+        .expect("search predicates parse");
+        assert!(matches!(request.predicate, LogPredicate::And(_)));
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn request_parses_relevance_order_explicit_or_and_trace_join() {
+        let request = parse_scan_request(
+            "tenant-a".to_owned(),
+            Some("message_phrase=failed|to|place|order&message_token_ci=charge&predicate_operator=or&limit=100&order=score_desc&columns=timestamp,message,score&wire=jsonl"),
+        )
+        .expect("relevance request parses");
+        assert_eq!(request.order, Some(AnalyticsScanOrder::RelevanceDescending));
+        assert!(request.predicate_any);
+        assert!(matches!(request.predicate, LogPredicate::Or(_)));
+        assert!(request.columns.contains(&AnalyticsColumn::Score));
+
+        let join = parse_scan_request(
+            "tenant-a".to_owned(),
+            Some("columns=partition&cardinality_only=1&distinct_trace_id=1&trace_join_service=payment&wire=rowbinary"),
+        )
+        .expect("trace join parses");
+        assert!(join.distinct_trace_id);
+        assert_eq!(join.trace_join_service.as_deref(), Some("payment"));
+        assert!(join.validate().is_ok());
+    }
+
+    #[test]
+    fn log_projection_only_requires_typed_metadata_for_typed_columns() {
+        assert!(!log_columns_need_typed_metadata(&[
+            AnalyticsColumn::Timestamp,
+            AnalyticsColumn::Message,
+            AnalyticsColumn::Labels,
+            AnalyticsColumn::Metadata,
+        ]));
+        assert!(log_columns_need_typed_metadata(&[
+            AnalyticsColumn::Timestamp,
+            AnalyticsColumn::Message,
+            AnalyticsColumn::BodyJson,
+        ]));
+        assert!(log_columns_need_typed_metadata(&[
+            AnalyticsColumn::ResourceId
+        ]));
+        assert!(!log_columns_need_typed_metadata(&[
+            AnalyticsColumn::Timestamp,
+            AnalyticsColumn::SeverityText,
+            AnalyticsColumn::Message,
+        ]));
+        assert!(!log_columns_need_structural_fields(&[
+            AnalyticsColumn::Timestamp,
+            AnalyticsColumn::SeverityText,
+            AnalyticsColumn::Message,
+        ]));
+        assert!(log_columns_need_structural_fields(&[
+            AnalyticsColumn::Labels
+        ]));
     }
 
     #[test]
@@ -2930,6 +4038,60 @@ mod tests {
     }
 
     #[test]
+    fn boolean_message_and_field_predicates_are_parsed() {
+        let request = parse_scan_request(
+            "tenant-a".to_owned(),
+            Some("message_any=error&message_any=failed&message_not=cache&field_numeric.otel.severity_number=ge:13&field_regex.service.name=checkout.*"),
+        )
+        .expect("predicate scan");
+        assert!(
+            matches!(request.predicate, LogPredicate::And(predicates) if predicates.len() == 4)
+        );
+        let min_match = parse_scan_request(
+            "tenant-a".to_owned(),
+            Some("message_any=error&message_any=failed&message_any=charge&message_any=cache&message_min_match=2"),
+        )
+        .expect("min-match scan");
+        assert!(
+            matches!(min_match.predicate, LogPredicate::Or(predicates) if predicates.len() == 6)
+        );
+    }
+
+    #[test]
+    fn in_memory_scan_applies_boolean_predicates() {
+        let entries = vec![
+            LokiEntry {
+                timestamp_unix_nanos: 1,
+                labels: BTreeMap::new(),
+                line: "request failed".to_owned(),
+                structured_metadata: BTreeMap::new(),
+            },
+            LokiEntry {
+                timestamp_unix_nanos: 2,
+                labels: BTreeMap::new(),
+                line: "request failed cache".to_owned(),
+                structured_metadata: BTreeMap::new(),
+            },
+        ];
+        let mut request = AnalyticsScanRequest::new("tenant-a");
+        request.predicate = LogPredicate::and(vec![
+            LogPredicate::message_regex("failed", CaseSensitivity::Sensitive).expect("valid regex"),
+            LogPredicate::negate(LogPredicate::message_token(
+                "cache",
+                CaseSensitivity::Sensitive,
+            )),
+        ]);
+        let mut rows = Vec::new();
+        scan_entries(entries, &request, &mut |batch| {
+            rows.extend_from_slice(batch);
+            Ok(())
+        })
+        .expect("predicate scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message.as_deref(), Some("request failed"));
+    }
+
+    #[test]
     fn zero_limit_is_a_valid_empty_scan() {
         let entries = vec![LokiEntry {
             timestamp_unix_nanos: 11,
@@ -2951,8 +4113,9 @@ mod tests {
     #[test]
     fn projected_arrow_batch_preserves_timestamp_message_and_maps() {
         let mut row = AnalyticsRow::empty(Arc::from("tenant-a"), "logs", 123, 4, 9).expect("row");
-        row.message = Some(Arc::from("request failed"));
-        row.labels.insert("app".to_owned(), "api".to_owned());
+        row.message = Some(Arc::from("request \"failed\"\\n"));
+        row.labels
+            .insert("app\nname".to_owned(), "api\\edge".to_owned());
         row.metadata.insert("code".to_owned(), "500".to_owned());
         let columns = vec![
             AnalyticsColumn::Timestamp,
@@ -2985,7 +4148,7 @@ mod tests {
                 .downcast_ref::<StringArray>()
                 .unwrap()
                 .value(0),
-            "request failed"
+            "request \"failed\"\\n"
         );
         assert_eq!(
             decoded
@@ -3008,8 +4171,9 @@ mod tests {
             9,
         )
         .expect("row");
-        row.message = Some(Arc::from("request failed"));
-        row.labels.insert("app".to_owned(), "api".to_owned());
+        row.message = Some(Arc::from("request \"failed\"\\n"));
+        row.labels
+            .insert("app\nname".to_owned(), "api\\edge".to_owned());
         row.metadata.insert("code".to_owned(), "500".to_owned());
         let columns = vec![
             AnalyticsColumn::Timestamp,
@@ -3024,8 +4188,8 @@ mod tests {
         let value: JsonValue = serde_json::from_slice(&output).expect("valid JSON line");
         assert_eq!(value["timestamp"], 1_800_000_000_000_000_001_i64);
         assert_eq!(value["offset"], 9_u64);
-        assert_eq!(value["message"], "request failed");
-        assert_eq!(value["labels"]["app"], "api");
+        assert_eq!(value["message"], "request \"failed\"\\n");
+        assert_eq!(value["labels"]["app\nname"], "api\\edge");
         assert_eq!(value["metadata"]["code"], "500");
     }
 
@@ -3127,5 +4291,36 @@ mod tests {
         .expect("scan");
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].message.as_deref(), Some("request ERROR"));
+    }
+
+    #[test]
+    fn indexed_relevance_score_matches_message_scan() {
+        let mut request = AnalyticsScanRequest::new("tenant-a");
+        request.message_tokens.push(Arc::from("error"));
+        request.predicate = LogPredicate::And(vec![
+            LogPredicate::message_token("checkout", CaseSensitivity::Insensitive),
+            LogPredicate::message_token("ERROR", CaseSensitivity::Insensitive),
+        ]);
+        let scorer = RelevanceScorer::from_request(&request);
+        let message = "ERROR checkout error";
+        let mut document_length = 0_u32;
+        let mut frequencies = BTreeMap::<String, u32>::new();
+        crate::query::scan_clickhouse_tokens(message, |token| {
+            document_length = document_length.saturating_add(1);
+            let token = token.to_ascii_lowercase();
+            let frequency = frequencies.entry(token).or_default();
+            *frequency = frequency.saturating_add(1);
+        });
+        let indexed = scorer.score_indexed(document_length, |term| {
+            frequencies.get(term).copied().unwrap_or_default()
+        });
+        let indexed_by_index = scorer.score_indexed_by_index(document_length, |index| {
+            frequencies
+                .get(scorer.terms()[index].as_ref())
+                .copied()
+                .unwrap_or_default()
+        });
+        assert_eq!(scorer.score(message).to_bits(), indexed.to_bits());
+        assert_eq!(indexed.to_bits(), indexed_by_index.to_bits());
     }
 }

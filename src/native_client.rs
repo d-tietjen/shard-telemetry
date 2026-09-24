@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::future::try_join_all;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, MutexGuard};
@@ -242,8 +243,24 @@ impl ShardTelemetryClient {
         &self,
         batch: &NativeTelemetryBatch,
     ) -> Result<NativeTelemetryAppendAck, NativeClientError> {
-        self.append_with_request_id(batch, self.next_request_id())
+        self.append_with_opcode(batch, self.next_request_id(), NativeOpcode::AppendUntracked)
             .await
+    }
+
+    /// Appends independent batches concurrently through the configured
+    /// connection pool. Set [`NativeClientConfig::with_max_connections`] to
+    /// the desired concurrency; a single connection still serializes its
+    /// exchanges to preserve request/response framing.
+    pub async fn append_many(
+        &self,
+        batches: Vec<NativeTelemetryBatch>,
+    ) -> Result<Vec<NativeTelemetryAppendAck>, NativeClientError> {
+        try_join_all(
+            batches
+                .into_iter()
+                .map(|batch| async move { self.append(&batch).await }),
+        )
+        .await
     }
 
     /// Appends logs with a client-generated request ID.
@@ -283,10 +300,18 @@ impl ShardTelemetryClient {
         batch: &NativeTelemetryBatch,
         request_id: u128,
     ) -> Result<NativeTelemetryAppendAck, NativeClientError> {
+        self.append_with_opcode(batch, request_id, NativeOpcode::Append)
+            .await
+    }
+
+    async fn append_with_opcode(
+        &self,
+        batch: &NativeTelemetryBatch,
+        request_id: u128,
+        opcode: NativeOpcode,
+    ) -> Result<NativeTelemetryAppendAck, NativeClientError> {
         let payload = batch.encode_native_append()?;
-        let response = self
-            .request(NativeOpcode::Append, request_id, payload)
-            .await?;
+        let response = self.request(opcode, request_id, payload).await?;
         NativeTelemetryAppendAck::decode(&response).map_err(Into::into)
     }
 
@@ -492,6 +517,7 @@ async fn exchange(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -506,18 +532,16 @@ mod tests {
     };
 
     #[derive(Debug)]
-    struct ParallelAppendGate {
-        state: std::sync::Mutex<ParallelAppendGateState>,
-        arrivals: std::sync::Condvar,
+    struct AppendCountingGate {
+        state: std::sync::Mutex<AppendCountingGateState>,
     }
 
     #[derive(Debug, Default)]
-    struct ParallelAppendGateState {
-        active: usize,
-        maximum_active: usize,
+    struct AppendCountingGateState {
+        calls: usize,
     }
 
-    impl NativeRequestGate for ParallelAppendGate {
+    impl NativeRequestGate for AppendCountingGate {
         fn check(&self) -> Result<(), String> {
             Ok(())
         }
@@ -527,18 +551,7 @@ mod tests {
             _partitions: &[crate::NativePartitionAppend],
         ) -> Result<(), String> {
             let mut state = self.state.lock().map_err(|_| "test gate poisoned")?;
-            state.active = state.active.saturating_add(1);
-            state.maximum_active = state.maximum_active.max(state.active);
-            if state.active == 1 {
-                let (next, _) = self
-                    .arrivals
-                    .wait_timeout(state, Duration::from_secs(2))
-                    .map_err(|_| "test gate poisoned")?;
-                state = next;
-            } else {
-                self.arrivals.notify_one();
-            }
-            state.active = state.active.saturating_sub(1);
+            state.calls = state.calls.saturating_add(1);
             Ok(())
         }
     }
@@ -652,6 +665,18 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(queried.entries, vec![entry]);
+        let receipt_directory = directory.join("native-append-receipts-v2");
+        let durable_receipts = fs::read_dir(&receipt_directory)
+            .expect("receipt directory")
+            .count();
+        client.append(&batch).await.expect("untracked append");
+        assert_eq!(
+            fs::read_dir(&receipt_directory)
+                .expect("receipt directory")
+                .count(),
+            durable_receipts,
+            "ordinary appends must not force a durable retry receipt"
+        );
 
         drop(client);
         stop.send(()).expect("stop");
@@ -663,8 +688,8 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn configured_connection_pool_executes_independent_appends_concurrently() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn configured_connection_pool_routes_independent_appends_across_connections() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -690,9 +715,8 @@ mod tests {
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
-        let gate = Arc::new(ParallelAppendGate {
-            state: std::sync::Mutex::new(ParallelAppendGateState::default()),
-            arrivals: std::sync::Condvar::new(),
+        let gate = Arc::new(AppendCountingGate {
+            state: std::sync::Mutex::new(AppendCountingGateState::default()),
         });
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let server_store = Arc::clone(&store);
@@ -716,6 +740,9 @@ mod tests {
                 .expect("client"),
         );
         assert_eq!(client.connections.len(), 2);
+        let (first_health, second_health) = tokio::join!(client.health(), client.health());
+        first_health.expect("first pooled connection health check");
+        second_health.expect("second pooled connection health check");
         let first = NativeTelemetryBatch {
             partitions: vec![NativePartitionAppend {
                 topic_partition: TopicPartition::new(
@@ -754,32 +781,17 @@ mod tests {
                 transient_context: None,
             }],
         };
-        let start = Arc::new(tokio::sync::Barrier::new(3));
-        let first_client = Arc::clone(&client);
-        let first_start = Arc::clone(&start);
-        let first_append = tokio::spawn(async move {
-            first_start.wait().await;
-            first_client.append_with_request_id(&first, 100).await
-        });
-        let second_client = Arc::clone(&client);
-        let second_start = Arc::clone(&start);
-        let second_append = tokio::spawn(async move {
-            second_start.wait().await;
-            second_client.append_with_request_id(&second, 101).await
-        });
-        start.wait().await;
-        first_append
+        let acknowledgements = client
+            .append_many(vec![first, second])
             .await
-            .expect("first append task")
-            .expect("first append");
-        second_append
-            .await
-            .expect("second append task")
-            .expect("second append");
-        assert_eq!(
-            gate.state.lock().expect("test gate state").maximum_active,
-            2
-        );
+            .expect("pooled appends");
+        assert_eq!(acknowledgements.len(), 2);
+        let calls = gate.state.lock().expect("test gate state").calls;
+        assert_eq!(calls, 2, "expected both pooled appends to reach the server");
+        assert_eq!(client.next_connection.load(Ordering::Relaxed), 4);
+        for connection in &client.connections {
+            assert!(connection.lock().await.is_some());
+        }
 
         drop(client);
         stop.send(()).expect("stop");

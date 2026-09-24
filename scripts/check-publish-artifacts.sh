@@ -64,6 +64,7 @@ cargo package "${package_args[@]}" --list > "$package_list"
 required_files=(
   Cargo.lock
   Cargo.toml
+  EMBEDDED_USAGE.md
   LICENSE
   NOTICE
   README.md
@@ -71,6 +72,7 @@ required_files=(
   src/embedded.rs
   src/fast_telemetry.rs
   src/lib.rs
+  src/usage_ledger.rs
 )
 for required_file in "${required_files[@]}"
 do

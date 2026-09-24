@@ -147,9 +147,27 @@ fn main() -> Result<(), Box<dyn Error>> {
             expected_matches: error_matches,
         },
         Workload {
+            name: "boolean_common_and_error_or_rare_limit_100",
+            query: LogQuery::new(partition)
+                .where_predicate(LogPredicate::and(vec![
+                    LogPredicate::term("common"),
+                    LogPredicate::or(vec![
+                        LogPredicate::field_equals("severity", "ERROR"),
+                        LogPredicate::term("rare"),
+                    ]),
+                ]))
+                .with_limit(100),
+            expected_matches: error_matches.min(100),
+        },
+        Workload {
             name: "message_contains_rare",
             query: LogQuery::new(partition)
                 .where_predicate(LogPredicate::message_contains(" rare")),
+            expected_matches: rare_matches,
+        },
+        Workload {
+            name: "message_contains_rare_literal",
+            query: LogQuery::new(partition).where_predicate(LogPredicate::message_contains("rare")),
             expected_matches: rare_matches,
         },
         Workload {

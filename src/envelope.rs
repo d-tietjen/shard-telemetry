@@ -25,6 +25,21 @@ pub struct TelemetryEnvelope {
     pub payload: Arc<[u8]>,
 }
 
+/// Borrowed view of a checksummed durable telemetry append payload.
+///
+/// This keeps validation and signal decoding from allocating sections that
+/// the caller will immediately consume. Callers that need to retain the
+/// envelope can still use [`TelemetryEnvelope::decode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TelemetryEnvelopeView<'a> {
+    pub(crate) signal: TelemetrySignal,
+    pub(crate) tenant: &'a str,
+    pub(crate) item_count: u32,
+    pub(crate) routing_metadata: &'a [u8],
+    pub(crate) payload: &'a [u8],
+    pub(crate) checksum: [u8; 32],
+}
+
 impl TelemetryEnvelope {
     /// Returns whether bytes begin with the current STEL envelope magic.
     #[must_use]
@@ -62,7 +77,8 @@ impl TelemetryEnvelope {
         if total_len > MAX_TELEMETRY_ENVELOPE_BYTES {
             return Err(TelemetryError::TelemetryEnvelopeTooLarge);
         }
-        let mut encoded = vec![0; ENVELOPE_HEADER_BYTES];
+        let mut encoded = Vec::with_capacity(total_len);
+        encoded.resize(ENVELOPE_HEADER_BYTES, 0);
         encoded[..4].copy_from_slice(&ENVELOPE_MAGIC);
         encoded[4] = ENVELOPE_VERSION;
         encoded[5] = self.signal as u8;
@@ -92,6 +108,34 @@ impl TelemetryEnvelope {
 
     /// Decodes and verifies an `STEL` envelope before exposing any payload bytes.
     pub fn decode(encoded: &[u8]) -> TelemetryResult<Self> {
+        let view = Self::decode_view(encoded)?;
+        Self::new(
+            view.signal,
+            view.tenant,
+            view.item_count,
+            view.routing_metadata,
+            view.payload,
+        )
+    }
+
+    /// Validates an `STEL` envelope without allocating any of its sections.
+    pub(crate) fn decode_view(encoded: &[u8]) -> TelemetryResult<TelemetryEnvelopeView<'_>> {
+        Self::decode_view_internal(encoded, true)
+    }
+
+    /// Decodes an envelope after an earlier live-path validation proved its
+    /// checksum for these exact bytes. This retains every structural and
+    /// semantic check while avoiding a second BLAKE3 pass before indexing.
+    pub(crate) fn decode_view_after_validation(
+        encoded: &[u8],
+    ) -> TelemetryResult<TelemetryEnvelopeView<'_>> {
+        Self::decode_view_internal(encoded, false)
+    }
+
+    fn decode_view_internal(
+        encoded: &[u8],
+        verify_checksum: bool,
+    ) -> TelemetryResult<TelemetryEnvelopeView<'_>> {
         if encoded.len() < ENVELOPE_HEADER_BYTES || encoded.len() > MAX_TELEMETRY_ENVELOPE_BYTES {
             return Err(TelemetryError::InvalidTelemetryEnvelope(
                 "envelope length is outside the supported range",
@@ -115,7 +159,7 @@ impl TelemetryEnvelope {
         let expected_checksum: [u8; 32] = encoded[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 32]
             .try_into()
             .expect("fixed range");
-        if checksum(encoded).as_bytes() != &expected_checksum {
+        if verify_checksum && checksum(encoded).as_bytes() != &expected_checksum {
             return Err(TelemetryError::InvalidTelemetryEnvelope(
                 "envelope checksum mismatch",
             ));
@@ -145,13 +189,29 @@ impl TelemetryEnvelope {
         let payload_start = routing_start + routing_len;
         let tenant = std::str::from_utf8(&encoded[tenant_start..routing_start])
             .map_err(|_| TelemetryError::InvalidTelemetryEnvelope("tenant is not UTF-8"))?;
-        Self::new(
+        if tenant.is_empty() {
+            return Err(TelemetryError::InvalidTelemetryEnvelope(
+                "tenant must not be empty",
+            ));
+        }
+        if item_count == 0 {
+            return Err(TelemetryError::InvalidTelemetryEnvelope(
+                "item count must not be zero",
+            ));
+        }
+        if payload_start == encoded.len() {
+            return Err(TelemetryError::InvalidTelemetryEnvelope(
+                "payload must not be empty",
+            ));
+        }
+        Ok(TelemetryEnvelopeView {
             signal,
             tenant,
             item_count,
-            &encoded[routing_start..payload_start],
-            &encoded[payload_start..],
-        )
+            routing_metadata: &encoded[routing_start..payload_start],
+            payload: &encoded[payload_start..],
+            checksum: expected_checksum,
+        })
     }
 
     fn validate(&self) -> TelemetryResult<()> {
@@ -198,6 +258,27 @@ mod tests {
         .unwrap();
         let encoded = envelope.encode().unwrap();
         assert_eq!(TelemetryEnvelope::decode(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn borrowed_view_matches_owned_decode_without_changing_validation() {
+        let envelope = TelemetryEnvelope::new(
+            TelemetrySignal::Traces,
+            "tenant-a",
+            7,
+            &b"partition-key"[..],
+            &b"signal-payload"[..],
+        )
+        .unwrap();
+        let encoded = envelope.encode().unwrap();
+        let view = TelemetryEnvelope::decode_view(&encoded).unwrap();
+        let owned = TelemetryEnvelope::decode(&encoded).unwrap();
+
+        assert_eq!(view.signal, owned.signal);
+        assert_eq!(view.tenant, owned.tenant.as_ref());
+        assert_eq!(view.item_count, owned.item_count);
+        assert_eq!(view.routing_metadata, owned.routing_metadata.as_ref());
+        assert_eq!(view.payload, owned.payload.as_ref());
     }
 
     #[test]

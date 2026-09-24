@@ -1,6 +1,8 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::{
@@ -55,8 +57,23 @@ impl EmbeddedTelemetryConfig {
     /// Creates an embedded runtime configuration around one durable store.
     #[must_use]
     pub fn new(store: DurableTelemetryConfig) -> Self {
+        // Embedded mode still owns one append-submission and durable-sink
+        // dispatcher pool. Size both from the physical shard topology so a
+        // multi-shard embedded store retains the same owner parallelism as a
+        // standalone server. A one-shard store keeps the existing one-thread
+        // footprint.
+        let worker_count = usize::try_from(store.shard_count)
+            .unwrap_or(64)
+            .clamp(1, 64);
         let local_limits = DurableTelemetryLimits {
             max_lifetime_rollup_series: Some(100_000),
+            append_submission_threads: Some(worker_count),
+            durable_sink_threads: Some(worker_count),
+            queue_slots_per_shard: 64,
+            queue_bytes_per_shard: 2 * 1024 * 1024,
+            target_pack_bytes: 512 * 1024,
+            max_batch_bytes: 1024 * 1024,
+            max_fetch_bytes: 1024 * 1024,
             ..DurableTelemetryLimits::default()
         };
         Self {
@@ -129,7 +146,35 @@ impl EmbeddedTelemetryConfig {
                 .min(self.store.tenant_partitions)
                 .max(1),
         );
-        let head_total = max_bytes.saturating_mul(2) / 3;
+        let physical_shards = u64::from(self.store.shard_count.max(1));
+        let queue_total = (max_bytes / 16).max(1);
+        self.local_limits.queue_bytes_per_shard =
+            usize_from_u64((queue_total / physical_shards).max(1));
+        self.local_limits.queue_slots_per_shard = self
+            .local_limits
+            .queue_slots_per_shard
+            .min(self.local_limits.queue_bytes_per_shard)
+            .max(1);
+        self.local_limits.max_batch_bytes = self
+            .local_limits
+            .max_batch_bytes
+            .min((self.local_limits.queue_bytes_per_shard / 2).max(1));
+        self.local_limits.max_fetch_bytes = self
+            .local_limits
+            .max_fetch_bytes
+            .min(self.local_limits.max_batch_bytes)
+            .max(1);
+        self.local_limits.target_pack_bytes = self
+            .local_limits
+            .target_pack_bytes
+            .min(u64::try_from(self.local_limits.max_batch_bytes).unwrap_or(u64::MAX))
+            .max(1);
+        let component_bytes = max_bytes.saturating_sub(
+            u64::try_from(self.local_limits.queue_bytes_per_shard)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(physical_shards),
+        );
+        let head_total = component_bytes.saturating_mul(2) / 3;
         let head_per_stripe = head_total / stripes;
         let logs = (head_per_stripe / 8).max(1);
         let traces = (head_per_stripe / 4).max(1);
@@ -147,12 +192,12 @@ impl EmbeddedTelemetryConfig {
             .metrics
             .head_memory_bytes_per_stripe = usize_from_u64(metrics);
 
-        let dictionary_per_stripe = (max_bytes / 12 / stripes).max(1);
+        let dictionary_per_stripe = (component_bytes / 12 / stripes).max(1);
         self.store.stripe.dictionary_cache_bytes = usize_from_u64(dictionary_per_stripe);
         let charged_heads =
             stripes.saturating_mul(logs.saturating_add(traces).saturating_add(metrics));
         let charged_dictionaries = stripes.saturating_mul(dictionary_per_stripe);
-        let cache_total = max_bytes
+        let cache_total = component_bytes
             .saturating_sub(charged_heads)
             .saturating_sub(charged_dictionaries);
         let control_total = cache_total / 4;
@@ -299,7 +344,15 @@ impl EmbeddedTelemetryConfig {
             let dictionaries = u64::try_from(self.store.stripe.dictionary_cache_bytes)
                 .unwrap_or(u64::MAX)
                 .saturating_mul(stripes);
-            if heads.saturating_add(dictionaries).saturating_add(caches) > max_bytes {
+            let queues = u64::try_from(self.local_limits.queue_bytes_per_shard)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::from(self.store.shard_count.max(1)));
+            if heads
+                .saturating_add(dictionaries)
+                .saturating_add(caches)
+                .saturating_add(queues)
+                > max_bytes
+            {
                 return Err(LokiApiError::configuration(
                     "embedded component RAM limits exceed max_ram_bytes",
                 ));
@@ -346,6 +399,83 @@ pub enum EmbeddedTelemetryState {
     Stopped = 4,
 }
 
+/// Public storage and maintenance snapshot for an embedded runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddedStorageHealth {
+    /// Current embedded lifecycle state.
+    pub state: EmbeddedTelemetryState,
+    /// Logical bytes in every regular file below the owned data directory.
+    pub data_directory_bytes: u64,
+    /// Physical filesystem blocks assigned to regular files below the owned
+    /// data directory. On platforms without block accounting this equals
+    /// `data_directory_bytes`.
+    pub allocated_data_directory_bytes: u64,
+    /// Configured managed SSD budget, when present.
+    pub max_ssd_bytes: Option<u64>,
+    /// Remaining managed SSD headroom based on the greater of logical and
+    /// allocated regular-file bytes from the complete directory scan.
+    pub ssd_headroom_bytes: Option<u64>,
+    /// Whether complete logical or allocated directory bytes exceed
+    /// `max_ssd_bytes`.
+    pub ssd_budget_exceeded: bool,
+    /// Persisted lifetime-rollup file bytes.
+    pub lifetime_rollup_bytes: u64,
+    /// Configured lifetime-rollup file byte cap.
+    pub max_lifetime_rollup_bytes: u64,
+    /// Distinct metric series represented in the lifetime rollup.
+    pub lifetime_rollup_series: usize,
+    /// Durable sink items waiting for index application.
+    pub backlog_items: u64,
+    /// Durable sink bytes waiting for index application.
+    pub backlog_bytes: u64,
+    /// Source payload bytes retained in the shard-stream WAL.
+    pub retained_payload_bytes: Option<u64>,
+    /// Completed retention maintenance passes.
+    pub retention_runs: u64,
+    /// Failed retention maintenance passes.
+    pub retention_failures: u64,
+    /// Last successful runtime-driven maintenance wall-clock second.
+    pub last_successful_maintenance_unix_seconds: Option<u64>,
+}
+
+/// Owned periodic maintenance task for an [`EmbeddedTelemetryRuntime`].
+///
+/// Dropping this handle requests shutdown and joins its thread. Hosts should
+/// retain it until before draining the runtime.
+#[derive(Debug)]
+pub struct EmbeddedMaintenanceWorker {
+    shutdown: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+    running: Arc<AtomicBool>,
+}
+
+impl EmbeddedMaintenanceWorker {
+    /// Stops the maintenance task and waits for its thread to exit.
+    pub fn shutdown(mut self) -> Result<(), LokiApiError> {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> Result<(), LokiApiError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let result = thread
+                .join()
+                .map_err(|_| LokiApiError::internal("embedded maintenance worker thread panicked"));
+            self.running.store(false, Ordering::Release);
+            result?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for EmbeddedMaintenanceWorker {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 impl EmbeddedTelemetryState {
     fn from_u8(value: u8) -> Self {
         match value {
@@ -367,7 +497,12 @@ impl EmbeddedTelemetryState {
 #[derive(Debug)]
 pub struct EmbeddedTelemetryRuntime {
     store: Arc<DurableTelemetryStore>,
+    data_directory: PathBuf,
+    max_ssd_bytes: Option<u64>,
+    max_lifetime_rollup_bytes: u64,
     shutdown_flush_timeout: Duration,
+    last_successful_maintenance_unix_seconds: AtomicU64,
+    maintenance_running: Arc<AtomicBool>,
     state: AtomicU8,
     /// Serializes exporter attachment, readiness, and drain transitions. The
     /// atomic state remains cheap for steady-state ingestion checks, while this
@@ -384,6 +519,9 @@ impl EmbeddedTelemetryRuntime {
     /// exclusively owned until this runtime and all store clones are dropped.
     pub fn open(config: EmbeddedTelemetryConfig) -> Result<Self, LokiApiError> {
         config.validate()?;
+        let data_directory = config.store.data_directory.clone();
+        let max_ssd_bytes = config.max_ssd_bytes;
+        let max_lifetime_rollup_bytes = config.local_limits.max_lifetime_rollup_bytes;
         let runtime = Self {
             store: Arc::new(
                 DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
@@ -392,7 +530,12 @@ impl EmbeddedTelemetryRuntime {
                     config.local_limits,
                 )?,
             ),
+            data_directory,
+            max_ssd_bytes,
+            max_lifetime_rollup_bytes,
             shutdown_flush_timeout: config.shutdown_flush_timeout,
+            last_successful_maintenance_unix_seconds: AtomicU64::new(0),
+            maintenance_running: Arc::new(AtomicBool::new(false)),
             state: AtomicU8::new(EmbeddedTelemetryState::Recovering as u8),
             lifecycle_gate: Mutex::new(()),
             ingestion_gate: RwLock::new(()),
@@ -486,6 +629,99 @@ impl EmbeddedTelemetryRuntime {
         self.store.query_lifetime_metric_rollups(tenant, name)
     }
 
+    /// Returns complete-directory, rollup, backlog, and maintenance health.
+    ///
+    /// Directory bytes include logical lengths and physical allocation for all
+    /// regular files. Directory-entry metadata remains platform-specific; use
+    /// [`crate::EmbeddedUsageLedger`] when a hard single-file product-usage
+    /// quota is required.
+    pub fn storage_health(&self) -> Result<EmbeddedStorageHealth, LokiApiError> {
+        let (data_directory_bytes, allocated_data_directory_bytes) =
+            directory_file_bytes(&self.data_directory)?;
+        let accounted_data_directory_bytes =
+            data_directory_bytes.max(allocated_data_directory_bytes);
+        let (lifetime_rollup_series, lifetime_rollup_bytes) =
+            self.store.lifetime_rollup_storage()?;
+        let metrics = self.store.operational_metrics();
+        let last_maintenance = self
+            .last_successful_maintenance_unix_seconds
+            .load(Ordering::Relaxed);
+        Ok(EmbeddedStorageHealth {
+            state: self.state(),
+            data_directory_bytes,
+            allocated_data_directory_bytes,
+            max_ssd_bytes: self.max_ssd_bytes,
+            ssd_headroom_bytes: self
+                .max_ssd_bytes
+                .map(|maximum| maximum.saturating_sub(accounted_data_directory_bytes)),
+            ssd_budget_exceeded: self
+                .max_ssd_bytes
+                .is_some_and(|maximum| accounted_data_directory_bytes > maximum),
+            lifetime_rollup_bytes,
+            max_lifetime_rollup_bytes: self.max_lifetime_rollup_bytes,
+            lifetime_rollup_series,
+            backlog_items: metrics.pending_items,
+            backlog_bytes: metrics.pending_bytes,
+            retained_payload_bytes: metrics.retained_payload_bytes,
+            retention_runs: metrics.retention_runs,
+            retention_failures: metrics.retention_failures,
+            last_successful_maintenance_unix_seconds: (last_maintenance != 0)
+                .then_some(last_maintenance),
+        })
+    }
+
+    /// Starts built-in periodic export-independent retention maintenance.
+    ///
+    /// The worker waits while the runtime is not ready and exits when its
+    /// handle is dropped, explicitly shut down, or the runtime is dropped.
+    pub fn spawn_maintenance(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> Result<EmbeddedMaintenanceWorker, LokiApiError> {
+        if interval.is_zero() {
+            return Err(LokiApiError::configuration(
+                "embedded maintenance interval must be nonzero",
+            ));
+        }
+        self.maintenance_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                LokiApiError::configuration("embedded maintenance worker is already running")
+            })?;
+        let runtime = Arc::downgrade(self);
+        let running = Arc::clone(&self.maintenance_running);
+        let (shutdown, receiver) = mpsc::channel();
+        let thread = match std::thread::Builder::new()
+            .name("shard-telemetry-maintenance".into())
+            .spawn(move || {
+                loop {
+                    match receiver.recv_timeout(interval) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                    let Some(runtime) = runtime.upgrade() else {
+                        break;
+                    };
+                    if runtime.state() == EmbeddedTelemetryState::Ready {
+                        let _ = runtime.compact_retention();
+                    }
+                }
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                running.store(false, Ordering::Release);
+                return Err(LokiApiError::configuration(format!(
+                    "failed to start embedded maintenance worker: {error}",
+                )));
+            }
+        };
+        Ok(EmbeddedMaintenanceWorker {
+            shutdown: Some(shutdown),
+            thread: Some(thread),
+            running,
+        })
+    }
+
     /// Directly appends normalized logs to this process's embedded store.
     ///
     /// This is an in-process fast path: it performs signal routing and the
@@ -556,7 +792,10 @@ impl EmbeddedTelemetryRuntime {
     /// so physical SSD usage tracks that logical window.
     pub fn compact_retention(&self) -> Result<RetentionReport, LokiApiError> {
         let _lease = self.begin_ingest()?;
-        self.store.compact_retention()
+        let report = self.store.compact_retention()?;
+        self.last_successful_maintenance_unix_seconds
+            .store(unix_seconds_now(), Ordering::Relaxed);
+        Ok(report)
     }
 
     /// Stops new host work and flushes every current durable boundary.
@@ -599,6 +838,65 @@ impl EmbeddedTelemetryRuntime {
     }
 }
 
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn directory_file_bytes(directory: &std::path::Path) -> Result<(u64, u64), LokiApiError> {
+    let mut logical_bytes = 0_u64;
+    let mut allocated_bytes = 0_u64;
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(LokiApiError::internal(format!(
+                    "inspect embedded data directory {}: {error}",
+                    path.display(),
+                )));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                LokiApiError::internal(format!("inspect embedded data directory entry: {error}"))
+            })?;
+            let metadata = match entry.path().symlink_metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(LokiApiError::internal(format!(
+                        "inspect embedded path {}: {error}",
+                        entry.path().display(),
+                    )));
+                }
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                logical_bytes = logical_bytes.saturating_add(metadata.len());
+                allocated_bytes = allocated_bytes.saturating_add(file_allocated_bytes(&metadata));
+            }
+        }
+    }
+    Ok((logical_bytes, allocated_bytes))
+}
+
+#[cfg(unix)]
+fn file_allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn file_allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
+    metadata.len()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -624,6 +922,14 @@ mod tests {
         )
         .with_storage_budgets(256 * 1024 * 1024, 1024 * 1024 * 1024);
         local.validate().expect("local budgets validate");
+        assert_eq!(local.local_limits.append_submission_threads, Some(1));
+        assert_eq!(local.local_limits.durable_sink_threads, Some(1));
+        let mut parallel_store = local.store.clone();
+        parallel_store.shard_count = 4;
+        let parallel = EmbeddedTelemetryConfig::new(parallel_store);
+        assert_eq!(parallel.local_limits.append_submission_threads, Some(4));
+        assert_eq!(parallel.local_limits.durable_sink_threads, Some(4));
+        assert!(local.local_limits.queue_bytes_per_shard < 128 * 1024 * 1024);
         assert!(
             local
                 .local_limits
@@ -659,6 +965,23 @@ mod tests {
                 + archived.local_limits.payload_cache.max_bytes
                 + archived.local_limits.max_lifetime_rollup_bytes,
             1024 * 1024 * 1024
+        );
+
+        let mut multi_shard = EmbeddedTelemetryConfig::bounded_local(
+            std::env::temp_dir().join("shard-telemetry-unused-multi-shard-config"),
+            Duration::from_secs(5 * 60),
+        );
+        multi_shard.store.shard_count = 4;
+        multi_shard.store.tenant_partitions = 1;
+        let multi_shard = multi_shard.with_max_ram_bytes(64 * 1024 * 1024);
+        multi_shard
+            .validate()
+            .expect("multi-shard budget validates");
+        assert!(
+            u64::try_from(multi_shard.local_limits.queue_bytes_per_shard)
+                .expect("queue bytes")
+                .saturating_mul(u64::from(multi_shard.store.shard_count))
+                <= 64 * 1024 * 1024 / 16
         );
     }
 
@@ -759,6 +1082,52 @@ mod tests {
                 .append_log_events("tenant-a", vec![event], true)
                 .is_err()
         );
+        drop(runtime);
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn built_in_worker_runs_retention_and_reports_health() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-embedded-maintenance-{}-{nonce}",
+            std::process::id()
+        ));
+        let runtime = Arc::new(
+            EmbeddedTelemetryRuntime::open(EmbeddedTelemetryConfig::bounded_local(
+                directory.clone(),
+                Duration::from_secs(60),
+            ))
+            .expect("runtime opens"),
+        );
+        runtime.mark_ready().expect("runtime ready");
+        let worker = runtime
+            .spawn_maintenance(Duration::from_millis(5))
+            .expect("maintenance starts");
+        assert!(runtime.spawn_maintenance(Duration::from_millis(5)).is_err());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if runtime.storage_health().expect("health").retention_runs > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "maintenance did not run before the deadline"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let health = runtime.storage_health().expect("health");
+        assert!(health.last_successful_maintenance_unix_seconds.is_some());
+        worker.shutdown().expect("maintenance stops");
+        runtime
+            .spawn_maintenance(Duration::from_millis(5))
+            .expect("maintenance can restart")
+            .shutdown()
+            .expect("restarted maintenance stops");
+        runtime.drain().expect("runtime drains");
         drop(runtime);
         std::fs::remove_dir_all(directory).expect("cleanup");
     }

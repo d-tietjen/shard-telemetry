@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+"${ST_BINARY:?ST_BINARY must be set}" --version 2>/dev/null || printf '%s\n' 'ShardTelemetry dirty worktree'

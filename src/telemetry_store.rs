@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::{Ordering as CmpOrdering, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::num::NonZeroU16;
@@ -10,10 +11,11 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use bytes::Bytes;
+use foldhash::HashMapExt;
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use shard_stream_core::{
-    LogicalOffset, LogicalPartitionId, PlacementSequence, TopicId, TopicPartition,
+    LogicalOffset, LogicalPartitionId, PlacementSequence, ShardId, TopicId, TopicPartition,
 };
 use shard_stream_engine::{
     DurableSinkCheckpoint, DurableSinkConfig, DurableSinkOptions, EngineConfig, EngineError,
@@ -21,18 +23,19 @@ use shard_stream_engine::{
 };
 use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest};
 
+use crate::analytics::{AnalyticsGroupOrder, AnalyticsGroupRow};
 use crate::deletion::DeleteCatalog;
 use crate::ingest_pack::decode_ingest_pack;
-use crate::loki_api::{LogicalDeleteFilter, LokiApiError, apply_logical_deletes};
+use crate::loki_api::{LogicalDeleteFilter, LokiApiError, LokiQueryResult, apply_logical_deletes};
 use crate::rollup::MetricRollupCatalog;
 use crate::storage_format::DataDirectoryLease;
 use crate::{
     AnalyticsRelation, AnalyticsRow, AnalyticsScanOrder, AnalyticsScanRequest, CaseSensitivity,
     DeleteRequest, LocalObjectStore, LogMatch, LogPredicate, LogQuery, LokiEntry, LokiStore,
-    NativeQuery, NativeQueryDirection, ObjectTierConfig, OtlpSinkConfig, QueryCursor,
-    S3ObjectStore, S3ObjectStoreConfig, SharedTelemetryObjectStore, SinkObjectTierConfig,
-    SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig, TelemetryService,
-    TelemetrySinkFactory,
+    MetadataField, NativeQuery, NativeQueryDirection, ObjectTierConfig, OtlpSinkConfig,
+    QueryCursor, S3ObjectStore, S3ObjectStoreConfig, SharedTelemetryObjectStore,
+    SinkObjectTierConfig, SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig,
+    TelemetryService, TelemetrySinkFactory,
 };
 
 const LOKI_TOPIC_ID: TopicId = crate::LOGS_TOPIC_ID;
@@ -40,12 +43,128 @@ const LABEL_PREFIX: &str = "resource.loki.label.";
 const METADATA_PREFIX: &str = "attr.loki.metadata.";
 const TENANT_FIELD: &str = "resource.loki.tenant";
 const MIN_APPEND_SUBMISSION_THREADS: usize = 8;
-const MAX_APPEND_SUBMISSION_THREADS: usize = 32;
+const MAX_APPEND_SUBMISSION_THREADS: usize = 64;
+const MAX_DURABLE_SINK_THREADS: usize = 256;
+const REMOTE_WRITE_LOCK_SHARDS: usize = 64;
 
-fn build_append_submission_pool(physical_stripes: u32) -> Result<ThreadPool, LokiApiError> {
-    let threads = usize::try_from(physical_stripes)
-        .unwrap_or(MAX_APPEND_SUBMISSION_THREADS)
-        .clamp(MIN_APPEND_SUBMISSION_THREADS, MAX_APPEND_SUBMISSION_THREADS);
+fn new_remote_write_locks() -> Box<[Mutex<()>]> {
+    (0..REMOTE_WRITE_LOCK_SHARDS)
+        .map(|_| Mutex::new(()))
+        .collect()
+}
+
+fn remote_write_lock_index(series: crate::SeriesFingerprint) -> usize {
+    (series.get() as usize) % REMOTE_WRITE_LOCK_SHARDS
+}
+
+fn apply_analytics_log_filters(mut query: LogQuery, request: &AnalyticsScanRequest) -> LogQuery {
+    for term in &request.terms {
+        query = query.with_term(Arc::clone(term));
+    }
+    for token in &request.message_tokens {
+        query = query.with_predicate(LogPredicate::message_token(
+            Arc::clone(token),
+            CaseSensitivity::Sensitive,
+        ));
+    }
+    for token in &request.case_insensitive_message_tokens {
+        query = query.with_predicate(LogPredicate::message_token(
+            Arc::clone(token),
+            CaseSensitivity::Insensitive,
+        ));
+    }
+    for field in &request.labels {
+        query = query.with_field(
+            format!("{LABEL_PREFIX}{}", field.key),
+            Arc::clone(&field.value),
+        );
+    }
+    for field in &request.metadata {
+        query = query.with_field(
+            format!("{METADATA_PREFIX}{}", field.key),
+            Arc::clone(&field.value),
+        );
+    }
+    for field in &request.attributes {
+        query = query.with_field(Arc::clone(&field.key), Arc::clone(&field.value));
+    }
+    for field in &request.resource_attributes {
+        query = query.with_field(format!("resource.{}", field.key), Arc::clone(&field.value));
+    }
+    for field in &request.scope_attributes {
+        query = query.with_field(format!("scope.{}", field.key), Arc::clone(&field.value));
+    }
+    if let Some(trace_id) = request.trace_id {
+        query = query.with_field("otel.trace_id", trace_id.to_string());
+    }
+    if let Some(span_id) = request.span_id {
+        query = query.with_field("otel.span_id", span_id.to_string());
+    }
+    if request.predicate != LogPredicate::MatchAll {
+        query = query.with_predicate(normalize_analytics_predicate(&request.predicate));
+    }
+    query
+}
+
+fn analytics_predicate_needs_structural_fields(predicate: &LogPredicate) -> bool {
+    match predicate {
+        LogPredicate::FieldExists(_)
+        | LogPredicate::Field { .. }
+        | LogPredicate::FieldIn { .. }
+        | LogPredicate::FieldRegex { .. }
+        | LogPredicate::FieldNumeric { .. } => true,
+        LogPredicate::And(predicates) | LogPredicate::Or(predicates) => predicates
+            .iter()
+            .any(analytics_predicate_needs_structural_fields),
+        LogPredicate::Not(predicate) => analytics_predicate_needs_structural_fields(predicate),
+        _ => false,
+    }
+}
+
+fn normalize_analytics_predicate(predicate: &LogPredicate) -> LogPredicate {
+    match predicate {
+        LogPredicate::FieldNumeric {
+            key,
+            comparison,
+            value,
+        } if key.as_ref() == "otel.severity_number" => {
+            LogPredicate::field_numeric("attr.loki.metadata.severity_number", *comparison, *value)
+        }
+        LogPredicate::And(predicates) => LogPredicate::and(
+            predicates
+                .iter()
+                .map(normalize_analytics_predicate)
+                .collect(),
+        ),
+        LogPredicate::Or(predicates) => LogPredicate::or(
+            predicates
+                .iter()
+                .map(normalize_analytics_predicate)
+                .collect(),
+        ),
+        LogPredicate::Not(predicate) => {
+            LogPredicate::negate(normalize_analytics_predicate(predicate))
+        }
+        _ => predicate.clone(),
+    }
+}
+
+fn build_append_submission_pool(
+    physical_stripes: u32,
+    configured_threads: Option<usize>,
+) -> Result<ThreadPool, LokiApiError> {
+    if configured_threads
+        .is_some_and(|threads| !(1..=MAX_APPEND_SUBMISSION_THREADS).contains(&threads))
+    {
+        return Err(LokiApiError::configuration(
+            "append submission threads must be in 1..=64",
+        ));
+    }
+    let threads = configured_threads.unwrap_or_else(|| {
+        usize::try_from(physical_stripes)
+            .unwrap_or(MAX_APPEND_SUBMISSION_THREADS)
+            .clamp(MIN_APPEND_SUBMISSION_THREADS, MAX_APPEND_SUBMISSION_THREADS)
+    });
     ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|index| format!("shard-telemetry-append-{index}"))
@@ -53,6 +172,14 @@ fn build_append_submission_pool(physical_stripes: u32) -> Result<ThreadPool, Lok
         .map_err(|error| {
             LokiApiError::configuration(format!("failed to build append submission pool: {error}"))
         })
+}
+
+fn durable_sink_worker_count(physical_shards: u32, configured_threads: Option<usize>) -> usize {
+    configured_threads.unwrap_or_else(|| {
+        usize::try_from(physical_shards)
+            .unwrap_or(MAX_DURABLE_SINK_THREADS)
+            .min(MAX_DURABLE_SINK_THREADS)
+    })
 }
 
 fn object_tier_partitions(partition_count: u32) -> Vec<TopicPartition> {
@@ -130,6 +257,28 @@ pub struct DurableTelemetryLimits {
     /// their complete archive remotely and use `payload_cache.max_bytes` as
     /// the bounded local recent-data tier.
     pub max_object_payload_bytes_per_partition: Option<u64>,
+    /// Optional fixed append-submission worker count. Standalone stores derive
+    /// a bounded pool from stripe count; server hosts pass their runtime CPU
+    /// budget explicitly when they need strict thread-per-core ownership.
+    pub append_submission_threads: Option<usize>,
+    /// Optional fixed durable-sink dispatcher worker count. This controls the
+    /// partition-striped callback dispatchers; physical shard sinks and their
+    /// index workers remain one per shard. Standalone stores default to the
+    /// physical shard count.
+    pub durable_sink_threads: Option<usize>,
+    /// Optional fixed S3 object-store runtime worker count. Standalone stores
+    /// use the adapter's four-worker default when this is unset.
+    pub object_store_threads: Option<usize>,
+    /// Maximum queued append records in each shard-stream shard.
+    pub queue_slots_per_shard: usize,
+    /// Maximum queued append payload bytes in each shard-stream shard.
+    pub queue_bytes_per_shard: usize,
+    /// Target raw WAL pack size before rotation.
+    pub target_pack_bytes: u64,
+    /// Maximum payload bytes accepted by one shard-stream append batch.
+    pub max_batch_bytes: usize,
+    /// Maximum payload bytes returned by one shard-stream fetch.
+    pub max_fetch_bytes: usize,
 }
 
 impl Default for DurableTelemetryLimits {
@@ -145,6 +294,14 @@ impl Default for DurableTelemetryLimits {
             },
             payload_cache: SsdCacheConfig::default(),
             max_object_payload_bytes_per_partition: None,
+            append_submission_threads: None,
+            durable_sink_threads: None,
+            object_store_threads: None,
+            queue_slots_per_shard: 1_024,
+            queue_bytes_per_shard: 128 * 1024 * 1024,
+            target_pack_bytes: 8 * 1024 * 1024,
+            max_batch_bytes: 64 * 1024 * 1024,
+            max_fetch_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -196,14 +353,16 @@ pub struct DurableTelemetryStore {
     append_durability: Durability,
     append_gate: Option<Arc<dyn TelemetryAppendGate>>,
     tenant_partitions: u32,
+    physical_shard_count: Option<u32>,
     telemetry_router: crate::TelemetryRouter,
     ingest_stripes_per_tenant: u32,
     indexed_ack_timeout: Duration,
+    max_fetch_bytes: u32,
     append_submission_pool: ThreadPool,
     next_request_id: AtomicU64,
     append_receipts: AppendReceiptCatalog,
     lifetime_rollups: Option<Mutex<MetricRollupCatalog>>,
-    remote_write_append: Mutex<()>,
+    remote_write_append: Box<[Mutex<()>]>,
     deletes: DeleteCatalog,
     retention: Option<Duration>,
     retention_runs: AtomicU64,
@@ -335,6 +494,7 @@ struct PersistedAppendReceipts {
 #[derive(Debug)]
 struct AppendReceiptCatalog {
     directory: PathBuf,
+    directory_sync: File,
     state: Mutex<AppendReceiptState>,
     changed: Condvar,
 }
@@ -412,6 +572,7 @@ impl AppendReceiptCatalog {
             }
         }
         let catalog = Self {
+            directory_sync: File::open(&directory).map_err(receipt_io_error)?,
             directory,
             state: Mutex::new(state),
             changed: Condvar::new(),
@@ -616,12 +777,14 @@ impl AppendReceiptCatalog {
             .open(&temporary)
             .map_err(receipt_io_error)?;
         file.write_all(&encoded)
-            .and_then(|()| file.sync_all())
+            // The temporary file is atomically renamed below and the parent
+            // directory is synced after the rename. The receipt bytes and
+            // length are therefore the only file state that must be flushed
+            // before the directory entry becomes durable.
+            .and_then(|()| file.sync_data())
             .map_err(receipt_io_error)?;
         fs::rename(&temporary, &path).map_err(receipt_io_error)?;
-        File::open(&self.directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(receipt_io_error)?;
+        self.directory_sync.sync_all().map_err(receipt_io_error)?;
         Ok(())
     }
 
@@ -705,6 +868,18 @@ impl DurableTelemetryStore {
         self.tenant_partitions
     }
 
+    /// Runs partition-parallel ingest work on this store's bounded append pool.
+    ///
+    /// Transport adapters use this for envelope preparation so their Rayon
+    /// work follows the same CPU budget as the subsequent durable append.
+    pub(crate) fn install_append_parallelism<OP, R>(&self, operation: OP) -> R
+    where
+        OP: FnOnce() -> R + Send,
+        R: Send,
+    {
+        self.append_submission_pool.install(operation)
+    }
+
     /// Opens or recovers a standalone durable store.
     pub fn open(config: DurableTelemetryConfig) -> Result<Self, LokiApiError> {
         Self::open_with_local_limits(config, DurableTelemetryLimits::default())
@@ -741,7 +916,33 @@ impl DurableTelemetryStore {
         limits: DurableTelemetryLimits,
     ) -> Result<Self, LokiApiError> {
         config.validate()?;
-        let append_submission_pool = build_append_submission_pool(config.shard_count)?;
+        if limits.append_submission_threads == Some(0)
+            || limits
+                .append_submission_threads
+                .is_some_and(|threads| threads > MAX_APPEND_SUBMISSION_THREADS)
+            || limits.durable_sink_threads == Some(0)
+            || limits
+                .durable_sink_threads
+                .is_some_and(|threads| threads > MAX_DURABLE_SINK_THREADS)
+            || limits.object_store_threads == Some(0)
+            || limits
+                .object_store_threads
+                .is_some_and(|threads| threads > 64)
+            || limits.queue_slots_per_shard == 0
+            || limits.queue_bytes_per_shard == 0
+            || limits.target_pack_bytes == 0
+            || limits.max_batch_bytes == 0
+            || limits.max_fetch_bytes == 0
+        {
+            return Err(LokiApiError::configuration(
+                "append worker count must be 1..=64, durable sink worker count must be 1..=256, S3 worker count must be 1..=64, and queue, pack, batch, and fetch limits must be nonzero",
+            ));
+        }
+        let max_fetch_bytes = u32::try_from(limits.max_fetch_bytes).map_err(|_| {
+            LokiApiError::configuration("max_fetch_bytes must fit the v1 u32 fetch limit")
+        })?;
+        let append_submission_pool =
+            build_append_submission_pool(config.shard_count, limits.append_submission_threads)?;
         object_tier_config
             .validate()
             .map_err(|error| LokiApiError::configuration(error.to_string()))?;
@@ -807,12 +1008,12 @@ impl DurableTelemetryStore {
             virtual_lane_count: config.shard_count,
             replication_factor: 1,
             min_in_sync_replicas: 1,
-            queue_slots_per_shard: 1_024,
-            queue_bytes_per_shard: 128 * 1024 * 1024,
-            target_pack_bytes: 8 * 1024 * 1024,
+            queue_slots_per_shard: limits.queue_slots_per_shard,
+            queue_bytes_per_shard: limits.queue_bytes_per_shard,
+            target_pack_bytes: limits.target_pack_bytes,
             max_pack_age: Duration::from_secs(1),
-            max_batch_bytes: 64 * 1024 * 1024,
-            max_fetch_bytes: 64 * 1024 * 1024,
+            max_batch_bytes: limits.max_batch_bytes,
+            max_fetch_bytes: limits.max_fetch_bytes,
             append_linger: config.append_linger,
         };
         let archive_object_tier = config.s3_object_store.is_some();
@@ -825,7 +1026,7 @@ impl DurableTelemetryStore {
                     .map_err(|error| LokiApiError::internal(error.to_string()))?,
             )),
             (None, Some(s3)) => Some(SharedTelemetryObjectStore::new(Arc::new(
-                S3ObjectStore::open(s3)
+                S3ObjectStore::open_with_threads(s3, limits.object_store_threads)
                     .map_err(|error| LokiApiError::internal(error.to_string()))?,
             ))),
             (None, None) => None,
@@ -855,6 +1056,7 @@ impl DurableTelemetryStore {
                 .recovery_journal
                 .then(|| config.data_directory.join("index-journal")),
             max_journal_bytes: limits.max_index_journal_bytes,
+            journal_sync_each_append: config.retention.is_some(),
             object_tier: sink_object_tier,
             ..OtlpSinkConfig::default()
         };
@@ -864,7 +1066,10 @@ impl DurableTelemetryStore {
         );
         let service = factory.service();
         let sink_options = DurableSinkOptions {
-            worker_count: config.shard_count as usize,
+            worker_count: durable_sink_worker_count(
+                config.shard_count,
+                limits.durable_sink_threads,
+            ),
             recovery_timeout: config.indexed_ack_timeout,
             ..DurableSinkOptions::default()
         };
@@ -900,14 +1105,16 @@ impl DurableTelemetryStore {
             append_durability: Durability::Leader,
             append_gate: None,
             tenant_partitions: config.tenant_partitions,
+            physical_shard_count: Some(config.shard_count),
             telemetry_router,
             ingest_stripes_per_tenant: config.shard_count.min(config.tenant_partitions),
             indexed_ack_timeout: config.indexed_ack_timeout,
+            max_fetch_bytes,
             append_submission_pool,
             next_request_id: AtomicU64::new(1),
             append_receipts,
             lifetime_rollups,
-            remote_write_append: Mutex::new(()),
+            remote_write_append: new_remote_write_locks(),
             deletes,
             retention: config.retention,
             retention_runs: AtomicU64::new(0),
@@ -998,7 +1205,7 @@ impl DurableTelemetryStore {
                 LokiApiError::configuration("tenant_partitions must fit the v1 u16 routing space")
             })?)
             .ok_or_else(|| LokiApiError::configuration("tenant_partitions must be nonzero"))?;
-        let append_submission_pool = build_append_submission_pool(ingest_stripes_per_tenant)?;
+        let append_submission_pool = build_append_submission_pool(ingest_stripes_per_tenant, None)?;
         let data_directory_lease = DataDirectoryLease::acquire(&data_directory)?;
         let deletes = DeleteCatalog::open(data_directory.join("delete-catalog-v1.json"))?;
         let append_receipts = AppendReceiptCatalog::open(&data_directory)?;
@@ -1024,14 +1231,16 @@ impl DurableTelemetryStore {
             append_durability: append_durability.into(),
             append_gate,
             tenant_partitions,
+            physical_shard_count: None,
             telemetry_router: crate::TelemetryRouter::new(logical_partitions),
             ingest_stripes_per_tenant,
             indexed_ack_timeout,
+            max_fetch_bytes: 16 * 1024 * 1024,
             append_submission_pool,
             next_request_id: AtomicU64::new(1),
             append_receipts,
             lifetime_rollups: None,
-            remote_write_append: Mutex::new(()),
+            remote_write_append: new_remote_write_locks(),
             deletes,
             retention,
             retention_runs: AtomicU64::new(0),
@@ -1104,6 +1313,29 @@ impl DurableTelemetryStore {
         }
     }
 
+    fn standalone_owner_shard(&self, partition: TopicPartition) -> Option<ShardId> {
+        self.physical_shard_count
+            .map(|shard_count| ShardId::new(partition.partition_id.get() % shard_count))
+    }
+
+    fn trace_query_owner_shard(&self, query: &crate::TraceQuery) -> Option<ShardId> {
+        let partition = query.partition.or_else(|| {
+            query
+                .trace_id
+                .map(|trace_id| self.telemetry_router.trace(&query.tenant, trace_id))
+        })?;
+        self.standalone_owner_shard(partition)
+    }
+
+    fn metric_query_owner_shard(&self, query: &crate::MetricQuery) -> Option<ShardId> {
+        let partition = query.partition.or_else(|| {
+            query
+                .series
+                .map(|series| self.telemetry_router.metric(&query.tenant, series))
+        })?;
+        self.standalone_owner_shard(partition)
+    }
+
     /// Incorporates every not-yet-checkpointed metric WAL point into the
     /// crash-safe local lifetime rollup catalog.
     ///
@@ -1136,7 +1368,8 @@ impl DurableTelemetryStore {
                 None => watermarks.log_start,
             };
             while next < watermarks.last_stable_offset {
-                let batches = self.fetch_telemetry_batches(partition, next, 16 * 1024 * 1024)?;
+                let batches =
+                    self.fetch_telemetry_batches(partition, next, self.max_fetch_bytes)?;
                 if batches.is_empty() {
                     break;
                 }
@@ -1188,6 +1421,21 @@ impl DurableTelemetryStore {
             .lock()
             .map(|catalog| catalog.query(tenant, name))
             .map_err(|_| LokiApiError::internal("lifetime metric rollup lock poisoned"))
+    }
+
+    pub(crate) fn lifetime_rollup_storage(&self) -> Result<(usize, u64), LokiApiError> {
+        let Some(catalog) = &self.lifetime_rollups else {
+            return Ok((0, 0));
+        };
+        let catalog = catalog
+            .lock()
+            .map_err(|_| LokiApiError::internal("lifetime metric rollup lock poisoned"))?;
+        Ok((
+            catalog.len(),
+            catalog
+                .persisted_bytes()
+                .map_err(|error| LokiApiError::internal(error.to_string()))?,
+        ))
     }
 
     /// Advances shard-stream retention at whole append-batch boundaries.
@@ -1255,7 +1503,7 @@ impl DurableTelemetryStore {
                         topic_id: partition.topic_id,
                         partition_id: partition.partition_id,
                         start_offset: scan_offset,
-                        max_bytes: 16 * 1024 * 1024,
+                        max_bytes: self.max_fetch_bytes,
                         mode: FetchMode::Ordered,
                     })
                     .map_err(engine_error)?;
@@ -1314,9 +1562,28 @@ impl DurableTelemetryStore {
         let encoded = batch
             .encode()
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
-        let validated = crate::NativeTelemetryBatch::decode(&encoded)
-            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
-        self.append_validated_telemetry_batch(&validated, wait_for_index)
+        let (validated, wire_ranges) =
+            crate::NativeTelemetryBatch::decode_with_envelope_ranges(&encoded)
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        self.append_validated_telemetry_batch_with_encoded_envelopes(
+            &validated,
+            Bytes::from(encoded),
+            &wire_ranges,
+            wait_for_index,
+        )
+    }
+
+    /// Appends envelopes prepared by an in-process trusted transport.
+    ///
+    /// OTLP decoding has already validated and grouped these envelopes, so
+    /// sending them through the native wire codec would only add a full encode
+    /// and decode pass before the same partition append work.
+    pub(crate) fn append_prepared_telemetry_partitions(
+        &self,
+        partitions: Vec<crate::NativePartitionAppend>,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        self.append_partitioned_envelopes(partitions, wait_for_index)
     }
 
     /// Appends one batch under a caller-stable retry ID.
@@ -1333,13 +1600,17 @@ impl DurableTelemetryStore {
         let encoded = batch
             .encode_native_append()
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
-        let validated = crate::NativeTelemetryBatch::decode(&encoded)
-            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
-        self.append_validated_telemetry_batch_with_retry_id(
+        let payload_digest = blake3::hash(&encoded).to_hex().to_string();
+        let (validated, envelope_range) =
+            crate::NativeTelemetryBatch::decode_native_append_with_envelope_range(&encoded)
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        let wire = Bytes::from(encoded);
+        self.append_validated_telemetry_batch_with_retry_id_and_encoded_envelope(
             &validated,
+            wire.slice(envelope_range),
             wait_for_index,
             retry_id,
-            blake3::hash(&encoded).to_hex().to_string(),
+            payload_digest,
         )
     }
 
@@ -1436,15 +1707,15 @@ impl DurableTelemetryStore {
             ));
         }
         let router = self.telemetry_router;
-        let mut routed = BTreeMap::<TopicPartition, Vec<crate::OtlpLogEvent>>::new();
+        let mut routed = foldhash::HashMap::<TopicPartition, Vec<crate::OtlpLogEvent>>::new();
         for event in events {
             let identity = event.resource.id().get().to_le_bytes();
             let partition = router.log(tenant, event.trace_id, &identity);
             routed.entry(partition).or_default().push(event);
         }
-        self.append_partitioned_envelopes(
+        let partitions = self.install_append_parallelism(|| {
             routed
-                .into_iter()
+                .into_par_iter()
                 .map(|(topic_partition, events)| {
                     crate::signal_ingest::prepare_log_envelope_owned_with_context(tenant, events)
                         .map(
@@ -1456,9 +1727,9 @@ impl DurableTelemetryStore {
                         )
                         .map_err(|error| LokiApiError::bad_request(error.to_string()))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-            wait_for_index,
-        )
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        self.append_partitioned_envelopes(partitions, wait_for_index)
     }
 
     /// Directly appends normalized trace spans for an embedded producer.
@@ -1482,7 +1753,8 @@ impl DurableTelemetryStore {
         // Trace blocks carry one envelope tenant. Partition keys therefore
         // include the tenant, while `append_partitioned_envelopes` retains the
         // physical partition's single append order below.
-        let mut routed = BTreeMap::<(TopicPartition, Arc<str>), Vec<crate::OtlpSpanEvent>>::new();
+        let mut routed =
+            foldhash::HashMap::<(TopicPartition, Arc<str>), Vec<crate::OtlpSpanEvent>>::new();
         for event in events {
             let partition = router.trace(event.tenant(), event.trace_id());
             routed
@@ -1490,9 +1762,9 @@ impl DurableTelemetryStore {
                 .or_default()
                 .push(event);
         }
-        self.append_partitioned_envelopes(
+        let partitions = self.install_append_parallelism(|| {
             routed
-                .into_iter()
+                .into_par_iter()
                 .map(|((topic_partition, _tenant), events)| {
                     crate::prepare_trace_envelope(topic_partition, events)
                         .map(|envelope| crate::NativePartitionAppend {
@@ -1502,9 +1774,9 @@ impl DurableTelemetryStore {
                         })
                         .map_err(|error| LokiApiError::bad_request(error.to_string()))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-            wait_for_index,
-        )
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        self.append_partitioned_envelopes(partitions, wait_for_index)
     }
 
     /// Directly appends normalized metric points for an embedded producer.
@@ -1564,7 +1836,7 @@ impl DurableTelemetryStore {
         // even when multiple series route to the same logical partition. Group
         // before creating envelopes so embedded fast exporters can snapshot an
         // entire fast-telemetry runtime in one direct call.
-        let mut partitions = BTreeMap::<
+        let mut partitions = foldhash::HashMap::<
             (TopicPartition, crate::SeriesFingerprint),
             Vec<crate::OtlpMetricEvent>,
         >::new();
@@ -1578,9 +1850,9 @@ impl DurableTelemetryStore {
                 .or_default()
                 .push(event);
         }
-        self.append_partitioned_envelopes(
+        let partitions = self.install_append_parallelism(|| {
             partitions
-                .into_iter()
+                .into_par_iter()
                 .map(|((topic_partition, _series), events)| {
                     crate::prepare_metric_envelope(topic_partition, events)
                         .map(|envelope| crate::NativePartitionAppend {
@@ -1590,9 +1862,9 @@ impl DurableTelemetryStore {
                         })
                         .map_err(|error| LokiApiError::bad_request(error.to_string()))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-            wait_for_index,
-        )
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        self.append_partitioned_envelopes(partitions, wait_for_index)
     }
 
     fn append_partitioned_envelopes(
@@ -1623,15 +1895,20 @@ impl DurableTelemetryStore {
                 .or_default()
                 .push(partition);
         }
-        let acknowledgements = by_partition
-            .into_par_iter()
-            .map(|(_, partitions)| {
-                partitions
-                    .into_iter()
-                    .map(|partition| self.append_telemetry_partition(&partition, wait_for_index))
+        let acknowledgements = self
+            .install_append_parallelism(|| {
+                by_partition
+                    .into_par_iter()
+                    .map(|(_, partitions)| {
+                        partitions
+                            .into_iter()
+                            .map(|partition| {
+                                self.append_telemetry_partition(&partition, wait_for_index)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
                     .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?
+            })?
             .into_iter()
             .flatten()
             .collect();
@@ -1664,12 +1941,58 @@ impl DurableTelemetryStore {
         })
     }
 
-    /// Appends a validated native payload with the idempotency identity carried
-    /// by its native frame header. The raw payload digest must bind the retry
-    /// ID, including transient contexts that affect index construction.
-    pub(crate) fn append_validated_telemetry_batch_with_retry_id(
+    pub(crate) fn append_validated_telemetry_batch_with_encoded_envelopes(
         &self,
         batch: &crate::NativeTelemetryBatch,
+        wire: Bytes,
+        wire_ranges: &[(std::ops::Range<usize>, Option<std::ops::Range<usize>>)],
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        if batch.partitions.len() != wire_ranges.len() {
+            return Err(LokiApiError::internal(
+                "validated native batch wire ranges do not match its partitions",
+            ));
+        }
+        self.check_append_partitions(&batch.partitions)?;
+        let append = |(partition, (envelope_range, transient_range)): (
+            &crate::NativePartitionAppend,
+            &(std::ops::Range<usize>, Option<std::ops::Range<usize>>),
+        )| {
+            self.append_telemetry_partition_with_fields(
+                partition.topic_partition,
+                partition.envelope.item_count,
+                wire.slice(envelope_range.clone()),
+                transient_range
+                    .as_ref()
+                    .map(|range| wire.slice(range.clone())),
+                wait_for_index,
+            )
+        };
+        let acknowledgements = if batch.partitions.len() == 1 {
+            vec![append((&batch.partitions[0], &wire_ranges[0]))?]
+        } else {
+            self.append_submission_pool.install(|| {
+                batch
+                    .partitions
+                    .par_iter()
+                    .zip(wire_ranges.par_iter())
+                    .map(append)
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+        };
+        Ok(crate::NativeTelemetryAppendAck {
+            partitions: acknowledgements,
+        })
+    }
+
+    /// Appends a native retryable batch while forwarding its already verified
+    /// wire envelope. Native frame decoding has authenticated and parsed this
+    /// exact STEL slice, so re-encoding it here would only repeat allocation
+    /// and checksum work before shard-stream persists the same bytes.
+    pub(crate) fn append_validated_telemetry_batch_with_retry_id_and_encoded_envelope(
+        &self,
+        batch: &crate::NativeTelemetryBatch,
+        encoded_envelope: Bytes,
         wait_for_index: bool,
         retry_id: u128,
         payload_digest: String,
@@ -1684,16 +2007,19 @@ impl DurableTelemetryStore {
             AppendReceiptReservation::Existing(acknowledgement) => return Ok(acknowledgement),
             AppendReceiptReservation::Reserved => {}
         }
-        let acknowledgement =
-            match self.append_telemetry_partition(&batch.partitions[0], wait_for_index) {
-                Ok(acknowledgement) => crate::NativeTelemetryAppendAck {
-                    partitions: vec![acknowledgement],
-                },
-                Err(error) => {
-                    self.append_receipts.abandon(retry_id);
-                    return Err(error);
-                }
-            };
+        let acknowledgement = match self.append_telemetry_partition_with_encoded_envelope(
+            &batch.partitions[0],
+            encoded_envelope,
+            wait_for_index,
+        ) {
+            Ok(acknowledgement) => crate::NativeTelemetryAppendAck {
+                partitions: vec![acknowledgement],
+            },
+            Err(error) => {
+                self.append_receipts.abandon(retry_id);
+                return Err(error);
+            }
+        };
         if let Err(error) =
             self.append_receipts
                 .complete(retry_id, payload_digest, acknowledgement.clone())
@@ -1704,6 +2030,135 @@ impl DurableTelemetryStore {
         Ok(acknowledgement)
     }
 
+    /// Appends one native retryable wire envelope without materializing an
+    /// owned `TelemetryEnvelope` for the normal ungated server path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_validated_native_metadata_with_retry_id_and_encoded_envelope(
+        &self,
+        topic_partition: TopicPartition,
+        record_count: u32,
+        encoded_envelope: Bytes,
+        transient_context: Option<Bytes>,
+        wait_for_index: bool,
+        retry_id: u128,
+        payload_digest: String,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        self.check_append_partition_encoded(
+            topic_partition,
+            record_count,
+            &encoded_envelope,
+            transient_context.as_deref(),
+            true,
+        )?;
+        match self.append_receipts.reserve(retry_id, &payload_digest)? {
+            AppendReceiptReservation::Existing(acknowledgement) => return Ok(acknowledgement),
+            AppendReceiptReservation::Reserved => {}
+        }
+        let acknowledgement = match self.append_telemetry_partition_with_fields(
+            topic_partition,
+            record_count,
+            encoded_envelope,
+            transient_context,
+            wait_for_index,
+        ) {
+            Ok(acknowledgement) => crate::NativeTelemetryAppendAck {
+                partitions: vec![acknowledgement],
+            },
+            Err(error) => {
+                self.append_receipts.abandon(retry_id);
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            self.append_receipts
+                .complete(retry_id, payload_digest, acknowledgement.clone())
+        {
+            self.append_receipts.abandon(retry_id);
+            return Err(error);
+        }
+        Ok(acknowledgement)
+    }
+
+    pub(crate) fn append_validated_native_metadata_with_encoded_envelope(
+        &self,
+        topic_partition: TopicPartition,
+        record_count: u32,
+        encoded_envelope: Bytes,
+        transient_context: Option<Bytes>,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        self.check_append_partition_encoded(
+            topic_partition,
+            record_count,
+            &encoded_envelope,
+            transient_context.as_deref(),
+            true,
+        )?;
+        Ok(crate::NativeTelemetryAppendAck {
+            partitions: vec![self.append_telemetry_partition_with_fields(
+                topic_partition,
+                record_count,
+                encoded_envelope,
+                transient_context,
+                wait_for_index,
+            )?],
+        })
+    }
+
+    pub(crate) fn append_validated_native_metadata_with_encoded_envelopes(
+        &self,
+        partitions: &[crate::native_protocol::NativeEncodedPartitionAppend],
+        wire: Bytes,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        if partitions.is_empty() {
+            return Err(LokiApiError::bad_request(
+                "native telemetry batch requires at least one partition",
+            ));
+        }
+        if self.append_gate.is_some() {
+            for partition in partitions {
+                let envelope = wire.slice(partition.envelope_range.clone());
+                let transient_context = partition
+                    .transient_range
+                    .as_ref()
+                    .map(|range| wire.slice(range.clone()));
+                self.check_append_partition_encoded(
+                    partition.topic_partition,
+                    partition.item_count,
+                    &envelope,
+                    transient_context.as_deref(),
+                    true,
+                )?;
+            }
+        }
+        let append = |partition: &crate::native_protocol::NativeEncodedPartitionAppend| {
+            self.append_telemetry_partition_with_fields(
+                partition.topic_partition,
+                partition.item_count,
+                wire.slice(partition.envelope_range.clone()),
+                partition
+                    .transient_range
+                    .as_ref()
+                    .map(|range| wire.slice(range.clone())),
+                wait_for_index,
+            )
+        };
+        let acknowledgements = if partitions.len() == 1 {
+            vec![append(&partitions[0])?]
+        } else {
+            self.append_submission_pool.install(|| {
+                partitions
+                    .par_iter()
+                    .map(append)
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+        };
+        Ok(crate::NativeTelemetryAppendAck {
+            partitions: acknowledgements,
+        })
+    }
+
     /// Validates and appends one complete Remote Write request under serialized
     /// same-timestamp conflict semantics.
     pub fn append_remote_write_batch(
@@ -1711,11 +2166,15 @@ impl DurableTelemetryStore {
         batch: &crate::NativeTelemetryBatch,
     ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
         self.check_append_partitions(&batch.partitions)?;
-        let _guard = self
-            .remote_write_append
-            .lock()
-            .map_err(|_| LokiApiError::internal("Remote Write append lock poisoned"))?;
-        let mut request_samples = BTreeMap::new();
+        let mut request_samples = foldhash::HashMap::with_capacity(
+            batch
+                .partitions
+                .iter()
+                .map(|partition| partition.envelope.item_count as usize)
+                .sum(),
+        );
+        let mut request_order = Vec::with_capacity(request_samples.capacity());
+        let mut lock_indices = BTreeSet::new();
         for partition in &batch.partitions {
             if partition.envelope.signal != crate::TelemetrySignal::Metrics
                 || partition.envelope.routing_metadata.len() != 5
@@ -1726,43 +2185,130 @@ impl DurableTelemetryStore {
                     "Remote Write batch contains a non-Remote-Write metric envelope",
                 ));
             }
-            for point in crate::decode_metric_chunk(&partition.envelope.payload)
-                .map_err(|error| LokiApiError::bad_request(error.to_string()))?
-            {
-                let key = (point.series_fingerprint(), point.timestamp_unix_nanos);
-                if let Some(existing) = request_samples.insert(key, point.clone())
-                    && !same_remote_write_sample(&existing, &point)
-                {
-                    return Err(LokiApiError::bad_request(format!(
-                        "conflicting samples for series {:032x} at {}",
-                        key.0.get(),
-                        key.1
-                    )));
+            let points = crate::decode_metric_chunk(&partition.envelope.payload)
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+            let series = points
+                .first()
+                .map(crate::DurableMetricPoint::series_fingerprint)
+                .ok_or_else(|| LokiApiError::bad_request("Remote Write metric chunk is empty"))?;
+            for point in points {
+                let key = (
+                    partition.topic_partition,
+                    series,
+                    point.timestamp_unix_nanos,
+                );
+                if let Some(existing) = request_samples.get(&key) {
+                    if !same_remote_write_sample_payload(existing, &point) {
+                        return Err(LokiApiError::bad_request(format!(
+                            "conflicting samples for series {:032x} at {}",
+                            key.1.get(),
+                            key.2
+                        )));
+                    }
+                    continue;
                 }
-                let existing = self.query_metrics(&crate::MetricQuery {
-                    tenant: Arc::clone(&point.identity.tenant),
-                    partition: None,
-                    start_offset: None,
-                    series: Some(point.series_fingerprint()),
-                    name: None,
-                    exact_labels: Arc::new(Vec::new()),
-                    start_time_unix_nanos: Some(point.timestamp_unix_nanos),
-                    end_time_unix_nanos: Some(point.timestamp_unix_nanos),
-                    limit: usize::MAX,
-                })?;
-                if existing
-                    .iter()
-                    .any(|stored| !same_remote_write_sample(stored, &point))
-                {
-                    return Err(LokiApiError::bad_request(format!(
-                        "conflicting sample for series {:032x} at {}",
-                        key.0.get(),
-                        key.1
-                    )));
-                }
+                lock_indices.insert(remote_write_lock_index(series));
+                request_order.push(key);
+                request_samples.insert(key, point);
             }
         }
-        self.append_telemetry_batch(batch, true)
+
+        // Conflict checks and the durable append must share the same locks.
+        // Acquire every lock in index order so batches spanning multiple lock
+        // shards cannot deadlock with another request acquiring the same set.
+        let _guards = lock_indices
+            .into_iter()
+            .map(|index| {
+                self.remote_write_append[index]
+                    .lock()
+                    .map_err(|_| LokiApiError::internal("Remote Write append lock poisoned"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut timestamp_queries = foldhash::HashMap::<
+            (TopicPartition, crate::SeriesFingerprint),
+            Vec<u64>,
+        >::with_capacity(request_samples.len());
+        for &(topic_partition, series, timestamp) in &request_order {
+            timestamp_queries
+                .entry((topic_partition, series))
+                .or_default()
+                .push(timestamp);
+        }
+        let retention_cutoff = self.retention_cutoff();
+        for timestamps in timestamp_queries.values_mut() {
+            timestamps.sort_unstable();
+            timestamps.dedup();
+            if let Some(cutoff) = retention_cutoff {
+                timestamps.retain(|timestamp| *timestamp >= cutoff);
+            }
+        }
+
+        // Probe each series once. The stripe query filters to the exact
+        // timestamp set, so a sparse request does not materialize unrelated
+        // points from the surrounding range.
+        let mut existing_samples = foldhash::HashMap::with_capacity(request_samples.len());
+        for ((topic_partition, series), timestamps) in timestamp_queries {
+            let Some(first_timestamp) = timestamps.first().copied() else {
+                continue;
+            };
+            let point = request_samples
+                .get(&(topic_partition, series, first_timestamp))
+                .expect("timestamp query only contains inserted samples");
+            let metric_query = crate::MetricQuery {
+                tenant: Arc::clone(&point.identity.tenant),
+                // The envelope already carries the exact logical
+                // partition used for this Remote Write append. Keeping
+                // it here avoids fanning every conflict probe across all
+                // tenant partitions and owner stripes.
+                partition: Some(topic_partition),
+                series: Some(series),
+                start_time_unix_nanos: timestamps.first().copied(),
+                end_time_unix_nanos: timestamps.last().copied(),
+                limit: usize::MAX,
+                ..crate::MetricQuery::default()
+            };
+            let exact_query = crate::sink::MetricTimestampQuery {
+                tenant: Arc::clone(&point.identity.tenant),
+                partition: topic_partition,
+                series,
+                timestamps: Arc::from(timestamps.into_boxed_slice()),
+            };
+            let existing = if let Some(shard_id) = self.metric_query_owner_shard(&metric_query) {
+                self.service
+                    .query_metric_timestamps_on_shard(shard_id, &exact_query)
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?
+            } else {
+                self.service
+                    .query_metric_timestamps(&exact_query)
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?
+            };
+            for stored in existing {
+                existing_samples.insert(
+                    (topic_partition, series, stored.timestamp_unix_nanos),
+                    stored,
+                );
+            }
+        }
+
+        for (topic_partition, series, timestamp) in request_order {
+            let point = request_samples
+                .get(&(topic_partition, series, timestamp))
+                .expect("request order only contains inserted samples");
+            if existing_samples
+                .get(&(topic_partition, series, timestamp))
+                .is_some_and(|stored| !same_remote_write_sample_payload(stored, point))
+            {
+                return Err(LokiApiError::bad_request(format!(
+                    "conflicting sample for series {:032x} at {}",
+                    series.get(),
+                    timestamp
+                )));
+            }
+        }
+        // Remote Write has already validated the metric envelope and applied
+        // its serialized conflict checks above. Re-encoding and decoding the
+        // native batch here would repeat the wire validation pass.
+        self.append_validated_telemetry_batch(batch, true)
     }
 
     /// Executes a native trace query on the owner stripes.
@@ -1781,9 +2327,23 @@ impl DurableTelemetryStore {
                     .map_or(cutoff, |start| start.max(cutoff)),
             );
         }
-        self.service
-            .query_traces(&query)
-            .map_err(|error| LokiApiError::internal(error.to_string()))
+        if let Some(shard_id) = self.trace_query_owner_shard(&query) {
+            self.service
+                .query_traces_on_shard(shard_id, &query)
+                .map_err(|error| LokiApiError::internal(error.to_string()))
+        } else if let Some(shard_id) = self
+            .service
+            .trace_query_owner_shard(&query)
+            .map_err(|error| LokiApiError::internal(error.to_string()))?
+        {
+            self.service
+                .query_traces_on_shard(shard_id, &query)
+                .map_err(|error| LokiApiError::internal(error.to_string()))
+        } else {
+            self.service
+                .query_traces(&query)
+                .map_err(|error| LokiApiError::internal(error.to_string()))
+        }
     }
 
     fn query_traces_unordered(
@@ -1801,9 +2361,19 @@ impl DurableTelemetryStore {
                     .map_or(cutoff, |start| start.max(cutoff)),
             );
         }
-        self.service
-            .query_traces_unordered(&query)
-            .map_err(|error| LokiApiError::internal(error.to_string()))
+        if let Some(shard_id) = self
+            .service
+            .trace_query_owner_shard(&query)
+            .map_err(|error| LokiApiError::internal(error.to_string()))?
+        {
+            self.service
+                .query_traces_on_shard(shard_id, &query)
+                .map_err(|error| LokiApiError::internal(error.to_string()))
+        } else {
+            self.service
+                .query_traces_unordered(&query)
+                .map_err(|error| LokiApiError::internal(error.to_string()))
+        }
     }
 
     /// Executes a native exact raw-metric query on the owner stripes.
@@ -1822,9 +2392,23 @@ impl DurableTelemetryStore {
                     .map_or(cutoff, |start| start.max(cutoff)),
             );
         }
-        self.service
-            .query_metrics(&query)
-            .map_err(|error| LokiApiError::internal(error.to_string()))
+        if let Some(shard_id) = self.metric_query_owner_shard(&query) {
+            self.service
+                .query_metrics_on_shard(shard_id, &query)
+                .map_err(|error| LokiApiError::internal(error.to_string()))
+        } else if let Some(shard_id) = self
+            .service
+            .metric_query_owner_shard(&query)
+            .map_err(|error| LokiApiError::internal(error.to_string()))?
+        {
+            self.service
+                .query_metrics_on_shard(shard_id, &query)
+                .map_err(|error| LokiApiError::internal(error.to_string()))
+        } else {
+            self.service
+                .query_metrics(&query)
+                .map_err(|error| LokiApiError::internal(error.to_string()))
+        }
     }
 
     /// Returns bounded cross-signal record references for exact shared
@@ -1855,35 +2439,66 @@ impl DurableTelemetryStore {
         wait_for_index: bool,
     ) -> Result<crate::NativePartitionAck, LokiApiError> {
         self.check_append_partitions(std::slice::from_ref(partition))?;
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let payload = partition
             .envelope
             .encode()
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        self.append_telemetry_partition_with_encoded_envelope(
+            partition,
+            Bytes::from(payload),
+            wait_for_index,
+        )
+    }
+
+    fn append_telemetry_partition_with_encoded_envelope(
+        &self,
+        partition: &crate::NativePartitionAppend,
+        payload: Bytes,
+        wait_for_index: bool,
+    ) -> Result<crate::NativePartitionAck, LokiApiError> {
+        self.append_telemetry_partition_with_fields(
+            partition.topic_partition,
+            partition.envelope.item_count,
+            payload,
+            partition
+                .transient_context
+                .as_deref()
+                .map(Bytes::copy_from_slice),
+            wait_for_index,
+        )
+    }
+
+    fn append_telemetry_partition_with_fields(
+        &self,
+        topic_partition: TopicPartition,
+        record_count: u32,
+        payload: Bytes,
+        transient_context: Option<Bytes>,
+        wait_for_index: bool,
+    ) -> Result<crate::NativePartitionAck, LokiApiError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = AppendRequest {
             request_id: u128::from(request_id),
-            topic_id: partition.topic_partition.topic_id,
-            partition_id: partition.topic_partition.partition_id,
-            record_count: partition.envelope.item_count,
-            payload: Bytes::from(payload),
+            topic_id: topic_partition.topic_id,
+            partition_id: topic_partition.partition_id,
+            record_count,
+            payload,
             durability: self.append_durability,
             producer: None,
             atomic_group: None,
             leader_epoch: None,
             extension_context: None,
         };
-        let appended = if let Some(transient_context) = &partition.transient_context {
-            self.engine.append_with_durable_sink_context(
-                request,
-                Bytes::copy_from_slice(transient_context),
-            )
+        let appended = if let Some(transient_context) = transient_context {
+            self.engine
+                .append_with_durable_sink_context(request, transient_context)
         } else {
             self.engine.append(request)
         }
         .map_err(engine_error)?;
         if wait_for_index {
             let target = DurableSinkCheckpoint {
-                topic_partition: partition.topic_partition,
+                topic_partition,
                 next_placement_sequence: PlacementSequence::new(
                     appended
                         .placement
@@ -1905,7 +2520,7 @@ impl DurableTelemetryStore {
                 .map_err(engine_error)?;
         }
         Ok(crate::NativePartitionAck {
-            topic_partition: partition.topic_partition,
+            topic_partition,
             first_offset: appended.first_offset.get(),
             last_offset: appended.last_offset.get(),
         })
@@ -1924,6 +2539,45 @@ impl DurableTelemetryStore {
         })
     }
 
+    fn check_append_partition_encoded(
+        &self,
+        topic_partition: TopicPartition,
+        record_count: u32,
+        encoded_envelope: &[u8],
+        transient_context: Option<&[u8]>,
+        already_validated: bool,
+    ) -> Result<(), LokiApiError> {
+        let Some(gate) = &self.append_gate else {
+            return Ok(());
+        };
+        let envelope = if already_validated {
+            let view = crate::TelemetryEnvelope::decode_view_after_validation(encoded_envelope)
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+            crate::TelemetryEnvelope::new(
+                view.signal,
+                view.tenant,
+                view.item_count,
+                view.routing_metadata,
+                view.payload,
+            )
+            .map_err(|error| LokiApiError::bad_request(error.to_string()))?
+        } else {
+            crate::TelemetryEnvelope::decode(encoded_envelope)
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?
+        };
+        if envelope.item_count != record_count {
+            return Err(LokiApiError::bad_request(
+                "native append metadata count disagrees with its envelope",
+            ));
+        }
+        gate.check_append_partitions(&[crate::NativePartitionAppend {
+            topic_partition,
+            envelope,
+            transient_context: transient_context.map(Arc::<[u8]>::from),
+        }])
+        .map_err(LokiApiError::unavailable)
+    }
+
     /// Executes a native exact-label/token query directly against the bounded
     /// stripe indexes and merges tenant partitions by timestamp.
     pub fn query_native(&self, request: &NativeQuery) -> Result<Vec<LokiEntry>, LokiApiError> {
@@ -1934,6 +2588,33 @@ impl DurableTelemetryStore {
         if !delete_filter.is_empty() {
             return self.query_native_with_deletes(request, &delete_filter);
         }
+        self.query_native_indexed_matches(request)?
+            .into_iter()
+            .map(log_match_to_entry)
+            .collect()
+    }
+
+    /// Returns projected native-query matches when the query needs no
+    /// post-filtering. The native server can encode these shared records
+    /// directly, avoiding per-result Loki label and metadata maps.
+    pub(crate) fn query_native_projected(
+        &self,
+        request: &NativeQuery,
+    ) -> Result<Option<Vec<LogMatch>>, LokiApiError> {
+        if request.limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let delete_filter = LogicalDeleteFilter::compile(&self.deletes.list(&request.tenant)?)?;
+        if !delete_filter.is_empty() {
+            return Ok(None);
+        }
+        self.query_native_indexed_matches(request).map(Some)
+    }
+
+    fn query_native_indexed_matches(
+        &self,
+        request: &NativeQuery,
+    ) -> Result<Vec<LogMatch>, LokiApiError> {
         let queries = self
             .tenant_partitions(&request.tenant)?
             .into_iter()
@@ -1957,28 +2638,15 @@ impl DurableTelemetryStore {
                 query
             })
             .collect::<Vec<_>>();
-        let mut matches = self
+        // Every logical partition has one deterministic stripe owner. Route
+        // each query directly to that owner instead of broadcasting the full
+        // tenant fan-out to every stripe and making each worker discard the
+        // partitions it does not own.
+        let matches = self
             .service
-            .query_partitions(&queries)
+            .query_partitions_projected_with_fields(&queries, false, true)
             .map_err(|error| LokiApiError::internal(error.to_string()))?;
-        matches.sort_unstable_by(|left, right| {
-            let ordering = left
-                .record
-                .timestamp_unix_nanos
-                .cmp(&right.record.timestamp_unix_nanos)
-                .then_with(|| {
-                    left.record
-                        .record_ref
-                        .offset
-                        .cmp(&right.record.record_ref.offset)
-                });
-            match request.direction {
-                NativeQueryDirection::OldestFirst => ordering,
-                NativeQueryDirection::NewestFirst => ordering.reverse(),
-            }
-        });
-        matches.truncate(request.limit as usize);
-        matches.into_iter().map(log_match_to_entry).collect()
+        Ok(matches)
     }
 
     fn query_native_with_deletes(
@@ -2010,10 +2678,22 @@ impl DurableTelemetryStore {
                 for term in &request.terms {
                     query = query.with_term(term.as_str());
                 }
-                let matches = self
-                    .service
-                    .query_partitions(std::slice::from_ref(&query))
-                    .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                let matches = if let Some(shard_id) = self.standalone_owner_shard(partition) {
+                    self.service
+                        .query_partition_projected_on_shard(shard_id, &query, false)
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?
+                } else {
+                    self.service
+                        .query_partitions_projected_each_with_fields(
+                            std::slice::from_ref(&query),
+                            false,
+                            true,
+                        )
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?
+                        .into_iter()
+                        .flatten()
+                        .collect()
+                };
                 if matches.is_empty() {
                     break;
                 }
@@ -2054,16 +2734,122 @@ impl DurableTelemetryStore {
     }
 }
 
-fn same_remote_write_sample(
+fn same_remote_write_sample_payload(
     left: &crate::DurableMetricPoint,
     right: &crate::DurableMetricPoint,
 ) -> bool {
-    left.series_fingerprint() == right.series_fingerprint()
-        && left.timestamp_unix_nanos == right.timestamp_unix_nanos
+    left.timestamp_unix_nanos == right.timestamp_unix_nanos
         && left.start_time_unix_nanos == right.start_time_unix_nanos
         && left.flags == right.flags
         && left.value == right.value
         && left.exemplars == right.exemplars
+}
+
+impl DurableTelemetryStore {
+    fn query_loki_range(
+        &self,
+        tenant: &str,
+        selector: &crate::loki_api::LogSelector,
+        start_timestamp_unix_nanos: i64,
+        end_timestamp_unix_nanos: i64,
+        limit: usize,
+        newest_first: bool,
+    ) -> Result<LokiQueryResult, LokiApiError> {
+        if limit == 0 || end_timestamp_unix_nanos < 0 {
+            return Ok(LokiQueryResult::default());
+        }
+        let partitions = self.tenant_partitions(tenant)?;
+        if partitions.is_empty() {
+            return Ok(LokiQueryResult::default());
+        }
+        let start = u64::try_from(start_timestamp_unix_nanos).unwrap_or_default();
+        // Loki range bounds are inclusive. The native log query uses an
+        // exclusive upper bound, so widen the converted end by one tick.
+        let end = u64::try_from(end_timestamp_unix_nanos)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let start = self.retained_query_start(Some(start));
+        let delete_requests = self.deletes.list(tenant)?;
+        let exact_selector = selector.is_exact_label_only();
+        let bounded_candidates = exact_selector && delete_requests.is_empty();
+        let indexed_line_predicate = selector.indexed_line_predicate();
+        let mut per_partition_limit = limit.div_ceil(partitions.len()).max(1);
+        let mut lines_processed = 0usize;
+        let mut bytes_processed = 0usize;
+        loop {
+            let queries = partitions
+                .iter()
+                .copied()
+                .map(|partition| {
+                    let mut query = LogQuery::new(partition)
+                        .sort_by_timestamp()
+                        .with_field(TENANT_FIELD, tenant);
+                    if bounded_candidates {
+                        query = query.with_limit(per_partition_limit);
+                    }
+                    query.start_timestamp_unix_nanos = start;
+                    query.end_timestamp_unix_nanos = Some(end);
+                    if newest_first {
+                        query = query.newest_first();
+                    }
+                    for (key, value) in selector.exact_label_matchers() {
+                        query = query.with_field(format!("{LABEL_PREFIX}{key}"), value);
+                    }
+                    if let Some(predicate) = &indexed_line_predicate {
+                        query = query.with_predicate(predicate.clone());
+                    }
+                    query
+                })
+                .collect::<Vec<_>>();
+            let partition_matches = self
+                .service
+                .query_partitions_projected_each_with_fields(&queries, false, true)
+                .map_err(|error| LokiApiError::internal(error.to_string()))?;
+            let saturated = bounded_candidates
+                && partition_matches
+                    .iter()
+                    .any(|matches| matches.len() >= per_partition_limit);
+            let matches = partition_matches.into_iter().flatten().inspect(|matched| {
+                lines_processed = lines_processed.saturating_add(1);
+                bytes_processed = bytes_processed.saturating_add(matched.record.message.len());
+            });
+            let mut entries = matches
+                .map(log_match_to_entry)
+                .collect::<Result<Vec<_>, _>>()?;
+            if !delete_requests.is_empty() {
+                apply_logical_deletes(&mut entries, &delete_requests)?;
+            }
+            let mut entries = if exact_selector {
+                entries
+            } else {
+                entries
+                    .into_iter()
+                    .filter_map(|entry| selector.process(entry))
+                    .collect::<Vec<_>>()
+            };
+            entries.sort_unstable_by_key(|entry| entry.timestamp_unix_nanos);
+            if newest_first {
+                entries.reverse();
+            }
+            entries.truncate(limit);
+            if entries.len() >= limit || !saturated {
+                return Ok(LokiQueryResult {
+                    entries,
+                    lines_processed,
+                    bytes_processed,
+                });
+            }
+            let next_limit = per_partition_limit.saturating_mul(2);
+            if next_limit == per_partition_limit {
+                return Ok(LokiQueryResult {
+                    entries,
+                    lines_processed,
+                    bytes_processed,
+                });
+            }
+            per_partition_limit = next_limit;
+        }
+    }
 }
 
 impl LokiStore for DurableTelemetryStore {
@@ -2075,13 +2861,14 @@ impl LokiStore for DurableTelemetryStore {
             .map_err(|_| LokiApiError::bad_request("push contains more than u32 entries"))?;
         let routing_request = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let topic_partition = self.write_partition(tenant, routing_request);
-        let envelope = crate::prepare_loki_log_envelope(tenant, entries)
-            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        let (envelope, transient_context) =
+            crate::signal_ingest::prepare_loki_log_envelope_with_context(tenant, entries)
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
         let acknowledgement = self.append_telemetry_partition(
             &crate::NativePartitionAppend {
                 topic_partition,
                 envelope,
-                transient_context: None,
+                transient_context: Some(transient_context),
             },
             true,
         )?;
@@ -2115,7 +2902,11 @@ impl LokiStore for DurableTelemetryStore {
             .collect::<Vec<_>>();
         let matches = self
             .service
-            .query_partitions(&queries)
+            // Loki listings only need the message, timestamp, and structural
+            // fields used to reconstruct labels and structured metadata.
+            // Avoid cloning typed OTLP bodies and signal context for every
+            // result in an unbounded listing.
+            .query_partitions_projected_with_fields(&queries, false, true)
             .map_err(|error| LokiApiError::internal(error.to_string()))?;
         let mut entries = matches
             .into_iter()
@@ -2124,6 +2915,26 @@ impl LokiStore for DurableTelemetryStore {
         apply_logical_deletes(&mut entries, &self.deletes.list(tenant)?)?;
         entries.sort_unstable_by_key(|entry| entry.timestamp_unix_nanos);
         Ok(entries)
+    }
+
+    fn query_range(
+        &self,
+        tenant: &str,
+        expression: &str,
+        start_timestamp_unix_nanos: i64,
+        end_timestamp_unix_nanos: i64,
+        limit: usize,
+        newest_first: bool,
+    ) -> Result<LokiQueryResult, LokiApiError> {
+        let selector = crate::loki_api::parse_log_query(expression)?;
+        self.query_loki_range(
+            tenant,
+            &selector,
+            start_timestamp_unix_nanos,
+            end_timestamp_unix_nanos,
+            limit,
+            newest_first,
+        )
     }
 
     fn scan_analytics_arrow(
@@ -2213,7 +3024,7 @@ impl LokiStore for DurableTelemetryStore {
                     min_duration_nanos: None,
                     limit,
                 };
-                let spans = if request.order.is_none() {
+                let spans = if request.order.is_none() && request.trace_id.is_none() {
                     self.query_traces_unordered(&query)?
                 } else {
                     self.query_traces(&query)?
@@ -2338,69 +3149,155 @@ impl LokiStore for DurableTelemetryStore {
                 return self.scan_metric_analytics(request, emit);
             }
         }
+        if request.order == Some(AnalyticsScanOrder::RelevanceDescending) {
+            return self.scan_analytics_relevance(request, emit);
+        }
         let limit = request.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(());
         }
+        let include_typed_metadata =
+            crate::analytics::log_columns_need_typed_metadata(&request.columns)
+                || !request.attributes.is_empty();
+        let include_fields = crate::analytics::log_columns_need_structural_fields(&request.columns)
+            || analytics_predicate_needs_structural_fields(&request.predicate)
+            || (!request.attributes.is_empty()
+                && (!request.labels.is_empty() || !request.metadata.is_empty()))
+            || request.series_id.is_some()
+            || request.name.is_some();
         let delete_filter = LogicalDeleteFilter::compile(&self.deletes.list(&request.tenant)?)?;
-        let index_complete_ordered_scan = request.order.is_some()
-            && delete_filter.is_empty()
+        let index_complete_log_scan = delete_filter.is_empty()
             && request.attributes.is_empty()
             && request.resource_attributes.is_empty()
             && request.scope_attributes.is_empty()
-            && request.trace_id.is_none()
-            && request.span_id.is_none()
             && request.series_id.is_none()
-            && request.name.is_none();
-        if index_complete_ordered_scan {
-            let queries = self
-                .tenant_partitions(&request.tenant)?
+            && request.name.is_none()
+            && (request.order.is_some() || request.trace_id.is_some() || request.limit.is_some());
+        if index_complete_log_scan {
+            let partitions = if let Some(trace_id) = request.trace_id {
+                let router = crate::TelemetryRouter::new(
+                    NonZeroU16::new(u16::try_from(self.tenant_partitions).map_err(|_| {
+                        LokiApiError::internal("tenant partition count exceeds the routing space")
+                    })?)
+                    .ok_or_else(|| LokiApiError::internal("tenant partition count is zero"))?,
+                );
+                vec![router.log(&request.tenant, Some(trace_id), &[])]
+            } else {
+                self.tenant_partitions(&request.tenant)?
+            };
+            let queries = partitions
                 .into_iter()
                 .map(|partition| {
-                    let mut query = LogQuery::new(partition)
-                        .sort_by_timestamp()
-                        .with_limit(limit)
-                        .with_field(TENANT_FIELD, request.tenant.as_ref());
+                    let mut query =
+                        LogQuery::new(partition).with_field(TENANT_FIELD, request.tenant.as_ref());
+                    if request.order.is_some() {
+                        query = query.sort_by_timestamp();
+                    }
+                    // SQL leaves the row order unspecified when ORDER BY is
+                    // absent. For a bounded unordered page, newest-first
+                    // selection lets tiered frames stop at the first useful
+                    // time groups instead of decoding the entire window.
+                    if request.order.is_none() && request.trace_id.is_none() {
+                        query = query.sort_by_timestamp().newest_first();
+                    }
+                    if let Some(limit) = request.limit {
+                        query = query.with_limit(limit);
+                    }
                     query.start_timestamp_unix_nanos =
                         self.retained_query_start(request.start_timestamp_unix_nanos);
                     query.end_timestamp_unix_nanos = request.end_timestamp_unix_nanos;
+                    query = apply_analytics_log_filters(query, request);
                     if request.order == Some(AnalyticsScanOrder::TimestampDescending) {
                         query = query.newest_first();
-                    }
-                    for term in &request.terms {
-                        query = query.with_term(Arc::clone(term));
-                    }
-                    for token in &request.message_tokens {
-                        query = query.with_predicate(LogPredicate::message_token(
-                            Arc::clone(token),
-                            CaseSensitivity::Sensitive,
-                        ));
-                    }
-                    for token in &request.case_insensitive_message_tokens {
-                        query = query.with_predicate(LogPredicate::message_token(
-                            Arc::clone(token),
-                            CaseSensitivity::Insensitive,
-                        ));
-                    }
-                    for field in &request.labels {
-                        query = query.with_field(
-                            format!("{LABEL_PREFIX}{}", field.key),
-                            Arc::clone(&field.value),
-                        );
-                    }
-                    for field in &request.metadata {
-                        query = query.with_field(
-                            format!("{METADATA_PREFIX}{}", field.key),
-                            Arc::clone(&field.value),
-                        );
                     }
                     query
                 })
                 .collect::<Vec<_>>();
-            let rows = self
-                .service
-                .query_partitions(&queries)
-                .map_err(|error| LokiApiError::internal(error.to_string()))?
+            let mut matches = if request.trace_id.is_some() {
+                let partition = queries
+                    .first()
+                    .expect("trace-routed log scan always builds one query")
+                    .topic_partition;
+                if let Some(shard_count) = self.physical_shard_count {
+                    self.service
+                        .query_partition_projected_on_shard_with_fields(
+                            ShardId::new(partition.partition_id.get() % shard_count),
+                            &queries[0],
+                            include_typed_metadata,
+                            include_fields,
+                        )
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?
+                } else {
+                    self.service
+                        .query_partitions_projected_each_with_fields(
+                            &queries,
+                            include_typed_metadata,
+                            include_fields,
+                        )
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?
+                        .into_iter()
+                        .flatten()
+                        .collect()
+                }
+            } else if request.order.is_none() {
+                // An unordered bounded scan only needs enough rows to fill the
+                // global page. Asking every partition for the full limit can
+                // decode tens of thousands of rows that are immediately
+                // discarded below. Start with an even per-partition budget and
+                // grow it only when a partition was saturated before the page
+                // filled, preserving the same arbitrary-order semantics.
+                let mut per_partition_limit = request
+                    .limit
+                    .unwrap_or(limit)
+                    .div_ceil(queries.len().max(1))
+                    .max(1);
+                loop {
+                    let bounded_queries = queries
+                        .iter()
+                        .cloned()
+                        .map(|query| query.with_limit(per_partition_limit))
+                        .collect::<Vec<_>>();
+                    let matches = self
+                        .service
+                        .query_partitions_projected_unordered_with_fields(
+                            &bounded_queries,
+                            include_typed_metadata,
+                            include_fields,
+                        )
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                    if matches.len() >= limit || per_partition_limit >= limit {
+                        break matches;
+                    }
+                    let mut counts = BTreeMap::<TopicPartition, usize>::new();
+                    for matched in &matches {
+                        *counts
+                            .entry(matched.record.record_ref.topic_partition)
+                            .or_default() += 1;
+                    }
+                    if !counts.values().any(|count| *count >= per_partition_limit) {
+                        break matches;
+                    }
+                    per_partition_limit = per_partition_limit.saturating_mul(2).min(limit);
+                }
+            } else {
+                self.service
+                    .query_partitions_projected_with_fields(
+                        &queries,
+                        include_typed_metadata,
+                        include_fields,
+                    )
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?
+            };
+            if request.order.is_none() && request.trace_id.is_none() {
+                matches.sort_unstable_by_key(|matched| {
+                    (
+                        matched.record.record_ref.topic_partition,
+                        matched.record.record_ref.offset,
+                    )
+                });
+                matches.truncate(limit);
+            }
+            let rows = matches
                 .into_iter()
                 .map(|matched| {
                     crate::analytics::projected_log_row(
@@ -2415,6 +3312,107 @@ impl LokiStore for DurableTelemetryStore {
             }
             return Ok(());
         }
+
+        // An unordered, bounded scan with no logical deletes can batch all
+        // partition queries into one owner-worker command. This keeps the
+        // post-filter semantics below while avoiding one channel round trip
+        // per logical partition on the common analytical path.
+        if delete_filter.is_empty()
+            && request.order.is_none()
+            && request.trace_id.is_none()
+            && let Some(request_limit) = request.limit
+        {
+            let mut active_partitions = self.tenant_partitions(&request.tenant)?;
+            let mut per_partition_limit = request_limit
+                .div_ceil(active_partitions.len().max(1))
+                .max(1);
+            let mut rows =
+                Vec::with_capacity(request_limit.min(crate::analytics::DEFAULT_SCAN_BATCH_ROWS));
+            let mut seen = HashSet::new();
+            loop {
+                let queries = active_partitions
+                    .iter()
+                    .copied()
+                    .map(|partition| {
+                        let mut query = LogQuery::new(partition)
+                            .with_field(TENANT_FIELD, request.tenant.as_ref());
+                        query.start_timestamp_unix_nanos =
+                            self.retained_query_start(request.start_timestamp_unix_nanos);
+                        query.end_timestamp_unix_nanos = request.end_timestamp_unix_nanos;
+                        apply_analytics_log_filters(query, request).with_limit(per_partition_limit)
+                    })
+                    .collect::<Vec<_>>();
+                let partition_matches = self
+                    .service
+                    .query_partitions_projected_each_with_fields(
+                        &queries,
+                        include_typed_metadata,
+                        include_fields,
+                    )
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                let mut saturated_partitions = Vec::new();
+                for (partition, matches) in active_partitions.iter().zip(partition_matches) {
+                    if matches.len() >= per_partition_limit {
+                        saturated_partitions.push(*partition);
+                    }
+                    for matched in matches {
+                        let record_key = (
+                            matched.record.record_ref.topic_partition,
+                            matched.record.record_ref.offset.get(),
+                        );
+                        if !seen.insert(record_key) {
+                            continue;
+                        }
+                        if request.attributes.is_empty() {
+                            rows.push(crate::analytics::projected_log_row(
+                                &request.tenant,
+                                &matched.record,
+                                &request.columns,
+                            )?);
+                        } else {
+                            let row = analytics_row_from_match(&request.tenant, matched)?;
+                            if !crate::analytics::row_matches(&row, request) {
+                                continue;
+                            }
+                            rows.push(row);
+                        }
+                        if rows.len() == request_limit {
+                            break;
+                        }
+                    }
+                    if rows.len() == request_limit {
+                        break;
+                    }
+                }
+                if rows.len() == request_limit
+                    || saturated_partitions.is_empty()
+                    || per_partition_limit >= request_limit
+                {
+                    for batch in rows.chunks(crate::analytics::DEFAULT_SCAN_BATCH_ROWS) {
+                        emit(batch)?;
+                    }
+                    return Ok(());
+                }
+                active_partitions = saturated_partitions;
+                per_partition_limit = per_partition_limit.saturating_mul(2).min(request_limit);
+            }
+        }
+
+        // The fallback pages materialize full rows and apply row_matches, so
+        // retain every lane that residual filtering can inspect. The bounded
+        // fast path above can omit these lanes because LogQuery already
+        // verified its exact pushdown filters before projection.
+        let post_filter_include_typed_metadata = include_typed_metadata
+            || request.trace_id.is_some()
+            || request.span_id.is_some()
+            || request.series_id.is_some()
+            || request.name.is_some()
+            || !request.attributes.is_empty()
+            || !request.resource_attributes.is_empty()
+            || !request.scope_attributes.is_empty()
+            || analytics_predicate_needs_structural_fields(&request.predicate);
+        let post_filter_include_fields =
+            include_fields || !request.labels.is_empty() || !request.metadata.is_empty();
         let mut emitted = 0usize;
         let partitions = if let Some(trace_id) = request.trace_id {
             let router = crate::TelemetryRouter::new(
@@ -2427,8 +3425,6 @@ impl LokiStore for DurableTelemetryStore {
         } else {
             self.tenant_partitions(&request.tenant)?
         };
-        let trace_id = request.trace_id.map(|trace_id| trace_id.to_string());
-        let span_id = request.span_id.map(|span_id| span_id.to_string());
         for partition in partitions {
             let mut next_offset = None;
             loop {
@@ -2443,43 +3439,25 @@ impl LokiStore for DurableTelemetryStore {
                 query.start_timestamp_unix_nanos =
                     self.retained_query_start(request.start_timestamp_unix_nanos);
                 query.end_timestamp_unix_nanos = request.end_timestamp_unix_nanos;
-                for term in &request.terms {
-                    query = query.with_term(Arc::clone(term));
-                }
-                for token in &request.message_tokens {
-                    query = query.with_predicate(LogPredicate::message_token(
-                        Arc::clone(token),
-                        CaseSensitivity::Sensitive,
-                    ));
-                }
-                for token in &request.case_insensitive_message_tokens {
-                    query = query.with_predicate(LogPredicate::message_token(
-                        Arc::clone(token),
-                        CaseSensitivity::Insensitive,
-                    ));
-                }
-                for field in &request.labels {
-                    query = query.with_field(
-                        format!("{LABEL_PREFIX}{}", field.key),
-                        Arc::clone(&field.value),
-                    );
-                }
-                for field in &request.metadata {
-                    query = query.with_field(
-                        format!("{METADATA_PREFIX}{}", field.key),
-                        Arc::clone(&field.value),
-                    );
-                }
-                if let Some(trace_id) = trace_id.as_deref() {
-                    query = query.with_field("otel.trace_id", trace_id);
-                }
-                if let Some(span_id) = span_id.as_deref() {
-                    query = query.with_field("otel.span_id", span_id);
-                }
-                let matches = self
-                    .service
-                    .query_partitions(std::slice::from_ref(&query))
-                    .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                query = apply_analytics_log_filters(query, request);
+                let matches = if let Some(shard_id) = self.standalone_owner_shard(partition) {
+                    self.service
+                        .query_partition_projected_on_shard_with_fields(
+                            shard_id,
+                            &query,
+                            post_filter_include_typed_metadata,
+                            post_filter_include_fields,
+                        )
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?
+                } else {
+                    self.service
+                        .query_partitions_projected_with_fields(
+                            std::slice::from_ref(&query),
+                            post_filter_include_typed_metadata,
+                            post_filter_include_fields,
+                        )
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?
+                };
                 if matches.is_empty() {
                     break;
                 }
@@ -2491,17 +3469,27 @@ impl LokiStore for DurableTelemetryStore {
                     .record_ref
                     .offset
                     .get();
-                let rows = matches
-                    .into_iter()
-                    .map(|matched| analytics_row_and_entry(&request.tenant, matched))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .filter_map(|(row, entry)| {
-                        (!delete_filter.matches(&entry)
-                            && crate::analytics::row_matches(&row, request))
-                        .then_some(row)
-                    })
-                    .collect::<Vec<_>>();
+                let rows = if delete_filter.is_empty() {
+                    matches
+                        .into_iter()
+                        .map(|matched| analytics_row_from_match(&request.tenant, matched))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .filter(|row| crate::analytics::row_matches(row, request))
+                        .collect::<Vec<_>>()
+                } else {
+                    matches
+                        .into_iter()
+                        .map(|matched| analytics_row_and_entry(&request.tenant, matched))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .filter_map(|(row, entry)| {
+                            (!delete_filter.matches(&entry)
+                                && crate::analytics::row_matches(&row, request))
+                            .then_some(row)
+                        })
+                        .collect::<Vec<_>>()
+                };
                 if !rows.is_empty() {
                     emit(&rows)?;
                 }
@@ -2518,18 +3506,266 @@ impl LokiStore for DurableTelemetryStore {
         Ok(())
     }
 
+    fn scan_analytics_relevance(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        let limit = request
+            .limit
+            .ok_or_else(|| LokiApiError::bad_request("relevance order requires a limit"))?;
+        if limit == 0 {
+            return Ok(());
+        }
+        let delete_filter = LogicalDeleteFilter::compile(&self.deletes.list(&request.tenant)?)?;
+        let queries = self
+            .tenant_partitions(&request.tenant)?
+            .into_iter()
+            .map(|partition| {
+                let mut query =
+                    LogQuery::new(partition).with_field(TENANT_FIELD, request.tenant.as_ref());
+                query.start_timestamp_unix_nanos =
+                    self.retained_query_start(request.start_timestamp_unix_nanos);
+                query.end_timestamp_unix_nanos = request.end_timestamp_unix_nanos;
+                apply_analytics_log_filters(query, request)
+            })
+            .collect::<Vec<_>>();
+        let include_typed_metadata =
+            crate::analytics::log_columns_need_typed_metadata(&request.columns);
+        let include_fields = crate::analytics::log_columns_need_structural_fields(&request.columns)
+            || analytics_predicate_needs_structural_fields(&request.predicate)
+            || !request.attributes.is_empty()
+            || !request.resource_attributes.is_empty()
+            || !request.scope_attributes.is_empty()
+            || request.series_id.is_some()
+            || request.name.is_some();
+        let needs_post_filter = !delete_filter.is_empty()
+            || !request.attributes.is_empty()
+            || !request.resource_attributes.is_empty()
+            || !request.scope_attributes.is_empty()
+            || request.series_id.is_some()
+            || request.name.is_some();
+        let message_only = !needs_post_filter
+            && request.trace_id.is_none()
+            && request.span_id.is_none()
+            && request.columns.iter().all(|column| {
+                matches!(
+                    column,
+                    crate::AnalyticsColumn::Timestamp
+                        | crate::AnalyticsColumn::Message
+                        | crate::AnalyticsColumn::Score
+                )
+            })
+            && relevance_message_predicate_only(&request.predicate);
+        let relevance_scorer = crate::analytics::RelevanceScorer::from_request(request);
+        let mut rows = if message_only {
+            let mut top =
+                BinaryHeap::with_capacity(limit.min(crate::analytics::DEFAULT_SCAN_BATCH_ROWS));
+            let matches = self
+                .service
+                .query_partitions_messages_top_k_unordered(&queries, &relevance_scorer, limit)
+                .map_err(|error| LokiApiError::internal(error.to_string()))?;
+            let mut visit = |matched: &crate::stripe::LogMessageMatch,
+                             score: f64|
+             -> Result<(), LokiApiError> {
+                let timestamp_unix_nanos =
+                    i64::try_from(matched.timestamp_unix_nanos).map_err(|_| {
+                        LokiApiError::internal("timestamp exceeds ClickHouse i64 range")
+                    })?;
+                let offset = matched.record_ref.offset.get();
+                let partition = matched.record_ref.topic_partition.partition_id.get();
+                let belongs_in_top = top.len() < limit
+                    || top.peek().is_some_and(
+                        |Reverse(worst): &Reverse<MessageRelevanceHeapItem>| {
+                            score
+                                .total_cmp(&worst.score)
+                                .then_with(|| timestamp_unix_nanos.cmp(&worst.timestamp_unix_nanos))
+                                .then_with(|| offset.cmp(&worst.offset))
+                                == CmpOrdering::Greater
+                        },
+                    );
+                if belongs_in_top {
+                    let item = MessageRelevanceHeapItem {
+                        score,
+                        timestamp_unix_nanos,
+                        offset,
+                        partition,
+                        message: matched.message_arc(),
+                    };
+                    if top.len() == limit {
+                        top.pop();
+                    }
+                    top.push(Reverse(item));
+                }
+                Ok(())
+            };
+            crate::stripe::for_each_message_match_score(&matches, &relevance_scorer, &mut visit)?;
+            top.into_iter()
+                .map(|Reverse(item)| {
+                    let mut row = AnalyticsRow::empty(
+                        Arc::clone(&request.tenant),
+                        "logs",
+                        u64::try_from(item.timestamp_unix_nanos)
+                            .expect("validated message timestamp is non-negative"),
+                        item.partition,
+                        item.offset,
+                    )?;
+                    row.message = Some(item.message);
+                    row.score = Some(item.score);
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>, LokiApiError>>()?
+        } else {
+            let mut top =
+                BinaryHeap::with_capacity(limit.min(crate::analytics::DEFAULT_SCAN_BATCH_ROWS));
+            let mut push_row = |mut row: AnalyticsRow| {
+                row.score =
+                    Some(relevance_scorer.score(row.message.as_deref().unwrap_or_default()));
+                let item = RelevanceHeapItem {
+                    score: row.score.unwrap_or_default(),
+                    timestamp_unix_nanos: row.timestamp_unix_nanos,
+                    offset: row.offset,
+                    row,
+                };
+                if top.len() < limit {
+                    top.push(Reverse(item));
+                } else if top.peek().is_some_and(|Reverse(worst)| item > *worst) {
+                    top.pop();
+                    top.push(Reverse(item));
+                }
+            };
+            let matches = self
+                .service
+                .query_partitions_projected_unordered_with_fields(
+                    &queries,
+                    include_typed_metadata,
+                    include_fields,
+                )
+                .map_err(|error| LokiApiError::internal(error.to_string()))?;
+            for matched in matches {
+                let row = if needs_post_filter {
+                    if delete_filter.is_empty() {
+                        let row = analytics_row_from_match(&request.tenant, matched)?;
+                        if !crate::analytics::row_matches(&row, request) {
+                            continue;
+                        }
+                        row
+                    } else {
+                        let (row, entry) = analytics_row_and_entry(&request.tenant, matched)?;
+                        if delete_filter.matches(&entry)
+                            || !crate::analytics::row_matches(&row, request)
+                        {
+                            continue;
+                        }
+                        row
+                    }
+                } else {
+                    crate::analytics::projected_log_row(
+                        &request.tenant,
+                        &matched.record,
+                        &request.columns,
+                    )?
+                };
+                push_row(row);
+            }
+            top.into_iter()
+                .map(|Reverse(item)| item.row)
+                .collect::<Vec<_>>()
+        };
+        rows.sort_unstable_by(|left, right| {
+            right
+                .score
+                .unwrap_or_default()
+                .partial_cmp(&left.score.unwrap_or_default())
+                .unwrap_or(CmpOrdering::Equal)
+                .then_with(|| right.timestamp_unix_nanos.cmp(&left.timestamp_unix_nanos))
+                .then_with(|| right.offset.cmp(&left.offset))
+        });
+        rows.truncate(limit);
+        for batch in rows.chunks(crate::analytics::DEFAULT_SCAN_BATCH_ROWS) {
+            emit(batch)?;
+        }
+        Ok(())
+    }
+
+    fn scan_analytics_distinct_trace_cardinality(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(u64) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        request.validate()?;
+        let delete_filter = LogicalDeleteFilter::compile(&self.deletes.list(&request.tenant)?)?;
+        let can_use_projected_ids = delete_filter.is_empty()
+            && request.attributes.is_empty()
+            && request.resource_attributes.is_empty()
+            && request.scope_attributes.is_empty()
+            && request.series_id.is_none()
+            && request.name.is_none();
+        if !can_use_projected_ids {
+            return crate::loki_api::scan_distinct_trace_cardinality_by_rows(self, request, emit);
+        }
+
+        let mut outer_request = request.clone();
+        let join_service = outer_request.trace_join_service.take();
+        outer_request.cardinality_only = false;
+        outer_request.distinct_trace_id = false;
+        outer_request.columns = vec![crate::AnalyticsColumn::TraceId];
+
+        let queries_for = |scan_request: &AnalyticsScanRequest| {
+            self.tenant_partitions(&scan_request.tenant)?
+                .into_iter()
+                .map(|partition| {
+                    let mut query = LogQuery::new(partition)
+                        .with_field(TENANT_FIELD, scan_request.tenant.as_ref());
+                    query.start_timestamp_unix_nanos =
+                        self.retained_query_start(scan_request.start_timestamp_unix_nanos);
+                    query.end_timestamp_unix_nanos = scan_request.end_timestamp_unix_nanos;
+                    Ok(apply_analytics_log_filters(query, scan_request))
+                })
+                .collect::<Result<Vec<_>, LokiApiError>>()
+        };
+
+        let outer_queries = queries_for(&outer_request)?;
+        if let Some(service) = join_service {
+            let mut inner_request = outer_request;
+            inner_request.predicate = LogPredicate::MatchAll;
+            inner_request.predicate_any = false;
+            inner_request.terms.clear();
+            inner_request.message_tokens.clear();
+            inner_request.case_insensitive_message_tokens.clear();
+            inner_request.labels = vec![crate::MetadataField::new("service_name", service)];
+            let inner_queries = queries_for(&inner_request)?;
+            let trace_ids = self
+                .service
+                .query_partitions_trace_ids_intersection_unordered(&outer_queries, &inner_queries)
+                .map_err(|error| LokiApiError::internal(error.to_string()))?;
+            emit(u64::try_from(trace_ids.len()).unwrap_or(u64::MAX))
+        } else {
+            let trace_ids = self
+                .service
+                .query_partitions_trace_ids_unordered(&outer_queries)
+                .map_err(|error| LokiApiError::internal(error.to_string()))?;
+            let distinct = trace_ids.into_iter().collect::<HashSet<_>>();
+            emit(u64::try_from(distinct.len()).unwrap_or(u64::MAX))
+        }
+    }
+
     fn scan_analytics_cardinality(
         &self,
         request: &AnalyticsScanRequest,
         emit: &mut dyn FnMut(u64) -> Result<(), LokiApiError>,
     ) -> Result<(), LokiApiError> {
         request.validate()?;
+        if request.trace_join_service.is_some() || request.distinct_trace_id {
+            return self.scan_analytics_distinct_trace_cardinality(request, emit);
+        }
         let unfiltered_log_count = request.relation == AnalyticsRelation::Logs
             && request.start_timestamp_unix_nanos.is_none()
             && request.end_timestamp_unix_nanos.is_none()
             && request.terms.is_empty()
             && request.message_tokens.is_empty()
             && request.case_insensitive_message_tokens.is_empty()
+            && request.predicate == LogPredicate::MatchAll
             && request.labels.is_empty()
             && request.metadata.is_empty()
             && request.attributes.is_empty()
@@ -2556,9 +3792,98 @@ impl LokiStore for DurableTelemetryStore {
             return Ok(());
         }
 
+        let indexed_filtered_log_count = request.relation == AnalyticsRelation::Logs
+            && request.limit.is_none()
+            && request.order.is_none()
+            && request.attributes.is_empty()
+            && request.resource_attributes.is_empty()
+            && request.scope_attributes.is_empty()
+            && request.series_id.is_none()
+            && request.name.is_none()
+            && self.retention.is_none()
+            && self.deletes.list(&request.tenant)?.is_empty();
+        if indexed_filtered_log_count {
+            let queries = self
+                .tenant_partitions(&request.tenant)?
+                .into_iter()
+                .map(|partition| {
+                    let mut query =
+                        LogQuery::new(partition).with_field(TENANT_FIELD, request.tenant.as_ref());
+                    query.start_timestamp_unix_nanos = request.start_timestamp_unix_nanos;
+                    query.end_timestamp_unix_nanos = request.end_timestamp_unix_nanos;
+                    apply_analytics_log_filters(query, request)
+                })
+                .collect::<Vec<_>>();
+            let count = self
+                .service
+                .count_queries(&queries)
+                .map_err(|error| LokiApiError::internal(error.to_string()))?;
+            if count > 0 {
+                emit(count)?;
+            }
+            return Ok(());
+        }
+
         self.scan_analytics(request, &mut |rows| {
             emit(u64::try_from(rows.len()).unwrap_or(u64::MAX))
         })
+    }
+
+    fn scan_analytics_grouped(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(&[AnalyticsGroupRow]) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        request.validate()?;
+        let fast_path = request.relation == AnalyticsRelation::Logs
+            && request.limit.is_none()
+            && request.order.is_none()
+            && request.attributes.is_empty()
+            && request.resource_attributes.is_empty()
+            && request.scope_attributes.is_empty()
+            && request.trace_id.is_none()
+            && request.span_id.is_none()
+            && request.series_id.is_none()
+            && request.name.is_none()
+            && self.retention.is_none()
+            && self.deletes.list(&request.tenant)?.is_empty();
+        if !fast_path {
+            return crate::analytics::group_analytics_rows(self, request, emit);
+        }
+        let partitions = self.tenant_partitions(&request.tenant)?;
+        let queries = partitions
+            .into_iter()
+            .map(|partition| {
+                let mut query =
+                    LogQuery::new(partition).with_field(TENANT_FIELD, request.tenant.as_ref());
+                query.start_timestamp_unix_nanos = request.start_timestamp_unix_nanos;
+                query.end_timestamp_unix_nanos = request.end_timestamp_unix_nanos;
+                apply_analytics_log_filters(query, request)
+            })
+            .collect::<Vec<_>>();
+        let groups = self
+            .service
+            .group_queries(&queries, &request.group_by)
+            .map_err(|error| LokiApiError::internal(error.to_string()))?;
+        let mut grouped = groups
+            .into_iter()
+            .map(|(keys, count)| AnalyticsGroupRow { keys, count })
+            .collect::<Vec<_>>();
+        if request.group_order == AnalyticsGroupOrder::CountDescending {
+            grouped.sort_unstable_by(|left, right| {
+                right
+                    .count
+                    .cmp(&left.count)
+                    .then_with(|| left.keys.cmp(&right.keys))
+            });
+        }
+        if let Some(limit) = request.group_limit {
+            grouped.truncate(limit);
+        }
+        if !grouped.is_empty() {
+            emit(&grouped)?;
+        }
+        Ok(())
     }
 
     fn health(&self) -> Result<StoreHealth, LokiApiError> {
@@ -2667,6 +3992,109 @@ impl LokiStore for DurableTelemetryStore {
     }
 }
 
+fn relevance_message_predicate_only(predicate: &LogPredicate) -> bool {
+    match predicate {
+        LogPredicate::MatchAll
+        | LogPredicate::MatchNone
+        | LogPredicate::MessagePhrase { .. }
+        | LogPredicate::MessageFuzzy { .. } => true,
+        LogPredicate::MessageToken {
+            case_sensitivity: CaseSensitivity::Insensitive,
+            ..
+        }
+        | LogPredicate::MessageTokenRegex(_)
+        | LogPredicate::MessageTokenPrefix {
+            case_sensitivity: CaseSensitivity::Insensitive,
+            ..
+        } => true,
+        LogPredicate::And(predicates) | LogPredicate::Or(predicates) => {
+            predicates.iter().all(relevance_message_predicate_only)
+        }
+        LogPredicate::Not(predicate) => relevance_message_predicate_only(predicate),
+        LogPredicate::Term(_)
+        | LogPredicate::Message(_)
+        | LogPredicate::MessageRegex(_)
+        | LogPredicate::FieldExists(_)
+        | LogPredicate::Field { .. }
+        | LogPredicate::FieldIn { .. }
+        | LogPredicate::FieldRegex { .. }
+        | LogPredicate::FieldNumeric { .. }
+        | LogPredicate::MessageToken {
+            case_sensitivity: CaseSensitivity::Sensitive,
+            ..
+        }
+        | LogPredicate::MessageTokenPrefix {
+            case_sensitivity: CaseSensitivity::Sensitive,
+            ..
+        } => false,
+    }
+}
+
+struct RelevanceHeapItem {
+    score: f64,
+    timestamp_unix_nanos: i64,
+    offset: u64,
+    row: AnalyticsRow,
+}
+
+struct MessageRelevanceHeapItem {
+    score: f64,
+    timestamp_unix_nanos: i64,
+    offset: u64,
+    partition: u32,
+    message: Arc<str>,
+}
+
+impl PartialEq for RelevanceHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.total_cmp(&other.score) == CmpOrdering::Equal
+            && self.timestamp_unix_nanos == other.timestamp_unix_nanos
+            && self.offset == other.offset
+    }
+}
+
+impl Eq for RelevanceHeapItem {}
+
+impl PartialOrd for RelevanceHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RelevanceHeapItem {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.timestamp_unix_nanos.cmp(&other.timestamp_unix_nanos))
+            .then_with(|| self.offset.cmp(&other.offset))
+    }
+}
+
+impl PartialEq for MessageRelevanceHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.total_cmp(&other.score) == CmpOrdering::Equal
+            && self.timestamp_unix_nanos == other.timestamp_unix_nanos
+            && self.offset == other.offset
+    }
+}
+
+impl Eq for MessageRelevanceHeapItem {}
+
+impl PartialOrd for MessageRelevanceHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MessageRelevanceHeapItem {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.timestamp_unix_nanos.cmp(&other.timestamp_unix_nanos))
+            .then_with(|| self.offset.cmp(&other.offset))
+    }
+}
+
 impl DurableTelemetryStore {
     fn reclaim_source_packs(&self) -> Result<u64, LokiApiError> {
         let mut reclaimed = 0u64;
@@ -2739,6 +4167,10 @@ impl DurableTelemetryStore {
         let span_predicates_fully_pushed = request.relation == AnalyticsRelation::Spans
             && request.labels.is_empty()
             && request.metadata.is_empty();
+        let projected_resource_scan = span_predicates_fully_pushed
+            && request.trace_id.is_none()
+            && !request.resource_attributes.is_empty()
+            && crate::analytics::can_direct_span_projection(&request.columns);
         for partition in partitions {
             let mut next_offset = None;
             loop {
@@ -2769,7 +4201,67 @@ impl DurableTelemetryStore {
                     min_duration_nanos: None,
                     limit: page_limit,
                 };
-                let spans = if request.order.is_none() {
+                let targeted_shard = self.physical_shard_count.and_then(|shard_count| {
+                    partition
+                        .map(|partition| ShardId::new(partition.partition_id.get() % shard_count))
+                });
+                if projected_resource_scan {
+                    let spans = if let Some(shard_id) = targeted_shard.or(self
+                        .service
+                        .trace_query_owner_shard(&query)
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?)
+                    {
+                        self.service
+                            .query_traces_projected_on_shard(shard_id, &query)
+                            .map_err(|error| LokiApiError::internal(error.to_string()))?
+                    } else {
+                        self.service
+                            .query_traces_projected_unordered(&query)
+                            .map_err(|error| LokiApiError::internal(error.to_string()))?
+                    };
+                    let returned = spans.len();
+                    let final_offset = spans.last().map(|span| span.record_ref.offset.get());
+                    let mut rows =
+                        Vec::with_capacity(page_limit.min(limit.saturating_sub(emitted)));
+                    for span in spans {
+                        rows.push(crate::analytics::projected_trace_row(
+                            &request.tenant,
+                            &span,
+                            &request.columns,
+                        )?);
+                        emitted = emitted.saturating_add(1);
+                        if rows.len() == crate::analytics::DEFAULT_SCAN_BATCH_ROWS {
+                            emit(&rows)?;
+                            rows.clear();
+                        }
+                        if emitted == limit {
+                            break;
+                        }
+                    }
+                    if !rows.is_empty() {
+                        emit(&rows)?;
+                    }
+                    if emitted == limit || returned < page_limit || partition.is_none() {
+                        break;
+                    }
+                    let Some(final_offset) = final_offset else {
+                        break;
+                    };
+                    let Some(start) = final_offset.checked_add(1) else {
+                        break;
+                    };
+                    next_offset = Some(start);
+                    continue;
+                }
+                let spans = if let Some(shard_id) = targeted_shard.or(self
+                    .service
+                    .trace_query_owner_shard(&query)
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?)
+                {
+                    self.service
+                        .query_traces_on_shard(shard_id, &query)
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?
+                } else if request.order.is_none() {
                     self.query_traces_unordered(&query)?
                 } else {
                     self.query_traces(&query)?
@@ -2786,18 +4278,24 @@ impl DurableTelemetryStore {
                     .get();
                 let mut rows = Vec::with_capacity(page_limit.min(limit.saturating_sub(emitted)));
                 for span in spans {
-                    let candidate_rows = if span_predicates_fully_pushed {
-                        vec![crate::analytics::projected_span_row(
+                    if span_predicates_fully_pushed {
+                        rows.push(crate::analytics::projected_span_row(
                             &span,
                             &request.columns,
-                        )?]
-                    } else {
-                        crate::analytics::span_rows(&span, request.relation)?
-                    };
+                        )?);
+                        emitted = emitted.saturating_add(1);
+                        if rows.len() == crate::analytics::DEFAULT_SCAN_BATCH_ROWS {
+                            emit(&rows)?;
+                            rows.clear();
+                        }
+                        if emitted == limit {
+                            break;
+                        }
+                        continue;
+                    }
+                    let candidate_rows = crate::analytics::span_rows(&span, request.relation)?;
                     for row in candidate_rows {
-                        if !span_predicates_fully_pushed
-                            && !crate::analytics::row_matches(&row, request)
-                        {
+                        if !crate::analytics::row_matches(&row, request) {
                             continue;
                         }
                         rows.push(row);
@@ -2902,7 +4400,18 @@ impl DurableTelemetryStore {
                         .flatten(),
                     limit: page_limit,
                 };
-                let points = self.query_metrics(&query)?;
+                let points = if let Some(shard_count) = self.physical_shard_count
+                    && request.series_id.is_some()
+                {
+                    self.service
+                        .query_metrics_on_shard(
+                            ShardId::new(partition.partition_id.get() % shard_count),
+                            &query,
+                        )
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?
+                } else {
+                    self.query_metrics(&query)?
+                };
                 if points.is_empty() {
                     break;
                 }
@@ -2915,18 +4424,24 @@ impl DurableTelemetryStore {
                     .get();
                 let mut rows = Vec::with_capacity(page_limit.min(limit.saturating_sub(emitted)));
                 for point in points {
-                    let candidate_rows = if metric_predicates_fully_pushed {
-                        vec![crate::analytics::projected_metric_row(
+                    if metric_predicates_fully_pushed {
+                        rows.push(crate::analytics::projected_metric_row(
                             &point,
                             &request.columns,
-                        )?]
-                    } else {
-                        crate::analytics::metric_rows(&point, request.relation)?
-                    };
+                        )?);
+                        emitted = emitted.saturating_add(1);
+                        if rows.len() == crate::analytics::DEFAULT_SCAN_BATCH_ROWS {
+                            emit(&rows)?;
+                            rows.clear();
+                        }
+                        if emitted == limit {
+                            break;
+                        }
+                        continue;
+                    }
+                    let candidate_rows = crate::analytics::metric_rows(&point, request.relation)?;
                     for row in candidate_rows {
-                        if !metric_predicates_fully_pushed
-                            && !crate::analytics::row_matches(&row, request)
-                        {
+                        if !crate::analytics::row_matches(&row, request) {
                             continue;
                         }
                         rows.push(row);
@@ -2959,19 +4474,34 @@ impl DurableTelemetryStore {
     }
 }
 
-fn analytics_row_and_entry(
-    tenant: &Arc<str>,
-    matched: LogMatch,
-) -> Result<(AnalyticsRow, LokiEntry), LokiApiError> {
+fn log_field_maps(
+    fields: &[MetadataField],
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let mut labels = BTreeMap::new();
     let mut metadata = BTreeMap::new();
-    for field in matched.record.fields.iter() {
+    for field in fields {
         if let Some(name) = field.key.as_ref().strip_prefix(LABEL_PREFIX) {
             labels.insert(name.to_owned(), field.value.to_string());
         } else if let Some(name) = field.key.as_ref().strip_prefix(METADATA_PREFIX) {
             metadata.insert(name.to_owned(), field.value.to_string());
         }
     }
+    (labels, metadata)
+}
+
+fn analytics_row_from_match(
+    tenant: &Arc<str>,
+    matched: LogMatch,
+) -> Result<crate::analytics::AnalyticsRow, LokiApiError> {
+    let (labels, metadata) = log_field_maps(&matched.record.fields);
+    crate::analytics::log_row(tenant, &matched.record, labels, metadata)
+}
+
+fn analytics_row_and_entry(
+    tenant: &Arc<str>,
+    matched: LogMatch,
+) -> Result<(AnalyticsRow, LokiEntry), LokiApiError> {
+    let (labels, metadata) = log_field_maps(&matched.record.fields);
     let timestamp_unix_nanos = i64::try_from(matched.record.timestamp_unix_nanos)
         .map_err(|_| LokiApiError::internal("timestamp exceeds ClickHouse i64 range"))?;
     let entry = LokiEntry {
@@ -3036,23 +4566,45 @@ mod tests {
     #[test]
     fn append_submission_pool_preserves_grouping_concurrency() {
         assert_eq!(
-            build_append_submission_pool(1)
+            build_append_submission_pool(1, None)
                 .expect("single stripe pool")
                 .current_num_threads(),
             MIN_APPEND_SUBMISSION_THREADS
         );
         assert_eq!(
-            build_append_submission_pool(16)
+            build_append_submission_pool(16, None)
                 .expect("multi-stripe pool")
                 .current_num_threads(),
             16
         );
         assert_eq!(
-            build_append_submission_pool(256)
+            build_append_submission_pool(256, None)
                 .expect("bounded pool")
                 .current_num_threads(),
             MAX_APPEND_SUBMISSION_THREADS
         );
+        assert_eq!(
+            build_append_submission_pool(1, Some(1))
+                .expect("embedded single-worker pool")
+                .current_num_threads(),
+            1
+        );
+        assert_eq!(
+            build_append_submission_pool(1, Some(64))
+                .expect("explicit multi-core pool")
+                .current_num_threads(),
+            64
+        );
+        assert!(build_append_submission_pool(1, Some(65)).is_err());
+    }
+
+    #[test]
+    fn durable_sink_worker_count_is_independent_from_physical_shards() {
+        assert_eq!(durable_sink_worker_count(1, None), 1);
+        assert_eq!(durable_sink_worker_count(16, None), 16);
+        assert_eq!(durable_sink_worker_count(256, None), 256);
+        assert_eq!(durable_sink_worker_count(512, None), 256);
+        assert_eq!(durable_sink_worker_count(16, Some(4)), 4);
     }
 
     #[test]
@@ -3318,21 +4870,60 @@ mod tests {
         let (metric_partition, metric_events) = metric_partitions.pop_first().unwrap();
         let trace_id = crate::TraceId::from_bytes([1; 16]).unwrap();
         let log_partition = router.log("tenant-a", Some(trace_id), &[]);
-        let log_events = vec![crate::OtlpLogEvent {
+        let log_resource = Arc::new(crate::ResourceContext {
+            attributes: Arc::new(vec![crate::TelemetryAttribute::new(
+                "service.name",
+                crate::TelemetryValue::String(Arc::from("checkout-api")),
+            )]),
+            ..crate::ResourceContext::default()
+        });
+        let mut log_events = vec![crate::OtlpLogEvent {
             timestamp_unix_nanos: 25,
             body: Some(crate::TelemetryValue::String(Arc::from(
                 "checkout request complete",
             ))),
             message: Arc::from("checkout request complete"),
-            fields: Arc::new(vec![crate::MetadataField::new(
-                "otel.trace_id",
-                trace_id.to_string(),
+            fields: Arc::new(vec![
+                crate::MetadataField::new("otel.trace_id", trace_id.to_string()),
+                crate::MetadataField::new("service.version", "v1"),
+                crate::MetadataField::new("resource.loki.label.service", "checkout"),
+                crate::MetadataField::new("resource.service.name", "checkout-api"),
+            ]),
+            attributes: Arc::new(vec![crate::TelemetryAttribute::new(
+                "service.version",
+                crate::TelemetryValue::String(Arc::from("v1")),
             )]),
             trace_id: Some(trace_id),
             span_id: Some(crate::SpanId::from_bytes([2; 8]).unwrap()),
+            resource: Arc::clone(&log_resource),
             compression_cohort: crate::CompressionCohortId::new(1),
             ..crate::OtlpLogEvent::default()
         }];
+        log_events.push(crate::OtlpLogEvent {
+            timestamp_unix_nanos: 26,
+            body: Some(crate::TelemetryValue::String(Arc::from(
+                "payment request complete",
+            ))),
+            message: Arc::from("payment request complete"),
+            fields: Arc::new(vec![
+                crate::MetadataField::new("otel.trace_id", trace_id.to_string()),
+                crate::MetadataField::new("resource.loki.label.service", "payment"),
+                crate::MetadataField::new("resource.loki.label.service_name", "payment"),
+                crate::MetadataField::new("resource.service.name", "payment-api"),
+            ]),
+            attributes: Arc::new(Vec::new()),
+            trace_id: Some(trace_id),
+            span_id: None,
+            resource: Arc::new(crate::ResourceContext {
+                attributes: Arc::new(vec![crate::TelemetryAttribute::new(
+                    "service.name",
+                    crate::TelemetryValue::String(Arc::from("payment-api")),
+                )]),
+                ..crate::ResourceContext::default()
+            }),
+            compression_cohort: crate::CompressionCohortId::new(1),
+            ..crate::OtlpLogEvent::default()
+        });
 
         let batch = crate::NativeTelemetryBatch {
             partitions: vec![
@@ -3356,6 +4947,21 @@ mod tests {
         };
         let acknowledgement = store.append_telemetry_batch(&batch, true).unwrap();
         assert_eq!(acknowledgement.partitions.len(), 3);
+        let mut joined_trace_count = crate::AnalyticsScanRequest::new("tenant-a");
+        joined_trace_count.columns = vec![crate::AnalyticsColumn::Offset];
+        joined_trace_count.cardinality_only = true;
+        joined_trace_count
+            .labels
+            .push(crate::MetadataField::new("service", "checkout"));
+        joined_trace_count.trace_join_service = Some(Arc::from("payment"));
+        let mut joined_count = 0_u64;
+        store
+            .scan_analytics_cardinality(&joined_trace_count, &mut |batch| {
+                joined_count += batch;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(joined_count, 1);
         let spans = store
             .query_traces(&crate::TraceQuery {
                 tenant: Arc::from("tenant-a"),
@@ -3394,7 +5000,7 @@ mod tests {
                     .with_limit(10),
             )
             .unwrap();
-        assert_eq!(correlated.len(), 3);
+        assert_eq!(correlated.len(), 4);
         assert!(
             [
                 crate::TelemetrySignal::Logs,
@@ -3405,7 +5011,7 @@ mod tests {
             .all(|signal| correlated.iter().any(|record| record.signal == signal))
         );
         for (relation, expected) in [
-            (crate::AnalyticsRelation::Logs, 1),
+            (crate::AnalyticsRelation::Logs, 2),
             (crate::AnalyticsRelation::Spans, 1),
             (crate::AnalyticsRelation::SpanEvents, 1),
             (crate::AnalyticsRelation::SpanLinks, 1),
@@ -3443,6 +5049,87 @@ mod tests {
             })
             .unwrap();
         assert_eq!(exact_log_rows.len(), 1);
+
+        let mut filtered_log =
+            crate::AnalyticsScanRequest::for_relation("tenant-a", crate::AnalyticsRelation::Logs);
+        filtered_log
+            .labels
+            .push(crate::MetadataField::new("service", "checkout"));
+        filtered_log.limit = Some(1);
+        filtered_log.columns = vec![
+            crate::AnalyticsColumn::Timestamp,
+            crate::AnalyticsColumn::Message,
+        ];
+        let mut filtered_log_rows = Vec::new();
+        store
+            .scan_analytics(&filtered_log, &mut |batch| {
+                filtered_log_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(filtered_log_rows.len(), 1);
+        assert_eq!(
+            filtered_log_rows[0].message.as_deref(),
+            Some("checkout request complete")
+        );
+
+        let mut resource_filtered_log =
+            crate::AnalyticsScanRequest::for_relation("tenant-a", crate::AnalyticsRelation::Logs);
+        resource_filtered_log
+            .resource_attributes
+            .push(crate::MetadataField::new("service.name", "checkout-api"));
+        resource_filtered_log.limit = Some(1);
+        resource_filtered_log.columns = vec![
+            crate::AnalyticsColumn::Timestamp,
+            crate::AnalyticsColumn::Message,
+        ];
+        let mut resource_filtered_log_rows = Vec::new();
+        store
+            .scan_analytics(&resource_filtered_log, &mut |batch| {
+                resource_filtered_log_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(resource_filtered_log_rows.len(), 1);
+        assert_eq!(
+            resource_filtered_log_rows[0].message.as_deref(),
+            Some("checkout request complete")
+        );
+        resource_filtered_log.limit = None;
+        resource_filtered_log_rows.clear();
+        store
+            .scan_analytics(&resource_filtered_log, &mut |batch| {
+                resource_filtered_log_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(resource_filtered_log_rows.len(), 1);
+
+        let mut mixed_filtered_log =
+            crate::AnalyticsScanRequest::for_relation("tenant-a", crate::AnalyticsRelation::Logs);
+        mixed_filtered_log
+            .labels
+            .push(crate::MetadataField::new("service", "checkout"));
+        mixed_filtered_log
+            .attributes
+            .push(crate::MetadataField::new("service.version", "v1"));
+        mixed_filtered_log.limit = Some(1);
+        mixed_filtered_log.columns = vec![
+            crate::AnalyticsColumn::Timestamp,
+            crate::AnalyticsColumn::Message,
+        ];
+        let mut mixed_filtered_log_rows = Vec::new();
+        store
+            .scan_analytics(&mixed_filtered_log, &mut |batch| {
+                mixed_filtered_log_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(mixed_filtered_log_rows.len(), 1);
+        assert_eq!(
+            mixed_filtered_log_rows[0].message.as_deref(),
+            Some("checkout request complete")
+        );
 
         let mut exact_trace =
             crate::AnalyticsScanRequest::for_relation("tenant-a", crate::AnalyticsRelation::Spans);
@@ -3554,7 +5241,7 @@ mod tests {
             s3_object_store: None,
             recovery_journal: false,
             retention: None,
-            shard_count: 2,
+            shard_count: 4,
             tenant_partitions: 8,
             append_linger: Duration::from_micros(250),
             stripe: StripeConfig::default(),
@@ -3582,6 +5269,99 @@ mod tests {
         assert_eq!(entries[0].line, "durable message 100");
         assert_eq!(entries[0].labels["app"], "api");
         assert_eq!(entries[0].structured_metadata["trace_id"], "abc-100");
+        let ranged = store
+            .query_range("tenant-a", r#"{app="api"}"#, 100, 102, 2, true)
+            .expect("indexed Loki range query");
+        assert_eq!(
+            ranged
+                .entries
+                .iter()
+                .map(|entry| entry.line.as_str())
+                .collect::<Vec<_>>(),
+            ["durable message 102", "durable message 101"]
+        );
+        let pipelined = store
+            .query_range("tenant-a", r#"{app="api"} |= "101""#, 100, 102, 2, true)
+            .expect("indexed Loki pipeline query");
+        assert_eq!(pipelined.entries.len(), 1);
+        assert_eq!(pipelined.entries[0].line, "durable message 101");
+        for index in 0..4 {
+            let timestamp = 1_000 + index * 2;
+            store
+                .push(
+                    "tenant-a",
+                    vec![
+                        LokiEntry {
+                            timestamp_unix_nanos: timestamp,
+                            labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                            line: format!("keep {timestamp}"),
+                            structured_metadata: BTreeMap::new(),
+                        },
+                        LokiEntry {
+                            timestamp_unix_nanos: timestamp + 1,
+                            labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                            line: format!("noise {timestamp}"),
+                            structured_metadata: BTreeMap::new(),
+                        },
+                    ],
+                )
+                .expect("push residual-filter test data");
+        }
+        let residual = store
+            .query_range(
+                "tenant-a",
+                r#"{app="api"} |= "keep""#,
+                1_000,
+                2_000,
+                4,
+                true,
+            )
+            .expect("indexed Loki residual query");
+        assert_eq!(
+            residual
+                .entries
+                .iter()
+                .map(|entry| entry.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            [1_006, 1_004, 1_002, 1_000]
+        );
+        store
+            .push(
+                "tenant-a",
+                vec![
+                    LokiEntry {
+                        timestamp_unix_nanos: 2_000,
+                        labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                        line: "needle".to_owned(),
+                        structured_metadata: BTreeMap::new(),
+                    },
+                    LokiEntry {
+                        timestamp_unix_nanos: 2_001,
+                        labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                        line: "needlex".to_owned(),
+                        structured_metadata: BTreeMap::new(),
+                    },
+                ],
+            )
+            .expect("push substring test data");
+        let substring = store
+            .query_range(
+                "tenant-a",
+                r#"{app="api"} |= "needle""#,
+                2_000,
+                2_001,
+                10,
+                true,
+            )
+            .expect("indexed Loki substring query");
+        assert_eq!(
+            substring
+                .entries
+                .iter()
+                .map(|entry| entry.line.as_str())
+                .collect::<Vec<_>>(),
+            ["needlex", "needle"]
+        );
         drop(store);
         let recovered = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
@@ -3589,7 +5369,7 @@ mod tests {
             s3_object_store: None,
             recovery_journal: false,
             retention: None,
-            shard_count: 2,
+            shard_count: 4,
             tenant_partitions: 8,
             append_linger: Duration::from_micros(250),
             stripe: StripeConfig::default(),
@@ -3597,7 +5377,7 @@ mod tests {
         })
         .expect("store recovers");
         let entries = recovered.entries("tenant-a").expect("recovered query");
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 13);
         assert_eq!(entries[2].line, "durable message 102");
         assert!(!directory.join("index-journal").exists());
         drop(recovered);
@@ -3686,6 +5466,23 @@ mod tests {
             })
             .expect("cold cardinality scan");
         assert_eq!(count, 2);
+        let mut filtered_count_request = AnalyticsScanRequest::new("tenant-a");
+        filtered_count_request.columns = vec![crate::AnalyticsColumn::Offset];
+        filtered_count_request.cardinality_only = true;
+        filtered_count_request
+            .case_insensitive_message_tokens
+            .push(Arc::from("failed"));
+        filtered_count_request
+            .labels
+            .push(crate::MetadataField::new("app", "api"));
+        let mut filtered_count = 0_u64;
+        store
+            .scan_analytics_cardinality(&filtered_count_request, &mut |batch_count| {
+                filtered_count += batch_count;
+                Ok(())
+            })
+            .expect("cold filtered cardinality scan");
+        assert_eq!(filtered_count, 1);
         assert!(object_directory.exists());
         drop(store);
 
@@ -3702,6 +5499,14 @@ mod tests {
             })
             .expect("recovered cold cardinality scan");
         assert_eq!(recovered_count, 2);
+        let mut recovered_filtered_count = 0_u64;
+        recovered
+            .scan_analytics_cardinality(&filtered_count_request, &mut |batch_count| {
+                recovered_filtered_count += batch_count;
+                Ok(())
+            })
+            .expect("recovered cold filtered cardinality scan");
+        assert_eq!(recovered_filtered_count, 1);
         drop(recovered);
         fs::remove_dir_all(directory).expect("remove test store");
     }
@@ -3836,6 +5641,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![100, 102]
         );
+        assert_eq!(
+            store
+                .query_range("tenant-a", r#"{app="api"}"#, 1, 200, 10, false)
+                .expect("Loki range entries")
+                .entries
+                .into_iter()
+                .map(|entry| entry.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            vec![100, 102]
+        );
 
         let native = store
             .query_native(&NativeQuery {
@@ -3872,6 +5687,86 @@ mod tests {
         assert!(recovered.cancel_delete("tenant-a", &request_id).unwrap());
         assert_eq!(recovered.entries("tenant-a").unwrap().len(), 3);
         drop(recovered);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn native_query_merges_owner_local_top_k_across_partitions() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-native-top-k-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = DurableTelemetryStore::open(DurableTelemetryConfig {
+            data_directory: directory.clone(),
+            object_store_directory: None,
+            s3_object_store: None,
+            recovery_journal: false,
+            retention: None,
+            shard_count: 4,
+            tenant_partitions: 8,
+            append_linger: Duration::ZERO,
+            stripe: StripeConfig::default(),
+            indexed_ack_timeout: Duration::from_secs(30),
+        })
+        .expect("store opens");
+
+        for timestamp in 0..8 {
+            store
+                .push(
+                    "tenant-a",
+                    vec![LokiEntry {
+                        timestamp_unix_nanos: timestamp,
+                        labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                        line: format!("request {timestamp}"),
+                        structured_metadata: BTreeMap::new(),
+                    }],
+                )
+                .expect("push");
+        }
+
+        let oldest = store
+            .query_native(&NativeQuery {
+                tenant: "tenant-a".to_owned(),
+                labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                terms: Vec::new(),
+                start_timestamp_unix_nanos: None,
+                end_timestamp_unix_nanos: None,
+                limit: 3,
+                direction: NativeQueryDirection::OldestFirst,
+            })
+            .expect("oldest query");
+        assert_eq!(
+            oldest
+                .iter()
+                .map(|entry| entry.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+
+        let newest = store
+            .query_native(&NativeQuery {
+                tenant: "tenant-a".to_owned(),
+                labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                terms: Vec::new(),
+                start_timestamp_unix_nanos: None,
+                end_timestamp_unix_nanos: None,
+                limit: 3,
+                direction: NativeQueryDirection::NewestFirst,
+            })
+            .expect("newest query");
+        assert_eq!(
+            newest
+                .iter()
+                .map(|entry| entry.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            [7, 6, 5]
+        );
+
+        drop(store);
         fs::remove_dir_all(directory).expect("cleanup");
     }
 
@@ -4097,6 +5992,17 @@ mod tests {
         assert_eq!(rows[0].message.as_deref(), Some("request ERROR"));
         assert_eq!(rows[0].labels["app"], "api");
         assert_eq!(rows[0].metadata["code"], "500");
+        let mut filtered_count_request = request.clone();
+        filtered_count_request.columns = vec![crate::AnalyticsColumn::Offset];
+        filtered_count_request.cardinality_only = true;
+        let mut filtered_count = 0_u64;
+        store
+            .scan_analytics_cardinality(&filtered_count_request, &mut |batch_count| {
+                filtered_count += batch_count;
+                Ok(())
+            })
+            .expect("filtered cardinality scan");
+        assert_eq!(filtered_count, 1);
         let mut newest = AnalyticsScanRequest::new("tenant-a");
         newest.limit = Some(1);
         newest.order = Some(AnalyticsScanOrder::TimestampDescending);
@@ -4125,6 +6031,21 @@ mod tests {
         assert_eq!(newest_rows[0].message.as_deref(), Some("newest request"));
         assert!(newest_rows[0].metadata.is_empty());
         assert!(newest_rows[0].body_json.is_none());
+        let mut newest_typed = newest.clone();
+        newest_typed.columns = vec![
+            crate::AnalyticsColumn::Timestamp,
+            crate::AnalyticsColumn::Message,
+            crate::AnalyticsColumn::BodyJson,
+        ];
+        newest_rows.clear();
+        store
+            .scan_analytics(&newest_typed, &mut |batch| {
+                newest_rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .expect("typed projected newest scan");
+        assert_eq!(newest_rows.len(), 1);
+        assert!(newest_rows[0].body_json.is_some());
         let mut newest_exact_token = AnalyticsScanRequest::new("tenant-a");
         newest_exact_token.limit = Some(1);
         newest_exact_token.order = Some(AnalyticsScanOrder::TimestampDescending);

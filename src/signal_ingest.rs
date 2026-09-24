@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use shard_stream_core::{LogicalOffset, ShardId, TopicPartition};
@@ -196,18 +196,54 @@ pub fn prepare_loki_log_envelope(
     tenant: &str,
     entries: Vec<LokiEntry>,
 ) -> TelemetryResult<TelemetryEnvelope> {
+    prepare_loki_log_envelope_with_context(tenant, entries).map(|(envelope, _)| envelope)
+}
+
+/// Builds a Loki envelope and the process-local frame index used by the live
+/// owner stripe. The durable payload remains self-contained; the sidecar is
+/// only an in-process shortcut that is omitted during recovery.
+pub(crate) fn prepare_loki_log_envelope_with_context(
+    tenant: &str,
+    entries: Vec<LokiEntry>,
+) -> TelemetryResult<(TelemetryEnvelope, Arc<[u8]>)> {
     if tenant.is_empty() {
         return Err(TelemetryError::InvalidNativePayload(
             "Loki tenant must not be empty".into(),
         ));
     }
     let mut events = Vec::with_capacity(entries.len());
+    let mut previous_labels = None::<BTreeMap<String, String>>;
+    let mut previous_cohort = CompressionCohortId::UNCLASSIFIED;
     for entry in entries {
         let timestamp_unix_nanos = u64::try_from(entry.timestamp_unix_nanos).map_err(|_| {
             TelemetryError::InvalidNativePayload(
                 "negative Loki timestamps are outside the storage epoch".into(),
             )
         })?;
+        // Loki structured metadata is commonly used to carry OpenTelemetry
+        // IDs. Promote only valid canonical hex values into the typed lanes;
+        // the original metadata remains available through the normal fields.
+        let trace_id = entry
+            .structured_metadata
+            .get("trace_id")
+            .and_then(|value| decode_hex_id::<16>(value))
+            .and_then(|value| crate::TraceId::from_bytes(value).ok());
+        let span_id = entry
+            .structured_metadata
+            .get("span_id")
+            .and_then(|value| decode_hex_id::<8>(value))
+            .and_then(|value| crate::SpanId::from_bytes(value).ok());
+        let compression_cohort = if previous_labels
+            .as_ref()
+            .is_some_and(|labels| labels == &entry.labels)
+        {
+            previous_cohort
+        } else {
+            let cohort = compression_cohort_for_labels(&entry.labels);
+            previous_labels = Some(entry.labels.clone());
+            previous_cohort = cohort;
+            cohort
+        };
         let mut fields = Vec::with_capacity(
             1 + entry
                 .labels
@@ -216,12 +252,7 @@ pub fn prepare_loki_log_envelope(
         );
         fields.push(MetadataField::new(TENANT_FIELD, tenant));
         let mut resource_attributes = Vec::with_capacity(entry.labels.len());
-        let mut cohort = blake3::Hasher::new();
         for (key, value) in entry.labels {
-            cohort.update(&(key.len() as u64).to_le_bytes());
-            cohort.update(key.as_bytes());
-            cohort.update(&(value.len() as u64).to_le_bytes());
-            cohort.update(value.as_bytes());
             fields.push(MetadataField::new(
                 format!("{LABEL_PREFIX}{key}"),
                 value.clone(),
@@ -242,12 +273,6 @@ pub fn prepare_loki_log_envelope(
                 TelemetryValue::String(value.into()),
             ));
         }
-        let cohort_bytes = cohort.finalize();
-        let compression_cohort = CompressionCohortId::new(u64::from_le_bytes(
-            cohort_bytes.as_bytes()[..8]
-                .try_into()
-                .expect("BLAKE3 output contains eight bytes"),
-        ));
         let resource = Arc::new(ResourceContext {
             attributes: Arc::new(resource_attributes),
             ..ResourceContext::default()
@@ -269,10 +294,41 @@ pub fn prepare_loki_log_envelope(
             resource,
             scope,
             compression_cohort,
+            trace_id,
+            span_id,
             ..OtlpLogEvent::default()
         });
     }
-    prepare_log_envelope(tenant, &events)
+    prepare_log_envelope_owned_with_context(tenant, events)
+}
+
+fn compression_cohort_for_labels(labels: &BTreeMap<String, String>) -> CompressionCohortId {
+    let mut cohort = blake3::Hasher::new();
+    for (key, value) in labels {
+        cohort.update(&(key.len() as u64).to_le_bytes());
+        cohort.update(key.as_bytes());
+        cohort.update(&(value.len() as u64).to_le_bytes());
+        cohort.update(value.as_bytes());
+    }
+    let cohort_bytes = cohort.finalize();
+    CompressionCohortId::new(u64::from_le_bytes(
+        cohort_bytes.as_bytes()[..8]
+            .try_into()
+            .expect("BLAKE3 output contains eight bytes"),
+    ))
+}
+
+fn decode_hex_id<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut decoded = [0_u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = char::from(pair[0]).to_digit(16)? as u8;
+        let low = char::from(pair[1]).to_digit(16)? as u8;
+        decoded[index] = (high << 4) | low;
+    }
+    Some(decoded)
 }
 
 /// Builds a log envelope directly from Docker records without constructing
@@ -562,6 +618,44 @@ mod tests {
             borrowed.encode().expect("borrowed encode"),
             owned.encode().expect("owned encode")
         );
+    }
+
+    #[test]
+    fn loki_structured_otel_ids_populate_typed_log_columns() {
+        let entries = vec![LokiEntry {
+            timestamp_unix_nanos: 42,
+            labels: BTreeMap::new(),
+            line: "request".to_owned(),
+            structured_metadata: BTreeMap::from([
+                (
+                    "trace_id".to_owned(),
+                    "01010101010101010101010101010101".to_owned(),
+                ),
+                ("span_id".to_owned(), "0202020202020202".to_owned()),
+            ]),
+        }];
+        let envelope = prepare_loki_log_envelope("tenant-a", entries.clone()).unwrap();
+        let (envelope_with_context, transient_context) =
+            prepare_loki_log_envelope_with_context("tenant-a", entries).unwrap();
+        assert_eq!(
+            envelope.encode().unwrap(),
+            envelope_with_context.encode().unwrap()
+        );
+        assert!(!transient_context.is_empty());
+
+        let decoded = decode_log_envelope(&envelope).unwrap();
+        assert_eq!(
+            decoded[0].trace_id,
+            Some(crate::TraceId::from_bytes([1; 16]).unwrap())
+        );
+        assert_eq!(
+            decoded[0].span_id,
+            Some(crate::SpanId::from_bytes([2; 8]).unwrap())
+        );
+        assert!(decoded[0].fields.iter().any(|field| {
+            field.key.as_ref() == "attr.loki.metadata.trace_id"
+                && field.value.as_ref() == "01010101010101010101010101010101"
+        }));
     }
 
     #[test]

@@ -267,6 +267,14 @@ impl MetricRollupCatalog {
     pub(crate) fn len(&self) -> usize {
         self.rollups.len()
     }
+
+    pub(crate) fn persisted_bytes(&self) -> TelemetryResult<u64> {
+        match fs::metadata(&self.path) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(storage_io("inspect lifetime metric rollups", error)),
+        }
+    }
 }
 
 fn update_state(state: &mut RollupState, point: &DurableMetricPoint) -> TelemetryResult<()> {
