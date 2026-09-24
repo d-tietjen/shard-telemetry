@@ -86,8 +86,7 @@ jobs:
             --publish 9000:9000 \
             --env MINIO_ROOT_USER=shard-telemetry-ci \
             --env MINIO_ROOT_PASSWORD=shard-telemetry-ci-secret \
-            minio/minio@sha256:3f97c5651cb6662b880c787a232b6b34fec8d8922e08d6617b25d241a21164bb \
-            server /data --console-address :9001
+            bitnamilegacy/minio@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
           for attempt in $(seq 1 30); do
             if curl --fail --silent --show-error http://127.0.0.1:9000/minio/health/live; then
               exit 0
