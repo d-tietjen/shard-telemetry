@@ -51,7 +51,7 @@ foldhash = "0.2"
 fast-telemetry = { version = "=0.9.0", default-features = false, features = ["runtime"], optional = true }
 futures-util = "0.3"
 form_urlencoded = "1.2"
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
 object_store = { version = "0.14", default-features = false, features = ["aws"] }
 pco = "1.0.2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
