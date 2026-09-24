@@ -5,8 +5,9 @@
 //! interval; only that snapshot path allocates storage-native points or waits
 //! for the local durable WAL.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::fast_telemetry::{
@@ -25,6 +26,7 @@ use crate::{
 const CUMULATIVE_TEMPORALITY: i32 = 2;
 const DEFAULT_EXPORT_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_POINTS_PER_EXPORT: usize = 65_536;
+const DEFAULT_MAX_SERIES: usize = 65_536;
 
 /// Bounded configuration for a periodic `fast-telemetry` snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,9 @@ pub struct FastTelemetryConfig {
     pub interval: Duration,
     /// Maximum points emitted by one runtime snapshot.
     pub max_points_per_export: usize,
+    /// Maximum distinct metric identities admitted over this exporter's
+    /// lifetime, including arbitrary label combinations.
+    pub max_series: usize,
     /// Whether zero counters and empty histograms/distributions are skipped.
     pub skip_empty_cumulative: bool,
     /// Whether an export waits until the local query index has applied its WAL
@@ -60,6 +65,7 @@ impl FastTelemetryConfig {
             scope_version: Arc::from("fast-telemetry"),
             interval: DEFAULT_EXPORT_INTERVAL,
             max_points_per_export: DEFAULT_MAX_POINTS_PER_EXPORT,
+            max_series: DEFAULT_MAX_SERIES,
             skip_empty_cumulative: true,
             wait_for_index: true,
         }
@@ -83,6 +89,13 @@ impl FastTelemetryConfig {
     #[must_use]
     pub const fn with_max_points_per_export(mut self, max_points: usize) -> Self {
         self.max_points_per_export = max_points;
+        self
+    }
+
+    /// Sets the lifetime bound for distinct exported metric identities.
+    #[must_use]
+    pub const fn with_max_series(mut self, max_series: usize) -> Self {
+        self.max_series = max_series;
         self
     }
 
@@ -116,6 +129,11 @@ impl FastTelemetryConfig {
                 "fast-telemetry export point limit must be nonzero",
             ));
         }
+        if self.max_series == 0 {
+            return Err(LokiApiError::configuration(
+                "fast-telemetry export series limit must be nonzero",
+            ));
+        }
         Ok(())
     }
 }
@@ -125,8 +143,14 @@ impl FastTelemetryConfig {
 pub struct FastTelemetryExportReport {
     /// Points observed after empty-cumulative filtering and before the cap.
     pub observed_points: usize,
-    /// Points omitted because the configured snapshot cap was reached.
+    /// Points omitted by either the per-export point cap or lifetime series
+    /// admission cap.
     pub dropped_points: usize,
+    /// Points omitted because their distinct identity exceeded the lifetime
+    /// series cap.
+    pub dropped_cardinality_points: usize,
+    /// Distinct identities currently admitted by this exporter.
+    pub admitted_series: usize,
     /// Points acknowledged by the embedded store.
     pub appended_points: usize,
     /// Per-series durable envelopes appended by the store.
@@ -142,6 +166,7 @@ pub struct FastTelemetryExporter {
     embedded: Arc<EmbeddedTelemetryRuntime>,
     config: FastTelemetryConfig,
     exporting: AtomicBool,
+    admitted_series: Mutex<BTreeSet<crate::SeriesFingerprint>>,
 }
 
 impl FastTelemetryExporter {
@@ -161,6 +186,7 @@ impl FastTelemetryExporter {
             embedded,
             config,
             exporting: AtomicBool::new(false),
+            admitted_series: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -193,7 +219,16 @@ impl FastTelemetryExporter {
         let _guard = ExportGuard {
             exporting: &self.exporting,
         };
-        let mut export = FastMetricExport::new(&self.embedded, &self.config, timestamp_unix_nanos);
+        let mut admitted_series = self
+            .admitted_series
+            .lock()
+            .map_err(|_| LokiApiError::internal("fast-telemetry series registry lock poisoned"))?;
+        let mut export = FastMetricExport::new(
+            &self.embedded,
+            &self.config,
+            timestamp_unix_nanos,
+            &mut admitted_series,
+        );
 
         // Runtime registration is a construction-time operation. Deduplicating
         // scopes avoids revisiting all groups when several groups intentionally
@@ -208,10 +243,14 @@ impl FastTelemetryExporter {
 
         let observed_points = export.observed_points;
         let dropped_points = export.dropped_points;
+        let dropped_cardinality_points = export.dropped_cardinality_points;
         let (appended_points, acknowledgement) = export.finish()?;
+        let admitted_series = admitted_series.len();
         Ok(FastTelemetryExportReport {
             observed_points,
             dropped_points,
+            dropped_cardinality_points,
+            admitted_series,
             appended_points,
             append_batches: acknowledgement.partitions.len(),
             skipped_busy: false,
@@ -237,12 +276,15 @@ struct FastMetricExport<'a> {
     scope: Arc<ScopeContext>,
     timestamp_unix_nanos: u64,
     max_points_per_export: usize,
+    max_series: usize,
     skip_empty_cumulative: bool,
     wait_for_index: bool,
     points: Vec<DurableMetricPoint>,
     tail: Option<DurableMetricPoint>,
     observed_points: usize,
     dropped_points: usize,
+    dropped_cardinality_points: usize,
+    admitted_series: &'a mut BTreeSet<crate::SeriesFingerprint>,
 }
 
 impl<'a> FastMetricExport<'a> {
@@ -250,6 +292,7 @@ impl<'a> FastMetricExport<'a> {
         embedded: &'a EmbeddedTelemetryRuntime,
         config: &FastTelemetryConfig,
         timestamp_unix_nanos: u64,
+        admitted_series: &'a mut BTreeSet<crate::SeriesFingerprint>,
     ) -> Self {
         Self {
             embedded,
@@ -262,12 +305,15 @@ impl<'a> FastMetricExport<'a> {
             scope: Arc::new(ScopeContext::default()),
             timestamp_unix_nanos,
             max_points_per_export: config.max_points_per_export,
+            max_series: config.max_series,
             skip_empty_cumulative: config.skip_empty_cumulative,
             wait_for_index: config.wait_for_index,
             points: Vec::new(),
             tail: None,
             observed_points: 0,
             dropped_points: 0,
+            dropped_cardinality_points: 0,
+            admitted_series,
         }
     }
 
@@ -326,6 +372,24 @@ impl<'a> FastMetricExport<'a> {
                 )
             })
             .collect();
+        let identity = Arc::new(MetricIdentity {
+            tenant: Arc::clone(&self.tenant),
+            resource: Arc::clone(&self.resource),
+            scope: Arc::clone(&self.scope),
+            name: Arc::from(meta.name),
+            unit: Arc::from(meta.unit.unwrap_or("")),
+            kind,
+            point_attributes: Arc::new(point_attributes),
+        });
+        let fingerprint = identity.fingerprint();
+        if !self.admitted_series.contains(&fingerprint) {
+            if self.admitted_series.len() >= self.max_series {
+                self.dropped_points = self.dropped_points.saturating_add(1);
+                self.dropped_cardinality_points = self.dropped_cardinality_points.saturating_add(1);
+                return;
+            }
+            self.admitted_series.insert(fingerprint);
+        }
         let point = DurableMetricPoint {
             stream_shard_id: ShardId::new(0),
             record_ref: TelemetryRecordRef::for_signal(
@@ -333,15 +397,7 @@ impl<'a> FastMetricExport<'a> {
                 TopicPartition::new(METRICS_TOPIC_ID, LogicalPartitionId::new(0)),
                 LogicalOffset::new(0),
             ),
-            identity: Arc::new(MetricIdentity {
-                tenant: Arc::clone(&self.tenant),
-                resource: Arc::clone(&self.resource),
-                scope: Arc::clone(&self.scope),
-                name: Arc::from(meta.name),
-                unit: Arc::from(meta.unit.unwrap_or("")),
-                kind,
-                point_attributes: Arc::new(point_attributes),
-            }),
+            identity,
             description: Arc::from(meta.help),
             metadata: Arc::new(Vec::new()),
             start_time_unix_nanos: 0,
@@ -620,6 +676,8 @@ mod tests {
         let report = exporter.export_once().expect("snapshot export");
         assert_eq!(report.observed_points, 4);
         assert_eq!(report.dropped_points, 0);
+        assert_eq!(report.dropped_cardinality_points, 0);
+        assert_eq!(report.admitted_series, 4);
         assert_eq!(report.appended_points, 4);
         assert!(!report.skipped_busy);
 
@@ -674,6 +732,66 @@ mod tests {
         ));
 
         embedded.compact_retention().expect("retention pass");
+        let health = embedded.storage_health().expect("storage health");
+        assert_eq!(health.state, crate::EmbeddedTelemetryState::Ready);
+        assert!(health.data_directory_bytes > 0);
+        assert!(health.allocated_data_directory_bytes > 0);
+        assert_eq!(health.backlog_items, 0);
+        assert!(health.lifetime_rollup_bytes > 0);
+        assert_eq!(health.lifetime_rollup_series, 4);
+        assert_eq!(health.retention_runs, 1);
+        assert!(health.last_successful_maintenance_unix_seconds.is_some());
+        embedded.drain().expect("drain");
+        drop(exporter);
+        drop(embedded);
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn exporter_enforces_a_lifetime_distinct_series_cap() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-fast-cardinality-{}-{nonce}",
+            std::process::id()
+        ));
+        let embedded = Arc::new(
+            EmbeddedTelemetryRuntime::open(EmbeddedTelemetryConfig::bounded_local(
+                directory.clone(),
+                Duration::from_secs(60),
+            ))
+            .expect("embedded runtime"),
+        );
+        let runtime = Runtime::new(RuntimeConfig::default());
+        let registered = runtime.register_metrics(MetricScope::new("api"), TestMetrics::new());
+        registered.requests.add(1);
+        registered.in_flight.set(1);
+        registered.latency.record(1);
+        registered.payload.record(1);
+        let exporter = embedded
+            .attach(|| {
+                FastTelemetryExporter::new(
+                    runtime,
+                    Arc::clone(&embedded),
+                    FastTelemetryConfig::new("tenant-a", "cardinality-test").with_max_series(2),
+                )
+            })
+            .expect("exporter attachment");
+        embedded.mark_ready().expect("ready");
+
+        let first = exporter.export_once().expect("first export");
+        assert_eq!(first.observed_points, 4);
+        assert_eq!(first.appended_points, 2);
+        assert_eq!(first.dropped_points, 2);
+        assert_eq!(first.dropped_cardinality_points, 2);
+        assert_eq!(first.admitted_series, 2);
+        let second = exporter.export_once().expect("second export");
+        assert_eq!(second.appended_points, 2);
+        assert_eq!(second.dropped_cardinality_points, 2);
+        assert_eq!(second.admitted_series, 2);
+
         embedded.drain().expect("drain");
         drop(exporter);
         drop(embedded);

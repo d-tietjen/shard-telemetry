@@ -5,19 +5,28 @@ use std::sync::Arc;
 
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId, TopicPartition};
 
+use crate::query::{RequiredIndexConstraints, text_matches};
 use crate::{
-    LogQuery, QueryOrder, StructuralRecordView, TelemetryError, TelemetryResult, analyze_message,
+    LogQuery, NumericComparison, QueryOrder, StructuralRecordView, TelemetryError, TelemetryResult,
+    analyze_message,
 };
 
-const QUERY_INDEX_MAGIC: &[u8; 8] = b"STLGQIX1";
-const COMPRESSED_QUERY_INDEX_MAGIC: &[u8; 8] = b"STLGQIZ1";
+const QUERY_INDEX_MAGIC_V1: &[u8; 8] = b"STLGQIX1";
+const QUERY_INDEX_MAGIC: &[u8; 8] = b"STLGQIX2";
+const COMPRESSED_QUERY_INDEX_MAGIC_V1: &[u8; 8] = b"STLGQIZ1";
+const COMPRESSED_QUERY_INDEX_MAGIC: &[u8; 8] = b"STLGQIZ2";
 const DELTA_POSTING: u8 = 0;
 const RUN_POSTING: u8 = 1;
 const MESSAGE_TERM_CACHE_ENTRIES: usize = 1_024;
 const TERM_CACHE_ENTRIES: usize = 4_096;
 const MESSAGE_TRIGRAM_FILTER_BITS: usize = 65_536;
 const MESSAGE_TRIGRAM_FILTER_WORDS: usize = MESSAGE_TRIGRAM_FILTER_BITS / u64::BITS as usize;
+const CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_BITS: usize = 4_096;
+const CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS: usize =
+    CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_BITS / u64::BITS as usize;
 const MESSAGE_TRIGRAM_FILTER_BYTES: usize = MESSAGE_TRIGRAM_FILTER_WORDS * size_of::<u64>();
+const CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_BYTES: usize =
+    CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS * size_of::<u64>();
 
 struct CachedMessageTerms<'a> {
     message: &'a str,
@@ -41,18 +50,34 @@ struct MessageTrigramFilter {
 
 impl MessageTrigramFilter {
     fn new() -> Self {
+        Self::with_words(MESSAGE_TRIGRAM_FILTER_WORDS)
+    }
+
+    fn new_case_sensitive() -> Self {
+        Self::with_words(CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS)
+    }
+
+    fn with_words(words: usize) -> Self {
         Self {
-            words: vec![0; MESSAGE_TRIGRAM_FILTER_WORDS].into_boxed_slice(),
+            words: vec![0; words].into_boxed_slice(),
         }
     }
 
     fn from_bytes(encoded: &[u8]) -> TelemetryResult<Self> {
-        if encoded.len() != MESSAGE_TRIGRAM_FILTER_BYTES {
+        Self::from_bytes_with_words(encoded, MESSAGE_TRIGRAM_FILTER_WORDS)
+    }
+
+    fn from_bytes_case_sensitive(encoded: &[u8]) -> TelemetryResult<Self> {
+        Self::from_bytes_with_words(encoded, CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS)
+    }
+
+    fn from_bytes_with_words(encoded: &[u8], words: usize) -> TelemetryResult<Self> {
+        if encoded.len() != words.saturating_mul(size_of::<u64>()) {
             return Err(TelemetryError::InvalidBlockEncoding(
                 "invalid message trigram filter length",
             ));
         }
-        let mut filter = Self::new();
+        let mut filter = Self::with_words(words);
         for (word, bytes) in filter.words.iter_mut().zip(encoded.chunks_exact(8)) {
             *word = u64::from_le_bytes(bytes.try_into().map_err(|_| {
                 TelemetryError::InvalidBlockEncoding("invalid trigram filter word")
@@ -62,7 +87,17 @@ impl MessageTrigramFilter {
     }
 
     fn insert_message(&mut self, message: &str) {
-        visit_normalized_trigrams(message, |slot| {
+        self.insert_message_with_case(message, false);
+    }
+
+    fn insert_case_sensitive_message(&mut self, message: &str) {
+        self.insert_message_with_case(message, true);
+    }
+
+    fn insert_message_with_case(&mut self, message: &str, case_sensitive: bool) {
+        let filter_bits = self.words.len().saturating_mul(u64::BITS as usize);
+        visit_message_trigrams(message, case_sensitive, |trigram| {
+            let slot = message_trigram_slot_for_bits(trigram, filter_bits);
             self.words[slot / u64::BITS as usize] |= 1u64 << (slot % u64::BITS as usize);
         });
     }
@@ -74,24 +109,28 @@ impl MessageTrigramFilter {
     }
 }
 
-fn visit_normalized_trigrams(message: &str, mut observe: impl FnMut(usize)) {
-    if message.is_ascii() {
+fn visit_message_trigrams(message: &str, case_sensitive: bool, mut observe: impl FnMut([u8; 3])) {
+    if case_sensitive {
         for trigram in message.as_bytes().windows(3) {
-            observe(message_trigram_slot([
+            observe([trigram[0], trigram[1], trigram[2]]);
+        }
+    } else if message.is_ascii() {
+        for trigram in message.as_bytes().windows(3) {
+            observe([
                 trigram[0].to_ascii_lowercase(),
                 trigram[1].to_ascii_lowercase(),
                 trigram[2].to_ascii_lowercase(),
-            ]));
+            ]);
         }
     } else {
         for trigram in message.to_lowercase().as_bytes().windows(3) {
-            observe(message_trigram_slot([trigram[0], trigram[1], trigram[2]]));
+            observe([trigram[0], trigram[1], trigram[2]]);
         }
     }
 }
 
 #[inline]
-fn message_trigram_slot(trigram: [u8; 3]) -> usize {
+fn message_trigram_slot_for_bits(trigram: [u8; 3], filter_bits: usize) -> usize {
     let mut hash =
         u32::from(trigram[0]) | (u32::from(trigram[1]) << 8) | (u32::from(trigram[2]) << 16);
     hash ^= hash >> 16;
@@ -99,13 +138,33 @@ fn message_trigram_slot(trigram: [u8; 3]) -> usize {
     hash ^= hash >> 15;
     hash = hash.wrapping_mul(0x846c_a68b);
     hash ^= hash >> 16;
-    hash as usize & (MESSAGE_TRIGRAM_FILTER_BITS - 1)
+    hash as usize & filter_bits.saturating_sub(1)
 }
 
 fn required_message_trigram_slots(literals: &[&str]) -> Vec<usize> {
     let mut slots = Vec::new();
     for literal in literals {
-        visit_normalized_trigrams(literal, |slot| slots.push(slot));
+        visit_message_trigrams(literal, false, |trigram| {
+            slots.push(message_trigram_slot_for_bits(
+                trigram,
+                MESSAGE_TRIGRAM_FILTER_BITS,
+            ));
+        });
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+fn required_case_sensitive_message_trigram_slots(literals: &[&str]) -> Vec<usize> {
+    let mut slots = Vec::new();
+    for literal in literals {
+        visit_message_trigrams(literal, true, |trigram| {
+            slots.push(message_trigram_slot_for_bits(
+                trigram,
+                CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_BITS,
+            ));
+        });
     }
     slots.sort_unstable();
     slots.dedup();
@@ -152,12 +211,27 @@ struct OrdinalRun {
     length: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostingCheckpoint {
+    index: u32,
+    previous: u32,
+    byte_offset: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PostingList {
     Ordinals(Vec<u32>),
     Runs {
         runs: Vec<OrdinalRun>,
         cardinality: usize,
+    },
+    Encoded {
+        bytes: Arc<[u8]>,
+        start: usize,
+        end: usize,
+        kind: u8,
+        cardinality: usize,
+        checkpoints: Arc<[PostingCheckpoint]>,
     },
 }
 
@@ -186,6 +260,7 @@ impl PostingList {
         match self {
             Self::Ordinals(ordinals) => ordinals.len(),
             Self::Runs { cardinality, .. } => *cardinality,
+            Self::Encoded { cardinality, .. } => *cardinality,
         }
     }
 
@@ -193,6 +268,7 @@ impl PostingList {
         match self {
             Self::Ordinals(ordinals) => ordinals.capacity() * size_of::<u32>(),
             Self::Runs { runs, .. } => runs.capacity() * size_of::<OrdinalRun>(),
+            Self::Encoded { start, end, .. } => end.saturating_sub(*start),
         }
     }
 
@@ -205,6 +281,14 @@ impl PostingList {
                     ordinals.extend(run.start..run.start + run.length);
                 }
                 ordinals
+            }
+            Self::Encoded {
+                bytes, start, end, ..
+            } => {
+                let mut cursor = 0;
+                decode_posting(&bytes[*start..*end], &mut cursor, u32::MAX)
+                    .expect("validated encoded query posting")
+                    .to_vec()
             }
         }
     }
@@ -246,6 +330,20 @@ impl PostingList {
                 }
                 ordinals
             }
+            Self::Encoded {
+                bytes,
+                start,
+                end,
+                kind,
+                checkpoints,
+                ..
+            } => take_encoded_ordered(
+                &bytes[*start..*end],
+                *kind,
+                checkpoints,
+                newest_first,
+                limit,
+            ),
         }
     }
 
@@ -260,6 +358,14 @@ impl PostingList {
                             .start
                             .saturating_add(runs[position - 1].length)
             }
+            Self::Encoded {
+                bytes,
+                start,
+                end,
+                kind,
+                checkpoints,
+                ..
+            } => encoded_posting_contains(&bytes[*start..*end], *kind, checkpoints, ordinal),
         }
     }
 }
@@ -273,6 +379,7 @@ type PartitionFieldBlockPostings =
 pub struct BlockQueryIndex {
     record_count: u32,
     message_trigrams: MessageTrigramFilter,
+    case_sensitive_message_trigrams: MessageTrigramFilter,
     term_postings: HashMap<Arc<str>, PostingList>,
     field_postings: HashMap<Arc<str>, HashMap<Arc<str>, PostingList>>,
 }
@@ -289,6 +396,7 @@ impl BlockQueryIndex {
             .collect::<Vec<Option<CachedMessageTerms<'_>>>>();
         let mut term_cache = vec![None::<CachedTerm>; TERM_CACHE_ENTRIES];
         let mut message_trigrams = MessageTrigramFilter::new();
+        let mut case_sensitive_message_trigrams = MessageTrigramFilter::new_case_sensitive();
         let mut field_postings = HashMap::<Arc<str>, HashMap<Arc<str>, Vec<u32>>>::new();
         for (record_ordinal, record) in records.iter().enumerate() {
             let record_ordinal =
@@ -306,6 +414,7 @@ impl BlockQueryIndex {
                 }
             } else {
                 message_trigrams.insert_message(message);
+                case_sensitive_message_trigrams.insert_case_sensitive_message(message);
                 let mut message_term_ids = message_cache[cache_slot]
                     .take()
                     .map(|cached| cached.term_ids)
@@ -388,6 +497,7 @@ impl BlockQueryIndex {
         Ok(Self {
             record_count,
             message_trigrams,
+            case_sensitive_message_trigrams,
             term_postings,
             field_postings,
         })
@@ -462,8 +572,11 @@ fn term_matches_cached(indexed: &str, observed: &str) -> bool {
 pub struct PersistentQueryIndex {
     blocks: Vec<QueryBlockMetadata>,
     message_trigram_words: Box<[u64]>,
+    case_sensitive_message_trigram_words: Box<[u64]>,
     message_trigram_union: MessageTrigramFilter,
     message_trigram_intersection: MessageTrigramFilter,
+    case_sensitive_message_trigram_union: MessageTrigramFilter,
+    case_sensitive_message_trigram_intersection: MessageTrigramFilter,
     partition_blocks: HashMap<TopicPartition, Vec<u32>>,
     term_postings: PartitionTermBlockPostings,
     field_postings: PartitionFieldBlockPostings,
@@ -486,6 +599,11 @@ impl PersistentQueryIndex {
         let mut metadata_entries = Vec::with_capacity(blocks.len());
         let mut message_trigram_words =
             Vec::with_capacity(blocks.len().saturating_mul(MESSAGE_TRIGRAM_FILTER_WORDS));
+        let mut case_sensitive_message_trigram_words = Vec::with_capacity(
+            blocks
+                .len()
+                .saturating_mul(CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS),
+        );
         let mut partition_blocks = HashMap::<TopicPartition, Vec<u32>>::new();
         let mut term_postings =
             HashMap::<TopicPartition, HashMap<Arc<str>, Vec<BlockPosting>>>::new();
@@ -524,15 +642,23 @@ impl PersistentQueryIndex {
                 }
             }
             message_trigram_words.extend_from_slice(&index.message_trigrams.words);
+            case_sensitive_message_trigram_words
+                .extend_from_slice(&index.case_sensitive_message_trigrams.words);
             metadata_entries.push(metadata);
         }
         let (message_trigram_union, message_trigram_intersection) =
             aggregate_message_trigrams(&message_trigram_words);
+        let (case_sensitive_message_trigram_union, case_sensitive_message_trigram_intersection) =
+            aggregate_case_sensitive_message_trigrams(&case_sensitive_message_trigram_words);
         Ok(Self {
             blocks: metadata_entries,
             message_trigram_words: message_trigram_words.into_boxed_slice(),
+            case_sensitive_message_trigram_words: case_sensitive_message_trigram_words
+                .into_boxed_slice(),
             message_trigram_union,
             message_trigram_intersection,
+            case_sensitive_message_trigram_union,
+            case_sensitive_message_trigram_intersection,
             partition_blocks,
             term_postings,
             field_postings,
@@ -570,6 +696,7 @@ impl PersistentQueryIndex {
     pub fn message_trigram_filter_bytes(&self) -> usize {
         self.message_trigram_words
             .len()
+            .saturating_add(self.case_sensitive_message_trigram_words.len())
             .saturating_mul(size_of::<u64>())
     }
 
@@ -613,11 +740,16 @@ impl PersistentQueryIndex {
         else {
             return Vec::new();
         };
+        let Some(required_case_sensitive_message_slots) =
+            self.prepare_case_sensitive_message_trigrams(&required.case_sensitive_message_literals)
+        else {
+            return Vec::new();
+        };
         let mut constraints = Vec::<&[BlockPosting]>::with_capacity(
             required.terms.len().saturating_add(required.fields.len()),
         );
         let partition_terms = self.term_postings.get(&query.topic_partition);
-        for term in required.terms {
+        for &term in &required.terms {
             let normalized = normalize_term(term);
             let Some(postings) = partition_terms.and_then(|terms| terms.get(normalized.as_ref()))
             else {
@@ -626,7 +758,7 @@ impl PersistentQueryIndex {
             constraints.push(postings);
         }
         let partition_fields = self.field_postings.get(&query.topic_partition);
-        for (key, value) in required.fields {
+        for &(key, value) in &required.fields {
             let Some(postings) = partition_fields
                 .and_then(|keys| keys.get(key))
                 .and_then(|values| values.get(value))
@@ -655,10 +787,21 @@ impl PersistentQueryIndex {
             }
             candidates
         };
+        for field_blocks in self.required_field_block_constraints(query.topic_partition, &required)
+        {
+            intersect_u32(&mut candidate_blocks, &field_blocks);
+            if candidate_blocks.is_empty() {
+                return Vec::new();
+            }
+        }
         candidate_blocks.retain(|ordinal| {
             self.block(*ordinal)
                 .is_some_and(|metadata| block_overlaps(metadata, query))
                 && self.message_might_match(*ordinal, &required_message_slots)
+                && self.case_sensitive_message_might_match(
+                    *ordinal,
+                    &required_case_sensitive_message_slots,
+                )
         });
         if query.order == QueryOrder::NewestFirst {
             candidate_blocks.reverse();
@@ -674,7 +817,16 @@ impl PersistentQueryIndex {
             let Some(metadata) = self.block(block_ordinal) else {
                 continue;
             };
-            let mut record_constraints = Vec::<&PostingList>::with_capacity(constraints.len());
+            let Some(field_record_constraints) = self.required_field_record_constraints(
+                query.topic_partition,
+                block_ordinal,
+                &required,
+            ) else {
+                continue;
+            };
+            let mut record_constraints = Vec::<&PostingList>::with_capacity(
+                constraints.len() + field_record_constraints.len(),
+            );
             for constraint in &constraints {
                 let Ok(position) = constraint
                     .binary_search_by_key(&block_ordinal, |posting| posting.block_ordinal)
@@ -684,10 +836,13 @@ impl PersistentQueryIndex {
                 };
                 record_constraints.push(&constraint[position].record_ordinals);
             }
+            for posting in &field_record_constraints {
+                record_constraints.push(posting);
+            }
             let remaining = safe_limit.saturating_sub(hits.len());
             let newest_first = query.order == QueryOrder::NewestFirst;
             let record_ordinals = if record_constraints.is_empty() {
-                if constraints.is_empty() {
+                if constraints.is_empty() && field_record_constraints.is_empty() {
                     if newest_first {
                         (0..metadata.record_count).rev().take(remaining).collect()
                     } else {
@@ -753,11 +908,16 @@ impl PersistentQueryIndex {
         else {
             return Vec::new();
         };
+        let Some(required_case_sensitive_message_slots) =
+            self.prepare_case_sensitive_message_trigrams(&required.case_sensitive_message_literals)
+        else {
+            return Vec::new();
+        };
         let mut constraints = Vec::<&[BlockPosting]>::with_capacity(
             required.terms.len().saturating_add(required.fields.len()),
         );
         let partition_terms = self.term_postings.get(&query.topic_partition);
-        for term in required.terms {
+        for &term in &required.terms {
             let normalized = normalize_term(term);
             let Some(postings) = partition_terms.and_then(|terms| terms.get(normalized.as_ref()))
             else {
@@ -766,7 +926,7 @@ impl PersistentQueryIndex {
             constraints.push(postings);
         }
         let partition_fields = self.field_postings.get(&query.topic_partition);
-        for (key, value) in required.fields {
+        for &(key, value) in &required.fields {
             let Some(postings) = partition_fields
                 .and_then(|keys| keys.get(key))
                 .and_then(|values| values.get(value))
@@ -795,10 +955,21 @@ impl PersistentQueryIndex {
             }
             blocks
         };
+        for field_blocks in self.required_field_block_constraints(query.topic_partition, &required)
+        {
+            intersect_u32(&mut blocks, &field_blocks);
+            if blocks.is_empty() {
+                return blocks;
+            }
+        }
         blocks.retain(|ordinal| {
             self.block(*ordinal)
                 .is_some_and(|metadata| block_overlaps(metadata, query))
                 && self.message_might_match(*ordinal, &required_message_slots)
+                && self.case_sensitive_message_might_match(
+                    *ordinal,
+                    &required_case_sensitive_message_slots,
+                )
         });
         blocks.sort_unstable_by_key(|ordinal| {
             self.block(*ordinal).map(|metadata| metadata.first_offset)
@@ -837,11 +1008,31 @@ impl PersistentQueryIndex {
         if !self.message_might_match(block_ordinal, &required_message_slots) {
             return Vec::new();
         }
+        let Some(required_case_sensitive_message_slots) =
+            self.prepare_case_sensitive_message_trigrams(&required.case_sensitive_message_literals)
+        else {
+            return Vec::new();
+        };
+        if !self.case_sensitive_message_might_match(
+            block_ordinal,
+            &required_case_sensitive_message_slots,
+        ) {
+            return Vec::new();
+        }
+        let Some(field_record_constraints) =
+            self.required_field_record_constraints(query.topic_partition, block_ordinal, &required)
+        else {
+            return Vec::new();
+        };
         let mut constraints = Vec::<&PostingList>::with_capacity(
-            required.terms.len().saturating_add(required.fields.len()),
+            required
+                .terms
+                .len()
+                .saturating_add(required.fields.len())
+                .saturating_add(field_record_constraints.len()),
         );
         let partition_terms = self.term_postings.get(&query.topic_partition);
-        for term in required.terms {
+        for &term in &required.terms {
             let normalized = normalize_term(term);
             let Some(posting) = partition_terms
                 .and_then(|terms| terms.get(normalized.as_ref()))
@@ -851,8 +1042,11 @@ impl PersistentQueryIndex {
             };
             constraints.push(posting);
         }
+        for posting in &field_record_constraints {
+            constraints.push(posting);
+        }
         let partition_fields = self.field_postings.get(&query.topic_partition);
-        for (key, value) in required.fields {
+        for &(key, value) in &required.fields {
             let Some(posting) = partition_fields
                 .and_then(|keys| keys.get(key))
                 .and_then(|values| values.get(value))
@@ -889,6 +1083,173 @@ impl PersistentQueryIndex {
             .collect()
     }
 
+    fn required_field_block_constraints(
+        &self,
+        topic_partition: TopicPartition,
+        required: &RequiredIndexConstraints<'_>,
+    ) -> Vec<Vec<u32>> {
+        let mut constraints = Vec::with_capacity(
+            required
+                .field_exists
+                .len()
+                .saturating_add(required.field_in.len())
+                .saturating_add(required.field_text.len())
+                .saturating_add(required.field_regex.len())
+                .saturating_add(required.field_numeric.len()),
+        );
+        for key in &required.field_exists {
+            constraints.push(self.field_block_candidates(topic_partition, key, |_| true));
+        }
+        for (key, values) in &required.field_in {
+            constraints.push(
+                self.field_block_candidates(topic_partition, key, |value| values.contains(&value)),
+            );
+        }
+        for (key, matcher) in &required.field_text {
+            constraints.push(self.field_block_candidates(topic_partition, key, |value| {
+                text_matches(value, matcher)
+            }));
+        }
+        for (key, regex) in &required.field_regex {
+            constraints.push(
+                self.field_block_candidates(topic_partition, key, |value| regex.is_match(value)),
+            );
+        }
+        for (key, comparison, target) in &required.field_numeric {
+            constraints.push(self.field_block_candidates(topic_partition, key, |value| {
+                value
+                    .parse::<i128>()
+                    .is_ok_and(|observed| compare_numeric(observed, *comparison, *target))
+            }));
+        }
+        constraints
+    }
+
+    fn required_field_record_constraints(
+        &self,
+        topic_partition: TopicPartition,
+        block_ordinal: u32,
+        required: &RequiredIndexConstraints<'_>,
+    ) -> Option<Vec<PostingList>> {
+        let mut constraints = Vec::with_capacity(
+            required
+                .field_exists
+                .len()
+                .saturating_add(required.field_in.len())
+                .saturating_add(required.field_text.len())
+                .saturating_add(required.field_regex.len())
+                .saturating_add(required.field_numeric.len()),
+        );
+        for key in &required.field_exists {
+            constraints.push(
+                PostingList::from_ordinals(self.field_record_candidates(
+                    topic_partition,
+                    key,
+                    block_ordinal,
+                    |_| true,
+                )?)
+                .ok()?,
+            );
+        }
+        for (key, values) in &required.field_in {
+            constraints.push(
+                PostingList::from_ordinals(self.field_record_candidates(
+                    topic_partition,
+                    key,
+                    block_ordinal,
+                    |value| values.contains(&value),
+                )?)
+                .ok()?,
+            );
+        }
+        for (key, matcher) in &required.field_text {
+            constraints.push(
+                PostingList::from_ordinals(self.field_record_candidates(
+                    topic_partition,
+                    key,
+                    block_ordinal,
+                    |value| text_matches(value, matcher),
+                )?)
+                .ok()?,
+            );
+        }
+        for (key, regex) in &required.field_regex {
+            constraints.push(
+                PostingList::from_ordinals(self.field_record_candidates(
+                    topic_partition,
+                    key,
+                    block_ordinal,
+                    |value| regex.is_match(value),
+                )?)
+                .ok()?,
+            );
+        }
+        for (key, comparison, target) in &required.field_numeric {
+            constraints.push(
+                PostingList::from_ordinals(self.field_record_candidates(
+                    topic_partition,
+                    key,
+                    block_ordinal,
+                    |value| {
+                        value
+                            .parse::<i128>()
+                            .is_ok_and(|observed| compare_numeric(observed, *comparison, *target))
+                    },
+                )?)
+                .ok()?,
+            );
+        }
+        Some(constraints)
+    }
+
+    fn field_block_candidates(
+        &self,
+        topic_partition: TopicPartition,
+        key: &str,
+        mut matches_value: impl FnMut(&str) -> bool,
+    ) -> Vec<u32> {
+        let Some(values) = self
+            .field_postings
+            .get(&topic_partition)
+            .and_then(|fields| fields.get(key))
+        else {
+            return Vec::new();
+        };
+        let mut blocks = Vec::new();
+        for (value, postings) in values {
+            if matches_value(value) {
+                blocks.extend(postings.iter().map(|posting| posting.block_ordinal));
+            }
+        }
+        blocks.sort_unstable();
+        blocks.dedup();
+        blocks
+    }
+
+    fn field_record_candidates(
+        &self,
+        topic_partition: TopicPartition,
+        key: &str,
+        block_ordinal: u32,
+        mut matches_value: impl FnMut(&str) -> bool,
+    ) -> Option<Vec<u32>> {
+        let values = self
+            .field_postings
+            .get(&topic_partition)
+            .and_then(|fields| fields.get(key))?;
+        let mut ordinals = Vec::new();
+        for (value, postings) in values {
+            if matches_value(value)
+                && let Some(posting) = posting_for_block(postings, block_ordinal)
+            {
+                ordinals.extend(posting.to_vec());
+            }
+        }
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        (!ordinals.is_empty()).then_some(ordinals)
+    }
+
     /// Encodes the complete immutable directory with hybrid delta/run postings.
     pub fn encode(&self) -> TelemetryResult<Vec<u8>> {
         let mut encoded = Vec::new();
@@ -909,6 +1270,13 @@ impl PersistentQueryIndex {
             let trigram_start = block_index.saturating_mul(MESSAGE_TRIGRAM_FILTER_WORDS);
             for word in &self.message_trigram_words
                 [trigram_start..trigram_start + MESSAGE_TRIGRAM_FILTER_WORDS]
+            {
+                encoded.extend_from_slice(&word.to_le_bytes());
+            }
+            let case_sensitive_trigram_start =
+                block_index.saturating_mul(CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS);
+            for word in &self.case_sensitive_message_trigram_words[case_sensitive_trigram_start
+                ..case_sensitive_trigram_start + CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS]
             {
                 encoded.extend_from_slice(&word.to_le_bytes());
             }
@@ -963,17 +1331,45 @@ impl PersistentQueryIndex {
 
     /// Decodes and validates one immutable query directory.
     pub fn decode(encoded: &[u8]) -> TelemetryResult<Self> {
-        if encoded.get(..QUERY_INDEX_MAGIC.len()) != Some(QUERY_INDEX_MAGIC) {
-            return Err(TelemetryError::InvalidBlockEncoding(
-                "missing query index magic",
-            ));
-        }
-        let mut cursor = QUERY_INDEX_MAGIC.len();
+        Self::decode_internal(encoded, None)
+    }
+
+    fn decode_internal(encoded: &[u8], backing: Option<Arc<[u8]>>) -> TelemetryResult<Self> {
+        let (magic_len, has_case_sensitive_filter) =
+            if encoded.get(..QUERY_INDEX_MAGIC.len()) == Some(QUERY_INDEX_MAGIC) {
+                (QUERY_INDEX_MAGIC.len(), true)
+            } else if encoded.get(..QUERY_INDEX_MAGIC_V1.len()) == Some(QUERY_INDEX_MAGIC_V1) {
+                (QUERY_INDEX_MAGIC_V1.len(), false)
+            } else {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "missing query index magic",
+                ));
+            };
+        let mut cursor = magic_len;
         let block_count = read_usize(encoded, &mut cursor)?;
         ensure_count(block_count, encoded.len().saturating_sub(cursor))?;
         let mut blocks = Vec::with_capacity(block_count);
+        let mut message_trigram_words =
+            Vec::with_capacity(block_count.saturating_mul(MESSAGE_TRIGRAM_FILTER_WORDS));
+        let mut case_sensitive_message_trigram_words = Vec::with_capacity(
+            block_count.saturating_mul(CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS),
+        );
+        let mut partition_blocks = HashMap::<TopicPartition, Vec<u32>>::new();
+        let mut term_postings =
+            HashMap::<TopicPartition, HashMap<Arc<str>, Vec<BlockPosting>>>::new();
+        let mut field_postings = HashMap::<
+            TopicPartition,
+            HashMap<Arc<str>, HashMap<Arc<str>, Vec<BlockPosting>>>,
+        >::new();
+        let mut previous_block_ordinal = None;
         for _ in 0..block_count {
             let block_ordinal = read_u32(encoded, &mut cursor)?;
+            if previous_block_ordinal.is_some_and(|previous| previous >= block_ordinal) {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "query blocks are not ordered",
+                ));
+            }
+            previous_block_ordinal = Some(block_ordinal);
             let topic_end = cursor
                 .checked_add(16)
                 .ok_or(TelemetryError::InvalidBlockEncoding("query topic overflow"))?;
@@ -1016,60 +1412,134 @@ impl PersistentQueryIndex {
                     TelemetryError::InvalidBlockEncoding("truncated message trigram filter"),
                 )?)?;
             cursor = trigram_end;
+            if first_offset > last_offset || min_timestamp_unix_nanos > max_timestamp_unix_nanos {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "invalid query block metadata",
+                ));
+            }
+            let topic_partition = TopicPartition::new(topic_id, partition_id);
+            partition_blocks
+                .entry(topic_partition)
+                .or_default()
+                .push(block_ordinal);
+            message_trigram_words.extend_from_slice(&message_trigrams.words);
+            if has_case_sensitive_filter {
+                let case_sensitive_trigram_end = cursor
+                    .checked_add(CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_BYTES)
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
+                        "case-sensitive message trigram filter overflow",
+                    ))?;
+                let case_sensitive_message_trigrams =
+                    MessageTrigramFilter::from_bytes_case_sensitive(
+                        encoded.get(cursor..case_sensitive_trigram_end).ok_or(
+                            TelemetryError::InvalidBlockEncoding(
+                                "truncated case-sensitive message trigram filter",
+                            ),
+                        )?,
+                    )?;
+                cursor = case_sensitive_trigram_end;
+                case_sensitive_message_trigram_words
+                    .extend_from_slice(&case_sensitive_message_trigrams.words);
+            } else {
+                case_sensitive_message_trigram_words.extend(std::iter::repeat_n(
+                    u64::MAX,
+                    CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS,
+                ));
+            }
+
             let term_count = read_usize(encoded, &mut cursor)?;
             ensure_count(term_count, encoded.len().saturating_sub(cursor))?;
-            let mut term_postings = HashMap::with_capacity(term_count);
+            let mut block_terms = HashMap::with_capacity(term_count);
             for _ in 0..term_count {
                 let term = decode_text(read_bytes(encoded, &mut cursor)?)?;
-                let posting = decode_posting(encoded, &mut cursor, record_count)?;
-                if term_postings.insert(term, posting).is_some() {
+                if block_terms.insert(term.clone(), ()).is_some() {
                     return Err(TelemetryError::InvalidBlockEncoding(
                         "duplicate indexed term",
                     ));
                 }
+                let posting = decode_posting_for_directory(
+                    encoded,
+                    &mut cursor,
+                    record_count,
+                    backing.as_ref(),
+                )?;
+                term_postings
+                    .entry(topic_partition)
+                    .or_default()
+                    .entry(term)
+                    .or_default()
+                    .push(BlockPosting {
+                        block_ordinal,
+                        record_ordinals: posting,
+                    });
             }
             let field_count = read_usize(encoded, &mut cursor)?;
             ensure_count(field_count, encoded.len().saturating_sub(cursor))?;
-            let mut field_postings = HashMap::<Arc<str>, HashMap<Arc<str>, PostingList>>::new();
+            let mut block_fields =
+                HashMap::<Arc<str>, HashMap<Arc<str>, ()>>::with_capacity(field_count);
             for _ in 0..field_count {
                 let key = decode_text(read_bytes(encoded, &mut cursor)?)?;
                 let value = decode_text(read_bytes(encoded, &mut cursor)?)?;
-                let posting = decode_posting(encoded, &mut cursor, record_count)?;
-                if field_postings
-                    .entry(key)
+                if block_fields
+                    .entry(key.clone())
                     .or_default()
-                    .insert(value, posting)
+                    .insert(value.clone(), ())
                     .is_some()
                 {
                     return Err(TelemetryError::InvalidBlockEncoding(
                         "duplicate indexed field",
                     ));
                 }
+                let posting = decode_posting_for_directory(
+                    encoded,
+                    &mut cursor,
+                    record_count,
+                    backing.as_ref(),
+                )?;
+                field_postings
+                    .entry(topic_partition)
+                    .or_default()
+                    .entry(key)
+                    .or_default()
+                    .entry(value)
+                    .or_default()
+                    .push(BlockPosting {
+                        block_ordinal,
+                        record_ordinals: posting,
+                    });
             }
-            blocks.push((
-                QueryBlockMetadata {
-                    block_ordinal,
-                    topic_partition: TopicPartition::new(topic_id, partition_id),
-                    first_offset,
-                    last_offset,
-                    min_timestamp_unix_nanos,
-                    max_timestamp_unix_nanos,
-                    record_count,
-                },
-                BlockQueryIndex {
-                    record_count,
-                    message_trigrams,
-                    term_postings,
-                    field_postings,
-                },
-            ));
+            blocks.push(QueryBlockMetadata {
+                block_ordinal,
+                topic_partition,
+                first_offset,
+                last_offset,
+                min_timestamp_unix_nanos,
+                max_timestamp_unix_nanos,
+                record_count,
+            });
         }
         if cursor != encoded.len() {
             return Err(TelemetryError::InvalidBlockEncoding(
                 "trailing query index bytes",
             ));
         }
-        Self::from_blocks(blocks)
+        let (message_trigram_union, message_trigram_intersection) =
+            aggregate_message_trigrams(&message_trigram_words);
+        let (case_sensitive_message_trigram_union, case_sensitive_message_trigram_intersection) =
+            aggregate_case_sensitive_message_trigrams(&case_sensitive_message_trigram_words);
+        Ok(Self {
+            blocks,
+            message_trigram_words: message_trigram_words.into_boxed_slice(),
+            case_sensitive_message_trigram_words: case_sensitive_message_trigram_words
+                .into_boxed_slice(),
+            message_trigram_union,
+            message_trigram_intersection,
+            case_sensitive_message_trigram_union,
+            case_sensitive_message_trigram_intersection,
+            partition_blocks,
+            term_postings,
+            field_postings,
+        })
     }
 
     /// Encodes and wraps the query directory in one zstd frame.
@@ -1091,15 +1561,23 @@ impl PersistentQueryIndex {
 
     /// Decodes a zstd-wrapped immutable query directory.
     pub fn decode_compressed(encoded: &[u8]) -> TelemetryResult<Self> {
-        if encoded.get(..COMPRESSED_QUERY_INDEX_MAGIC.len()) != Some(COMPRESSED_QUERY_INDEX_MAGIC) {
+        let magic_len = if encoded.get(..COMPRESSED_QUERY_INDEX_MAGIC.len())
+            == Some(COMPRESSED_QUERY_INDEX_MAGIC)
+        {
+            COMPRESSED_QUERY_INDEX_MAGIC.len()
+        } else if encoded.get(..COMPRESSED_QUERY_INDEX_MAGIC_V1.len())
+            == Some(COMPRESSED_QUERY_INDEX_MAGIC_V1)
+        {
+            COMPRESSED_QUERY_INDEX_MAGIC_V1.len()
+        } else {
             return Err(TelemetryError::InvalidBlockEncoding(
                 "missing compressed query index magic",
             ));
-        }
-        let length_end = COMPRESSED_QUERY_INDEX_MAGIC.len() + 8;
+        };
+        let length_end = magic_len + 8;
         let uncompressed_len = usize::try_from(u64::from_le_bytes(
             encoded
-                .get(COMPRESSED_QUERY_INDEX_MAGIC.len()..length_end)
+                .get(magic_len..length_end)
                 .ok_or(TelemetryError::InvalidBlockEncoding(
                     "truncated query index length",
                 ))?
@@ -1118,7 +1596,8 @@ impl PersistentQueryIndex {
             uncompressed_len,
         )
         .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid compressed query index"))?;
-        Self::decode(&uncompressed)
+        let backing: Arc<[u8]> = Arc::from(uncompressed);
+        Self::decode_internal(backing.as_ref(), Some(Arc::clone(&backing)))
     }
 
     fn block(&self, block_ordinal: u32) -> Option<&QueryBlockMetadata> {
@@ -1143,6 +1622,25 @@ impl PersistentQueryIndex {
         })
     }
 
+    fn case_sensitive_message_might_match(
+        &self,
+        block_ordinal: u32,
+        required_slots: &[usize],
+    ) -> bool {
+        let Ok(index) = self
+            .blocks
+            .binary_search_by_key(&block_ordinal, |metadata| metadata.block_ordinal)
+        else {
+            return false;
+        };
+        let start = index.saturating_mul(CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS);
+        required_slots.iter().all(|slot| {
+            self.case_sensitive_message_trigram_words
+                .get(start + *slot / u64::BITS as usize)
+                .is_some_and(|word| word & (1u64 << (*slot % u64::BITS as usize)) != 0)
+        })
+    }
+
     fn prepare_required_message_trigrams(&self, literals: &[&str]) -> Option<Vec<usize>> {
         let mut slots = required_message_trigram_slots(literals);
         if !self.message_trigram_union.might_contain_all(&slots) {
@@ -1151,6 +1649,22 @@ impl PersistentQueryIndex {
         slots.retain(|slot| {
             !self
                 .message_trigram_intersection
+                .might_contain_all(&[*slot])
+        });
+        Some(slots)
+    }
+
+    fn prepare_case_sensitive_message_trigrams(&self, literals: &[&str]) -> Option<Vec<usize>> {
+        let mut slots = required_case_sensitive_message_trigram_slots(literals);
+        if !self
+            .case_sensitive_message_trigram_union
+            .might_contain_all(&slots)
+        {
+            return None;
+        }
+        slots.retain(|slot| {
+            !self
+                .case_sensitive_message_trigram_intersection
                 .might_contain_all(&[*slot])
         });
         Some(slots)
@@ -1167,6 +1681,31 @@ fn aggregate_message_trigrams(words: &[u64]) -> (MessageTrigramFilter, MessageTr
         return (union, intersection);
     }
     for filter in words.chunks_exact(MESSAGE_TRIGRAM_FILTER_WORDS) {
+        for ((union, intersection), observed) in union
+            .words
+            .iter_mut()
+            .zip(intersection.words.iter_mut())
+            .zip(filter.iter())
+        {
+            *union |= *observed;
+            *intersection &= *observed;
+        }
+    }
+    (union, intersection)
+}
+
+fn aggregate_case_sensitive_message_trigrams(
+    words: &[u64],
+) -> (MessageTrigramFilter, MessageTrigramFilter) {
+    let mut union = MessageTrigramFilter::new_case_sensitive();
+    let mut intersection = MessageTrigramFilter {
+        words: vec![u64::MAX; CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS].into_boxed_slice(),
+    };
+    if words.is_empty() {
+        intersection.words.fill(0);
+        return (union, intersection);
+    }
+    for filter in words.chunks_exact(CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_WORDS) {
         for ((union, intersection), observed) in union
             .words
             .iter_mut()
@@ -1282,7 +1821,50 @@ fn intersect_posting(candidates: &mut Vec<u32>, posting: &PostingList) {
             }
             candidates.truncate(write_index);
         }
+        PostingList::Encoded {
+            bytes,
+            start,
+            end,
+            kind,
+            checkpoints,
+            ..
+        } => {
+            if candidates.len().saturating_mul(8) < posting.cardinality() {
+                candidates.retain(|ordinal| posting.contains(*ordinal));
+            } else {
+                intersect_encoded_posting(candidates, &bytes[*start..*end], *kind, checkpoints);
+            }
+        }
     }
+}
+
+fn intersect_encoded_posting(
+    candidates: &mut Vec<u32>,
+    encoded: &[u8],
+    kind: u8,
+    checkpoints: &[PostingCheckpoint],
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let candidate_count = candidates.len();
+    let mut candidate_index = 0usize;
+    let mut write_index = 0usize;
+    visit_encoded_ordered(encoded, kind, checkpoints, false, |ordinal| {
+        while candidate_index < candidate_count && candidates[candidate_index] < ordinal {
+            candidate_index += 1;
+        }
+        if candidate_index == candidate_count {
+            return true;
+        }
+        if candidates[candidate_index] == ordinal {
+            candidates[write_index] = ordinal;
+            write_index += 1;
+            candidate_index += 1;
+        }
+        false
+    });
+    candidates.truncate(write_index);
 }
 
 fn intersect_postings_limited(
@@ -1335,8 +1917,224 @@ fn intersect_postings_limited(
                 }
             }
         }
+        PostingList::Encoded {
+            bytes,
+            start,
+            end,
+            kind,
+            checkpoints,
+            ..
+        } => visit_encoded_ordered(
+            &bytes[*start..*end],
+            *kind,
+            checkpoints,
+            newest_first,
+            &mut observe,
+        ),
     }
     matches
+}
+
+fn encoded_posting_contains(
+    encoded: &[u8],
+    kind: u8,
+    checkpoints: &[PostingCheckpoint],
+    ordinal: u32,
+) -> bool {
+    let mut cursor = 0;
+    debug_assert_eq!(encoded.get(cursor).copied(), Some(kind));
+    match kind {
+        DELTA_POSTING => {
+            let _ = read_byte(encoded, &mut cursor);
+            let count = read_usize(encoded, &mut cursor).expect("validated posting count");
+            let mut previous = 0u32;
+            let mut index = 0usize;
+            if let Some(checkpoint) = checkpoints.get(..).and_then(|checkpoints| {
+                let index =
+                    checkpoints.partition_point(|checkpoint| checkpoint.previous <= ordinal);
+                index
+                    .checked_sub(1)
+                    .and_then(|index| checkpoints.get(index))
+            }) {
+                cursor = usize::try_from(checkpoint.byte_offset).expect("posting offset fits");
+                previous = checkpoint.previous;
+                index = usize::try_from(checkpoint.index).expect("posting index fits");
+                if index > 0 && previous == ordinal {
+                    return true;
+                }
+            }
+            for _ in index..count {
+                let delta = read_u32(encoded, &mut cursor).expect("validated posting delta");
+                let observed = previous
+                    .checked_add(delta)
+                    .expect("validated posting ordinal");
+                if observed == ordinal {
+                    return true;
+                }
+                if observed > ordinal {
+                    return false;
+                }
+                previous = observed;
+            }
+            false
+        }
+        RUN_POSTING => {
+            let _ = read_byte(encoded, &mut cursor);
+            let run_count = read_usize(encoded, &mut cursor).expect("validated run count");
+            let mut previous_end = 0u32;
+            let mut run_index = 0usize;
+            if let Some(checkpoint) = checkpoints.get(..).and_then(|checkpoints| {
+                let index =
+                    checkpoints.partition_point(|checkpoint| checkpoint.previous <= ordinal);
+                index
+                    .checked_sub(1)
+                    .and_then(|index| checkpoints.get(index))
+            }) {
+                cursor = usize::try_from(checkpoint.byte_offset).expect("posting offset fits");
+                previous_end = checkpoint.previous;
+                run_index = usize::try_from(checkpoint.index).expect("posting index fits");
+            }
+            for _ in run_index..run_count {
+                let start = previous_end
+                    .checked_add(read_u32(encoded, &mut cursor).expect("validated run start"))
+                    .expect("validated run start");
+                let length = read_u32(encoded, &mut cursor).expect("validated run length");
+                let end = start.checked_add(length).expect("validated run end");
+                if ordinal < start {
+                    return false;
+                }
+                if ordinal < end {
+                    return true;
+                }
+                previous_end = end;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn take_encoded_ordered(
+    encoded: &[u8],
+    kind: u8,
+    checkpoints: &[PostingCheckpoint],
+    newest_first: bool,
+    limit: usize,
+) -> Vec<u32> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut ordinals = Vec::with_capacity(limit);
+    visit_encoded_ordered(encoded, kind, checkpoints, newest_first, |ordinal| {
+        ordinals.push(ordinal);
+        ordinals.len() == limit
+    });
+    ordinals
+}
+
+fn visit_encoded_ordered(
+    encoded: &[u8],
+    kind: u8,
+    checkpoints: &[PostingCheckpoint],
+    newest_first: bool,
+    mut observe: impl FnMut(u32) -> bool,
+) {
+    let mut cursor = 0;
+    let encoded_kind = read_byte(encoded, &mut cursor).expect("validated posting kind");
+    debug_assert_eq!(encoded_kind, kind);
+    if kind == DELTA_POSTING {
+        let count = read_usize(encoded, &mut cursor).expect("validated posting count");
+        if !newest_first {
+            let mut previous = 0u32;
+            for _ in 0..count {
+                let delta = read_u32(encoded, &mut cursor).expect("validated posting delta");
+                previous = previous
+                    .checked_add(delta)
+                    .expect("validated posting ordinal");
+                if observe(previous) {
+                    return;
+                }
+            }
+            return;
+        }
+        if checkpoints.is_empty() {
+            let mut previous = 0u32;
+            let mut ordinals = Vec::with_capacity(count);
+            for _ in 0..count {
+                let delta = read_u32(encoded, &mut cursor).expect("validated posting delta");
+                previous = previous
+                    .checked_add(delta)
+                    .expect("validated posting ordinal");
+                ordinals.push(previous);
+            }
+            for ordinal in ordinals.into_iter().rev() {
+                if observe(ordinal) {
+                    return;
+                }
+            }
+            return;
+        }
+        for checkpoint_index in (0..checkpoints.len()).rev() {
+            let checkpoint = checkpoints[checkpoint_index];
+            let end_index = checkpoints.get(checkpoint_index + 1).map_or(count, |next| {
+                usize::try_from(next.index).expect("index fits")
+            });
+            let mut cursor = usize::try_from(checkpoint.byte_offset).expect("posting offset fits");
+            let mut previous = checkpoint.previous;
+            let mut ordinals = Vec::with_capacity(
+                end_index.saturating_sub(usize::try_from(checkpoint.index).expect("index fits")),
+            );
+            for _ in usize::try_from(checkpoint.index).expect("index fits")..end_index {
+                let delta = read_u32(encoded, &mut cursor).expect("validated posting delta");
+                previous = previous
+                    .checked_add(delta)
+                    .expect("validated posting ordinal");
+                ordinals.push(previous);
+            }
+            for ordinal in ordinals.into_iter().rev() {
+                if observe(ordinal) {
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
+    debug_assert_eq!(kind, RUN_POSTING);
+    let run_count = read_usize(encoded, &mut cursor).expect("validated run count");
+    if !newest_first {
+        let mut previous_end = 0u32;
+        for _ in 0..run_count {
+            let start = previous_end
+                .checked_add(read_u32(encoded, &mut cursor).expect("validated run start"))
+                .expect("validated run start");
+            let length = read_u32(encoded, &mut cursor).expect("validated run length");
+            previous_end = start.checked_add(length).expect("validated run end");
+            for ordinal in start..previous_end {
+                if observe(ordinal) {
+                    return;
+                }
+            }
+        }
+        return;
+    }
+    let mut runs = Vec::with_capacity(run_count);
+    let mut previous_end = 0u32;
+    for _ in 0..run_count {
+        let start = previous_end
+            .checked_add(read_u32(encoded, &mut cursor).expect("validated run start"))
+            .expect("validated run start");
+        let length = read_u32(encoded, &mut cursor).expect("validated run length");
+        previous_end = start.checked_add(length).expect("validated run end");
+        runs.push(OrdinalRun { start, length });
+    }
+    for run in runs.iter().rev() {
+        for ordinal in (run.start..run.start + run.length).rev() {
+            if observe(ordinal) {
+                return;
+            }
+        }
+    }
 }
 
 fn posting_runs(posting: &[u32]) -> Vec<OrdinalRun> {
@@ -1360,14 +2158,20 @@ fn encode_posting(posting: &PostingList, encoded: &mut Vec<u8>) -> TelemetryResu
     if let PostingList::Runs { runs, .. } = posting {
         return encode_run_posting(runs, encoded);
     }
+    if let PostingList::Encoded {
+        bytes, start, end, ..
+    } = posting
+    {
+        encoded.extend_from_slice(&bytes[*start..*end]);
+        return Ok(());
+    }
     let PostingList::Ordinals(posting) = posting else {
         unreachable!("run postings return above");
     };
-    let mut delta = Vec::new();
-    delta.push(DELTA_POSTING);
+    encoded.push(DELTA_POSTING);
     write_varint(
         u64::try_from(posting.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
-        &mut delta,
+        encoded,
     );
     let mut previous = 0u32;
     for (index, ordinal) in posting.iter().copied().enumerate() {
@@ -1376,10 +2180,9 @@ fn encode_posting(posting: &PostingList, encoded: &mut Vec<u8>) -> TelemetryResu
                 "query posting is not ordered",
             ));
         }
-        write_varint(u64::from(ordinal - previous), &mut delta);
+        write_varint(u64::from(ordinal - previous), encoded);
         previous = ordinal;
     }
-    encoded.extend_from_slice(&delta);
     Ok(())
 }
 
@@ -1477,11 +2280,150 @@ fn decode_posting(
     }
 }
 
+fn decode_posting_for_directory(
+    encoded: &[u8],
+    cursor: &mut usize,
+    record_count: u32,
+    backing: Option<&Arc<[u8]>>,
+) -> TelemetryResult<PostingList> {
+    let start = *cursor;
+    if let Some(bytes) = backing {
+        let (kind, cardinality, end, checkpoints) =
+            scan_posting(encoded, cursor, record_count, start)?;
+        return Ok(PostingList::Encoded {
+            bytes: Arc::clone(bytes),
+            start,
+            end,
+            kind,
+            cardinality,
+            checkpoints,
+        });
+    }
+    decode_posting(encoded, cursor, record_count)
+}
+
+fn scan_posting(
+    encoded: &[u8],
+    cursor: &mut usize,
+    record_count: u32,
+    posting_start: usize,
+) -> TelemetryResult<(u8, usize, usize, Arc<[PostingCheckpoint]>)> {
+    let kind = read_byte(encoded, cursor)?;
+    match kind {
+        DELTA_POSTING => {
+            let count = read_usize(encoded, cursor)?;
+            ensure_count(count, encoded.len().saturating_sub(*cursor))?;
+            let mut previous = 0u32;
+            let mut checkpoints = if count > 256 {
+                Vec::with_capacity(count.div_ceil(128))
+            } else {
+                Vec::new()
+            };
+            for index in 0..count {
+                let byte_offset = (*cursor).checked_sub(posting_start).ok_or(
+                    TelemetryError::InvalidBlockEncoding("query posting checkpoint underflow"),
+                )?;
+                if index % 128 == 0 {
+                    checkpoints.push(PostingCheckpoint {
+                        index: u32::try_from(index).map_err(|_| TelemetryError::RecordTooLarge)?,
+                        previous,
+                        byte_offset: u32::try_from(byte_offset)
+                            .map_err(|_| TelemetryError::RecordTooLarge)?,
+                    });
+                }
+                let delta = read_u32(encoded, cursor)?;
+                let ordinal =
+                    previous
+                        .checked_add(delta)
+                        .ok_or(TelemetryError::InvalidBlockEncoding(
+                            "query posting delta overflow",
+                        ))?;
+                if ordinal >= record_count || (index > 0 && ordinal <= previous) {
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "invalid query posting ordinal",
+                    ));
+                }
+                previous = ordinal;
+            }
+            if count == 0 {
+                return Err(TelemetryError::InvalidBlockEncoding("empty query posting"));
+            }
+            Ok((kind, count, *cursor, checkpoints.into()))
+        }
+        RUN_POSTING => {
+            let run_count = read_usize(encoded, cursor)?;
+            ensure_count(run_count, encoded.len().saturating_sub(*cursor))?;
+            let mut cardinality = 0usize;
+            let mut previous_end = 0u32;
+            let mut checkpoints = if run_count > 64 {
+                Vec::with_capacity(run_count.div_ceil(32))
+            } else {
+                Vec::new()
+            };
+            for index in 0..run_count {
+                let byte_offset = (*cursor).checked_sub(posting_start).ok_or(
+                    TelemetryError::InvalidBlockEncoding("query posting checkpoint underflow"),
+                )?;
+                if index % 32 == 0 {
+                    checkpoints.push(PostingCheckpoint {
+                        index: u32::try_from(index).map_err(|_| TelemetryError::RecordTooLarge)?,
+                        previous: previous_end,
+                        byte_offset: u32::try_from(byte_offset)
+                            .map_err(|_| TelemetryError::RecordTooLarge)?,
+                    });
+                }
+                let start = previous_end.checked_add(read_u32(encoded, cursor)?).ok_or(
+                    TelemetryError::InvalidBlockEncoding("query posting run overflow"),
+                )?;
+                let length = read_u32(encoded, cursor)?;
+                let end = start
+                    .checked_add(length)
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
+                        "query posting run overflow",
+                    ))?;
+                if length == 0 || end > record_count {
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "invalid query posting run",
+                    ));
+                }
+                cardinality = cardinality
+                    .checked_add(usize::try_from(length).map_err(|_| {
+                        TelemetryError::InvalidBlockEncoding(
+                            "query posting cardinality does not fit usize",
+                        )
+                    })?)
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
+                        "query posting cardinality overflow",
+                    ))?;
+                previous_end = end;
+            }
+            if run_count == 0 {
+                return Err(TelemetryError::InvalidBlockEncoding("empty query posting"));
+            }
+            Ok((kind, cardinality, *cursor, checkpoints.into()))
+        }
+        _ => Err(TelemetryError::InvalidBlockEncoding(
+            "unknown query posting encoding",
+        )),
+    }
+}
+
 fn normalize_term(term: &str) -> Cow<'_, str> {
     if term.chars().any(char::is_uppercase) {
         Cow::Owned(term.to_lowercase())
     } else {
         Cow::Borrowed(term)
+    }
+}
+
+fn compare_numeric(observed: i128, comparison: NumericComparison, expected: i128) -> bool {
+    match comparison {
+        NumericComparison::Equal => observed == expected,
+        NumericComparison::NotEqual => observed != expected,
+        NumericComparison::LessThan => observed < expected,
+        NumericComparison::LessThanOrEqual => observed <= expected,
+        NumericComparison::GreaterThan => observed > expected,
+        NumericComparison::GreaterThanOrEqual => observed >= expected,
     }
 }
 
@@ -1749,6 +2691,44 @@ mod tests {
     }
 
     #[test]
+    fn persistent_field_predicates_use_exact_value_postings() {
+        let records = compatibility_records(60);
+        let index = compatibility_index(&records, 10);
+        let queries = [
+            LogQuery::new(partition()).where_predicate(LogPredicate::field_exists("service")),
+            LogQuery::new(partition()).where_predicate(LogPredicate::field_in("env", ["dev"])),
+            LogQuery::new(partition()).where_predicate(LogPredicate::field(
+                "service",
+                TextMatcher::new("tor", TextMatchKind::Contains, CaseSensitivity::Sensitive),
+            )),
+            LogQuery::new(partition()).where_predicate(
+                LogPredicate::field_regex("status", r"5\d+", CaseSensitivity::Sensitive)
+                    .expect("regex compiles"),
+            ),
+            LogQuery::new(partition()).where_predicate(LogPredicate::field_numeric(
+                "status",
+                NumericComparison::GreaterThanOrEqual,
+                500,
+            )),
+        ];
+        for query in queries {
+            let expected = query.select(records.iter().cloned());
+            let actual = cold_matches(&index, &records, 10, &query);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|record| record.record_ref.offset)
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|record| record.record_ref.offset)
+                    .collect::<Vec<_>>(),
+                "persistent candidate filtering changed results for {query:?}"
+            );
+        }
+    }
+
+    #[test]
     fn newest_limit_and_block_ranges_prune_candidates() {
         let first = records(0, 100);
         let second = records(100, 100);
@@ -1802,6 +2782,54 @@ mod tests {
             (0..10_000).collect::<Vec<_>>()
         );
         assert_eq!(cursor, encoded.len());
+    }
+
+    #[test]
+    fn delta_posting_checkpoints_preserve_membership() {
+        let ordinals = (0..1_024)
+            .map(|ordinal| ordinal * 2 + 1)
+            .collect::<Vec<_>>();
+        let posting = PostingList::from_ordinals(ordinals.clone()).expect("posting builds");
+        let mut encoded = Vec::new();
+        encode_posting(&posting, &mut encoded).expect("posting encodes");
+        let mut cursor = 0;
+        let (kind, cardinality, end, checkpoints) =
+            scan_posting(&encoded, &mut cursor, 2_100, 0).expect("posting scans");
+        assert_eq!(kind, DELTA_POSTING);
+        assert_eq!(cardinality, ordinals.len());
+        assert_eq!(end, encoded.len());
+        assert!(!checkpoints.is_empty());
+        for ordinal in 0..2_100 {
+            assert_eq!(
+                encoded_posting_contains(&encoded, kind, &checkpoints, ordinal),
+                ordinal % 2 == 1 && ordinal < 2_049,
+                "membership mismatch for ordinal {ordinal}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_posting_checkpoints_preserve_membership() {
+        let ordinals = (0..100)
+            .flat_map(|run| (run * 4)..(run * 4 + 3))
+            .collect::<Vec<_>>();
+        let posting = PostingList::from_ordinals(ordinals.clone()).expect("posting builds");
+        let mut encoded = Vec::new();
+        encode_posting(&posting, &mut encoded).expect("posting encodes");
+        let mut cursor = 0;
+        let (kind, cardinality, end, checkpoints) =
+            scan_posting(&encoded, &mut cursor, 400, 0).expect("posting scans");
+        assert_eq!(kind, RUN_POSTING);
+        assert_eq!(cardinality, ordinals.len());
+        assert_eq!(end, encoded.len());
+        assert!(!checkpoints.is_empty());
+        for ordinal in 0..400 {
+            assert_eq!(
+                encoded_posting_contains(&encoded, kind, &checkpoints, ordinal),
+                ordinal < 399 && ordinal % 4 != 3,
+                "membership mismatch for ordinal {ordinal}"
+            );
+        }
     }
 
     #[test]
@@ -2101,6 +3129,35 @@ mod tests {
     }
 
     #[test]
+    fn case_sensitive_message_literals_reject_case_only_block_candidates() {
+        let records = (0..2)
+            .map(|offset| {
+                DurableLog::new(
+                    ShardId::new(1),
+                    partition(),
+                    LogicalOffset::new(offset),
+                    offset,
+                    "ERROR request failed",
+                    CompressionCohortId::new(1),
+                )
+            })
+            .collect::<Vec<_>>();
+        let index = compatibility_index(&records, 2);
+        let case_sensitive = LogQuery::new(partition()).where_predicate(
+            LogPredicate::message_regex("error", CaseSensitivity::Sensitive)
+                .expect("regex compiles"),
+        );
+        assert!(index.candidate_blocks(&case_sensitive).is_empty());
+        assert!(index.candidate_hits(&case_sensitive).is_empty());
+
+        let case_insensitive = LogQuery::new(partition()).where_predicate(
+            LogPredicate::message_regex("error", CaseSensitivity::Insensitive)
+                .expect("regex compiles"),
+        );
+        assert_eq!(index.candidate_blocks(&case_insensitive), vec![0]);
+    }
+
+    #[test]
     fn every_literal_mode_and_case_policy_retains_unicode_matches() {
         let messages = [
             "İSTANBUL 東京 suffix",
@@ -2178,6 +3235,21 @@ mod tests {
 
         let negation = LogQuery::new(partition()).where_predicate(LogPredicate::negate(missing));
         assert_eq!(index.candidate_blocks(&negation), vec![0, 1]);
+
+        let missing_regex = LogPredicate::message_regex(
+            "impossible-regex-9f82c4\\d+",
+            CaseSensitivity::Insensitive,
+        )
+        .expect("regex compiles");
+        let regex_query = LogQuery::new(partition()).where_predicate(missing_regex.clone());
+        assert!(index.candidate_blocks(&regex_query).is_empty());
+        assert!(cold_matches(&index, &records, 10, &regex_query).is_empty());
+
+        let regex_or = LogQuery::new(partition()).where_predicate(LogPredicate::or(vec![
+            LogPredicate::term("request"),
+            missing_regex,
+        ]));
+        assert_eq!(index.candidate_blocks(&regex_or), vec![0, 1]);
     }
 
     #[test]
@@ -2191,7 +3263,7 @@ mod tests {
             for &second in &lowercase_stable {
                 for &third in &lowercase_stable {
                     let trigram = [first, second, third];
-                    let slot = message_trigram_slot(trigram);
+                    let slot = message_trigram_slot_for_bits(trigram, MESSAGE_TRIGRAM_FILTER_BITS);
                     if let Some(previous) = by_slot[slot]
                         && previous != trigram
                     {
@@ -2227,7 +3299,7 @@ mod tests {
         let index = compatibility_index(&records, 10);
         assert_eq!(
             index.message_trigram_filter_bytes(),
-            3 * MESSAGE_TRIGRAM_FILTER_BYTES
+            3 * (MESSAGE_TRIGRAM_FILTER_BYTES + CASE_SENSITIVE_MESSAGE_TRIGRAM_FILTER_BYTES)
         );
     }
 }

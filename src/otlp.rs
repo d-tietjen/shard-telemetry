@@ -124,9 +124,25 @@ impl OtlpLogDecoder {
     pub fn decode(&self, payload: &[u8]) -> TelemetryResult<Vec<OtlpLogEvent>> {
         let request = ExportLogsServiceRequest::decode(payload)
             .map_err(|error| TelemetryError::InvalidOtlpPayload(error.to_string()))?;
-        let mut events = Vec::new();
+        self.decode_request(&request)
+    }
+
+    /// Decodes an already parsed OTLP Logs export request without a
+    /// protobuf encode/decode round trip.
+    pub(crate) fn decode_request(
+        &self,
+        request: &ExportLogsServiceRequest,
+    ) -> TelemetryResult<Vec<OtlpLogEvent>> {
+        let event_count = request
+            .resource_logs
+            .iter()
+            .flat_map(|resource_logs| &resource_logs.scope_logs)
+            .fold(0usize, |count, scope_logs| {
+                count.saturating_add(scope_logs.log_records.len())
+            });
+        let mut events = Vec::with_capacity(event_count);
         for resource_logs in &request.resource_logs {
-            events.extend(decode_resource_logs(resource_logs)?);
+            decode_resource_logs(resource_logs, &mut events)?;
         }
         Ok(events)
     }
@@ -160,67 +176,63 @@ impl OtlpLogDecoder {
     }
 }
 
-fn decode_resource_logs(resource_logs: &ResourceLogs) -> TelemetryResult<Vec<OtlpLogEvent>> {
+fn decode_resource_logs(
+    resource_logs: &ResourceLogs,
+    output: &mut Vec<OtlpLogEvent>,
+) -> TelemetryResult<()> {
     let resource_fields = resource_logs
         .resource
         .as_ref()
         .map_or_else(Vec::new, resource_fields);
     let resource = Arc::new(resource_context(resource_logs));
-    let mut events = Vec::new();
     for scope_logs in &resource_logs.scope_logs {
-        events.extend(decode_scope_logs(
-            scope_logs,
-            &resource_fields,
-            Arc::clone(&resource),
-        )?);
+        decode_scope_logs(scope_logs, &resource_fields, Arc::clone(&resource), output)?;
     }
-    Ok(events)
+    Ok(())
 }
 
 fn decode_scope_logs(
     scope_logs: &ScopeLogs,
     resource_fields: &[MetadataField],
     resource: Arc<ResourceContext>,
-) -> TelemetryResult<Vec<OtlpLogEvent>> {
+    output: &mut Vec<OtlpLogEvent>,
+) -> TelemetryResult<()> {
     let scope_fields = scope_fields(scope_logs.scope.as_ref());
     let scope = Arc::new(scope_context(scope_logs));
     let resource_id = resource.id().to_string();
     let scope_id = scope.id().to_string();
     let compression_cohort = compression_cohort(resource_fields, scope_logs.scope.as_ref());
-    scope_logs
-        .log_records
-        .iter()
-        .map(|record| {
-            let mut fields = Vec::with_capacity(
-                resource_fields.len() + scope_fields.len() + record.attributes.len() + 8,
-            );
-            fields.extend_from_slice(resource_fields);
-            fields.extend_from_slice(&scope_fields);
-            fields.push(MetadataField::new("otel.resource.id", resource_id.clone()));
-            fields.push(MetadataField::new("otel.scope.id", scope_id.clone()));
-            fields.extend(record_fields(record));
-            let trace_id = optional_trace_id(&record.trace_id)?;
-            let span_id = optional_span_id(&record.span_id)?;
-            Ok(OtlpLogEvent {
-                timestamp_unix_nanos: record.time_unix_nano,
-                observed_timestamp_unix_nanos: record.observed_time_unix_nano,
-                body: record.body.as_ref().map(decode_telemetry_value),
-                message: body_text(record.body.as_ref()),
-                fields: Arc::new(fields),
-                attributes: Arc::new(decode_telemetry_attributes(&record.attributes)),
-                resource: Arc::clone(&resource),
-                scope: Arc::clone(&scope),
-                severity_number: record.severity_number,
-                severity_text: Arc::from(record.severity_text.as_str()),
-                dropped_attributes_count: record.dropped_attributes_count,
-                flags: record.flags,
-                trace_id,
-                span_id,
-                event_name: Arc::from(record.event_name.as_str()),
-                compression_cohort,
-            })
-        })
-        .collect()
+    for record in &scope_logs.log_records {
+        let mut fields = Vec::with_capacity(
+            resource_fields.len() + scope_fields.len() + record.attributes.len() + 8,
+        );
+        fields.extend_from_slice(resource_fields);
+        fields.extend_from_slice(&scope_fields);
+        fields.push(MetadataField::new("otel.resource.id", resource_id.clone()));
+        fields.push(MetadataField::new("otel.scope.id", scope_id.clone()));
+        fields.extend(record_fields(record));
+        let trace_id = optional_trace_id(&record.trace_id)?;
+        let span_id = optional_span_id(&record.span_id)?;
+        output.push(OtlpLogEvent {
+            timestamp_unix_nanos: record.time_unix_nano,
+            observed_timestamp_unix_nanos: record.observed_time_unix_nano,
+            body: record.body.as_ref().map(decode_telemetry_value),
+            message: body_text(record.body.as_ref()),
+            fields: Arc::new(fields),
+            attributes: Arc::new(decode_telemetry_attributes(&record.attributes)),
+            resource: Arc::clone(&resource),
+            scope: Arc::clone(&scope),
+            severity_number: record.severity_number,
+            severity_text: Arc::from(record.severity_text.as_str()),
+            dropped_attributes_count: record.dropped_attributes_count,
+            flags: record.flags,
+            trace_id,
+            span_id,
+            event_name: Arc::from(record.event_name.as_str()),
+            compression_cohort,
+        });
+    }
+    Ok(())
 }
 
 fn resource_context(resource_logs: &ResourceLogs) -> ResourceContext {

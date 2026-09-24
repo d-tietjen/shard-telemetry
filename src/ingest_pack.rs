@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use shard_stream_core::LogicalOffset;
@@ -109,7 +110,7 @@ pub(crate) struct IndexedIngestFrame {
     pub(crate) min_timestamp_unix_nanos: u64,
     pub(crate) max_timestamp_unix_nanos: u64,
     pub(crate) compressed: Bytes,
-    pub(crate) index: EmbeddedFrameIndex,
+    pub(crate) index: Arc<EmbeddedFrameIndex>,
 }
 
 #[cfg(test)]
@@ -119,6 +120,23 @@ pub(crate) fn encode_ingest_pack(events: &[OtlpLogEvent]) -> TelemetryResult<Vec
 
 pub(crate) fn prepare_ingest_pack(events: &[OtlpLogEvent]) -> TelemetryResult<PreparedIngestPack> {
     let record_count = u32::try_from(events.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+    if let Some(cohort) = events.first().map(|event| event.compression_cohort)
+        && events
+            .iter()
+            .all(|event| event.compression_cohort == cohort)
+    {
+        let records = events
+            .iter()
+            .enumerate()
+            .map(|(ordinal, event)| {
+                Ok(IngestRecordView {
+                    ordinal: u32::try_from(ordinal).map_err(|_| TelemetryError::RecordTooLarge)?,
+                    event,
+                })
+            })
+            .collect::<TelemetryResult<Vec<_>>>()?;
+        return prepare_single_cohort_ingest_pack(&records, cohort);
+    }
     let mut cohorts = BTreeMap::<CompressionCohortId, Vec<IngestRecordView<'_>>>::new();
     for (ordinal, event) in events.iter().enumerate() {
         cohorts
@@ -350,6 +368,28 @@ pub(crate) fn decode_indexed_ingest_frames(
     transient_context: Option<&[u8]>,
     expected_record_count: u32,
 ) -> TelemetryResult<Vec<IndexedIngestFrame>> {
+    decode_indexed_ingest_frames_inner(payload, transient_context, expected_record_count, true)
+}
+
+/// Decodes a live append whose complete ingest pack was already validated by
+/// the durable sink factory. The immutable payload is forwarded unchanged
+/// after validation, so hashing every compressed group again only duplicates
+/// CPU work on the live path. Recovery continues through
+/// [`decode_indexed_ingest_frames`] and validates the persisted bytes.
+pub(crate) fn decode_indexed_ingest_frames_after_validation(
+    payload: Bytes,
+    transient_context: Option<&[u8]>,
+    expected_record_count: u32,
+) -> TelemetryResult<Vec<IndexedIngestFrame>> {
+    decode_indexed_ingest_frames_inner(payload, transient_context, expected_record_count, false)
+}
+
+fn decode_indexed_ingest_frames_inner(
+    payload: Bytes,
+    transient_context: Option<&[u8]>,
+    expected_record_count: u32,
+    validate_checksums: bool,
+) -> TelemetryResult<Vec<IndexedIngestFrame>> {
     let mut cursor = IngestPackCursor::new(&payload, expected_record_count)?;
     let mut transient = transient_context
         .filter(|context| context.starts_with(TRANSIENT_PACK_MAGIC))
@@ -358,7 +398,17 @@ pub(crate) fn decode_indexed_ingest_frames(
     let mut frames = Vec::with_capacity(cursor.group_count);
     for _ in 0..cursor.group_count {
         let group = cursor.next_group()?;
-        validate_group(&group)?;
+        if validate_checksums {
+            validate_group(&group)?;
+        } else if group.record_count == 0
+            || group.structural_bytes == 0
+            || group.structural_bytes > MAX_INGEST_STRUCTURAL_BYTES
+            || group.min_timestamp_unix_nanos > group.max_timestamp_unix_nanos
+        {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "invalid compressed ingest group",
+            ));
+        }
         let index = if let Some(transient) = transient.as_mut() {
             let live = transient.next_group()?;
             if live.cohort != group.cohort
@@ -387,7 +437,7 @@ pub(crate) fn decode_indexed_ingest_frames(
             min_timestamp_unix_nanos: group.min_timestamp_unix_nanos,
             max_timestamp_unix_nanos: group.max_timestamp_unix_nanos,
             compressed: payload.slice(group.compressed_range),
-            index,
+            index: Arc::new(index),
         });
     }
     cursor.finish()?;
@@ -397,6 +447,7 @@ pub(crate) fn decode_indexed_ingest_frames(
     Ok(frames)
 }
 
+#[allow(dead_code)]
 pub(crate) fn decode_indexed_ingest_records(
     frame: &IndexedIngestFrame,
     record_ordinals: &[u32],
@@ -671,6 +722,27 @@ mod tests {
     }
 
     #[test]
+    fn homogeneous_ingest_pack_uses_one_indexed_group() {
+        let events = (0..32)
+            .map(|ordinal| OtlpLogEvent {
+                timestamp_unix_nanos: 100 + ordinal,
+                message: Arc::from(format!("request id={ordinal} completed")),
+                compression_cohort: CompressionCohortId::new(7),
+                ..OtlpLogEvent::default()
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_ingest_pack(&events).expect("homogeneous pack prepares");
+        let frames = decode_indexed_ingest_frames(
+            Bytes::from(prepared.payload),
+            Some(&prepared.transient_context),
+            events.len() as u32,
+        )
+        .expect("homogeneous pack indexes");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].cohort, CompressionCohortId::new(7));
+    }
+
+    #[test]
     fn compressor_index_is_reused_live_and_recovered_from_durable_frames() {
         let events = (0..64)
             .map(|ordinal| OtlpLogEvent {
@@ -691,6 +763,29 @@ mod tests {
             events.len() as u32,
         )
         .expect("live indexes install");
+        let live_after_validation = decode_indexed_ingest_frames_after_validation(
+            Bytes::from(prepared.payload.clone()),
+            Some(&prepared.transient_context),
+            events.len() as u32,
+        )
+        .expect("validated live indexes install");
+        assert_eq!(live.len(), live_after_validation.len());
+        for (validated, fast) in live.iter().zip(&live_after_validation) {
+            assert_eq!(validated.frame_id, fast.frame_id);
+            assert_eq!(validated.cohort, fast.cohort);
+            assert_eq!(validated.record_count, fast.record_count);
+            assert_eq!(validated.structural_bytes, fast.structural_bytes);
+            assert_eq!(
+                validated.min_timestamp_unix_nanos,
+                fast.min_timestamp_unix_nanos
+            );
+            assert_eq!(
+                validated.max_timestamp_unix_nanos,
+                fast.max_timestamp_unix_nanos
+            );
+            assert_eq!(validated.compressed, fast.compressed);
+            assert_eq!(validated.index, fast.index);
+        }
         let recovered =
             decode_indexed_ingest_frames(Bytes::from(prepared.payload), None, events.len() as u32)
                 .expect("durable indexes recover");

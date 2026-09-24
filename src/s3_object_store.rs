@@ -23,6 +23,8 @@ use crate::{ObjectMetadata, TelemetryError, TelemetryObjectStore, TelemetryResul
 const BLAKE3_METADATA_KEY: &str = "shard-telemetry-blake3";
 const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MULTIPART_CONCURRENCY: usize = 4;
+const DEFAULT_RUNTIME_WORKER_THREADS: usize = 4;
+const MAX_RUNTIME_WORKER_THREADS: usize = 64;
 
 type CloudTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type CloudTask = Box<dyn FnOnce(Arc<DynObjectStore>) -> CloudTaskFuture + Send + 'static>;
@@ -103,7 +105,25 @@ impl std::fmt::Debug for S3ObjectStore {
 impl S3ObjectStore {
     /// Builds an S3 client and starts its shared asynchronous I/O runtime.
     pub fn open(config: S3ObjectStoreConfig) -> TelemetryResult<Self> {
+        Self::open_with_threads(config, None)
+    }
+
+    /// Builds an S3 client with an optional bounded runtime worker budget.
+    ///
+    /// The server supplies its configured CPU budget here. Standalone callers
+    /// retain the four-worker default because object-store I/O is independent
+    /// of the durable store's shard count in that mode.
+    pub fn open_with_threads(
+        config: S3ObjectStoreConfig,
+        configured_threads: Option<usize>,
+    ) -> TelemetryResult<Self> {
         config.validate()?;
+        let worker_threads = configured_threads.unwrap_or(DEFAULT_RUNTIME_WORKER_THREADS);
+        if !(1..=MAX_RUNTIME_WORKER_THREADS).contains(&worker_threads) {
+            return Err(TelemetryError::InvalidConfiguration(
+                "S3 runtime worker threads must be in 1..=64".into(),
+            ));
+        }
         let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(&config.bucket)
             .with_allow_http(config.allow_http)
@@ -123,7 +143,7 @@ impl S3ObjectStore {
             .name("shard-telemetry-s3".into())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(4)
+                    .worker_threads(worker_threads)
                     .enable_all()
                     .thread_name("shard-telemetry-s3-io")
                     .build()
@@ -606,6 +626,20 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn runtime_worker_budget_is_bounded_before_client_creation() {
+        let config = S3ObjectStoreConfig {
+            bucket: "bucket".into(),
+            prefix: String::new(),
+            region: Some("us-east-1".into()),
+            endpoint: None,
+            allow_http: false,
+            virtual_hosted_style: false,
+        };
+        assert!(S3ObjectStore::open_with_threads(config.clone(), Some(0)).is_err());
+        assert!(S3ObjectStore::open_with_threads(config, Some(65)).is_err());
     }
 
     #[test]

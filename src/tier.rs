@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use shard_stream_core::{ShardId, TopicPartition};
 
+use crate::tier_ingest::DecodedTierIngestAppend;
 use crate::{
     BlockCatalog, BlockDescriptor, BlockId, CompressionCodec, CorrelationBlockFilter,
     CorrelationQuery, TelemetryError, TelemetryResult, TelemetrySignal,
@@ -2943,6 +2944,7 @@ struct MemoryCacheEntry {
 enum ParsedControlObject {
     CatalogPage(Arc<CatalogPage>),
     GroupManifest(Arc<TierGroupManifest>),
+    TierIngestGroup(Arc<[DecodedTierIngestAppend]>),
 }
 
 #[derive(Debug)]
@@ -3501,7 +3503,9 @@ impl SsdObjectCache {
                     entry.stamp = stamp;
                     Some(Arc::clone(page))
                 }
-                ParsedControlObject::GroupManifest(_) => None,
+                ParsedControlObject::GroupManifest(_) | ParsedControlObject::TierIngestGroup(_) => {
+                    None
+                }
             });
         if page.is_some() {
             state.hits = state.hits.saturating_add(1);
@@ -3529,13 +3533,57 @@ impl SsdObjectCache {
                         entry.stamp = stamp;
                         Some(Arc::clone(manifest))
                     }
-                    ParsedControlObject::CatalogPage(_) => None,
+                    ParsedControlObject::CatalogPage(_)
+                    | ParsedControlObject::TierIngestGroup(_) => None,
                 });
         if manifest.is_some() {
             state.hits = state.hits.saturating_add(1);
             state.parsed_hits = state.parsed_hits.saturating_add(1);
         }
         Ok(manifest)
+    }
+
+    pub(crate) fn parsed_tier_ingest_hit(
+        &self,
+        cache_key: &str,
+    ) -> TelemetryResult<Option<Arc<[DecodedTierIngestAppend]>>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
+        state.clock = state.clock.wrapping_add(1);
+        let stamp = state.clock;
+        let appends =
+            state
+                .parsed_entries
+                .get_mut(cache_key)
+                .and_then(|entry| match &entry.object {
+                    ParsedControlObject::TierIngestGroup(appends) => {
+                        entry.stamp = stamp;
+                        Some(Arc::clone(appends))
+                    }
+                    ParsedControlObject::CatalogPage(_) | ParsedControlObject::GroupManifest(_) => {
+                        None
+                    }
+                });
+        if appends.is_some() {
+            state.hits = state.hits.saturating_add(1);
+            state.parsed_hits = state.parsed_hits.saturating_add(1);
+        }
+        Ok(appends)
+    }
+
+    pub(crate) fn admit_parsed_tier_ingest(
+        &self,
+        cache_key: String,
+        appends: Arc<[DecodedTierIngestAppend]>,
+        source_bytes: u64,
+    ) -> TelemetryResult<()> {
+        self.admit_parsed_control(
+            cache_key,
+            ParsedControlObject::TierIngestGroup(appends),
+            source_bytes,
+        )
     }
 
     fn admit_parsed_control(
@@ -3788,7 +3836,7 @@ pub fn write_staged_payload_pack(
             .checked_add(descriptor.stored_bytes)
             .ok_or_else(|| TelemetryError::ObjectStore("payload-pack length overflow".into()))?;
     }
-    file.sync_all()
+    file.sync_data()
         .map_err(|error| storage_io("sync staged payload pack", error))?;
     sync_parent(destination)?;
     Ok(entries)
@@ -4093,7 +4141,7 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> TelemetryResult<()> {
     let result = (|| {
         file.write_all(bytes)
             .map_err(|error| storage_io("write temporary object", error))?;
-        file.sync_all()
+        file.sync_data()
             .map_err(|error| storage_io("sync temporary object", error))?;
         fs::rename(&temporary, path)
             .map_err(|error| storage_io("publish temporary object", error))?;
@@ -4137,7 +4185,7 @@ fn copy_file_atomically(source: &Path, destination: &Path) -> TelemetryResult<Ob
                 .ok_or_else(|| TelemetryError::StorageIo("object length overflow".into()))?;
         }
         output
-            .sync_all()
+            .sync_data()
             .map_err(|error| storage_io("sync temporary object", error))?;
         fs::rename(&temporary, destination)
             .map_err(|error| storage_io("publish temporary object", error))?;

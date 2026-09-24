@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ST_ENGINE_DATA_DIR:?ST_ENGINE_DATA_DIR must be set}"
+mkdir -p "$ST_ENGINE_DATA_DIR"
+rm -rf -- "$ST_ENGINE_DATA_DIR/data"
+mkdir -p "$ST_ENGINE_DATA_DIR/data"
+printf '%s\n' "$ST_TOKEN" >"$ST_TOKEN_FILE"
+chmod 0600 "$ST_TOKEN_FILE"

@@ -111,15 +111,21 @@ let metrics = Runtime::new(RuntimeConfig::default());
 let exporter = embedded.attach(|| FastTelemetryExporter::new(
     metrics,
     Arc::clone(&embedded),
-    FastTelemetryConfig::new("device", "my-app"),
+    FastTelemetryConfig::new("device", "my-app").with_max_series(10_000),
 ))?;
 embedded.mark_ready()?;
+let maintenance = embedded.spawn_maintenance(Duration::from_secs(60))?;
 ~~~
 
-Drive `exporter.export_once()` at `exporter.interval()` and call
-`embedded.compact_retention()` periodically. Queries against the embedded
-runtime are immediately clipped to the configured recent window. Complete
-groups beyond the time or local payload budget are removed oldest-first.
+Drive `exporter.export_once()` at `exporter.interval()` and retain the built-in
+maintenance handle until shutdown. Alternatively, call
+`embedded.compact_retention()` from a host scheduler. Queries against the
+embedded runtime are immediately clipped to the configured recent window.
+Complete groups beyond the time or local payload budget are removed
+oldest-first. `embedded.storage_health()` reports complete logical and
+allocated directory bytes, rollup bytes and series, WAL payload bytes, index
+backlog, retention failures, quota headroom, and the last successful
+maintenance time.
 
 Use `EmbeddedEvictionPolicy::OffloadToS3` instead of `Delete` to preserve full
 raw history. Publication is write-through: a group becomes authoritative in a
@@ -135,6 +141,36 @@ bound storage-engine state and steady-state local data; transient request/query
 allocations, filesystem metadata, and one in-flight WAL/spool group require
 operational headroom.
 
+## Hard-quota offline product usage
+
+Do not use arbitrary metric rollups when the product requires a hard sub-1 MiB
+usage-data contract. `EmbeddedUsageLedger` is a separate fixed-schema path for
+an allowlist of feature counters, total active seconds, and optional fixed
+monthly buckets. It stores two compressed, checksummed generations in one
+preallocated and exclusively locked file; it has no WAL, spool, or temporary
+rewrite file.
+
+~~~rust
+use shard_telemetry::{EmbeddedUsageLedger, EmbeddedUsageLedgerConfig};
+
+let usage = EmbeddedUsageLedger::open(
+    EmbeddedUsageLedgerConfig::new(
+        "/var/lib/my-app/usage.ledger",
+        ["search", "export", "share"],
+    )
+    .with_monthly_buckets(12)
+    .with_max_file_bytes(1024 * 1024),
+)?;
+usage.record_batch(30, [("search", 1)])?;
+~~~
+
+The maximum possible file size is calculated before creation and physical disk
+space is reserved at open. For the covered 100-feature, 12-month profile, the
+complete file is below 64 KiB. Unknown features fail the whole update by
+default or may be directed to one fixed overflow counter. See
+[EMBEDDED_USAGE.md](EMBEDDED_USAGE.md) for format, recovery, quota, and health
+details.
+
 ## Documentation
 
 | Topic | Reference |
@@ -146,6 +182,7 @@ operational headroom.
 | Query planning and index behavior | [QUERY_ARCHITECTURE.md](QUERY_ARCHITECTURE.md) |
 | Compression layout and policy | [COMPRESSION_ARCHITECTURE.md](COMPRESSION_ARCHITECTURE.md) |
 | Object tier, recovery, and retention | [TIERED_STORAGE_ARCHITECTURE.md](TIERED_STORAGE_ARCHITECTURE.md) |
+| Hard-quota offline product usage | [EMBEDDED_USAGE.md](EMBEDDED_USAGE.md) |
 | Deployment examples | [deploy/README.md](deploy/README.md) |
 | Benchmark method and harnesses | [BENCHMARKS.md](BENCHMARKS.md) |
 | Release procedure | [RELEASING.md](RELEASING.md) |

@@ -1,10 +1,11 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::cell::RefCell;
+use std::hash::{BuildHasher, Hash};
 use std::mem::size_of;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use foldhash::{HashMap, HashMapExt};
 use pco::standalone::{simple_compress, simple_decompress_into};
 use pco::{ChunkConfig, DeltaSpec, ModeSpec};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ const STRUCTURAL_BLOCK_MAGIC: &[u8; 4] = b"STLG";
 const DIRECT_ATTRIBUTE_VALUE: u8 = 0;
 const DICTIONARY_ATTRIBUTE_VALUE: u8 = 1;
 const TIMESTAMP_PCO_LEVEL: usize = 8;
+const TYPED_METADATA_ZSTD_LEVEL: i32 = 1;
 const MESSAGE_LAYOUT_CACHE_ENTRIES: usize = 1_024;
 const FIELD_SET_CACHE_ENTRIES: usize = 1_024;
 const EMPTY_MESSAGE_LAYOUT: u32 = u32::MAX;
@@ -36,7 +38,16 @@ const PACKED_IDS_BITPACKED: u8 = 0;
 const PACKED_IDS_RUN_LENGTH: u8 = 1;
 const PACKED_IDS_POSITION_ORDERED: u8 = 1 << 7;
 
-type DecodedAttributeTables = (Vec<Arc<str>>, Vec<Vec<Arc<str>>>);
+thread_local! {
+    static TYPED_METADATA_COMPRESSOR: RefCell<zstd::bulk::Compressor<'static>> =
+        RefCell::new(zstd::bulk::Compressor::new(TYPED_METADATA_ZSTD_LEVEL)
+            .expect("typed metadata zstd level is valid"));
+    static TYPED_METADATA_DECOMPRESSOR: RefCell<zstd::bulk::Decompressor<'static>> =
+        RefCell::new(zstd::bulk::Decompressor::new()
+            .expect("typed metadata zstd decompressor initializes"));
+}
+
+pub(crate) type DecodedAttributeTables = (Vec<Arc<str>>, Vec<Vec<Arc<str>>>);
 
 struct SeekableRecordLane<'a> {
     interval: usize,
@@ -155,7 +166,7 @@ const EMPTY_STRING_ID: u32 = 0;
 const STRING_DICTIONARY_ID_BASE: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PackedLogMetadataRow {
+pub(crate) struct PackedLogMetadataRow {
     observed_timestamp_delta: i64,
     body_id: u32,
     attributes_id: u32,
@@ -173,7 +184,7 @@ struct PackedLogMetadataRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PackedLogMetadata {
+pub(crate) struct PackedLogMetadata {
     bodies: Vec<TelemetryValue>,
     attribute_sets: Vec<Arc<Vec<TelemetryAttribute>>>,
     resources: Vec<Arc<ResourceContext>>,
@@ -201,9 +212,7 @@ impl<T> MetadataInterner<T> {
         equals: impl Fn(&T, &Q) -> bool,
         own: impl FnOnce(&Q) -> T,
     ) -> TelemetryResult<u32> {
-        let mut hasher = DefaultHasher::new();
-        value.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = foldhash::fast::FixedState::with_seed(0x5354_5255_4354_5552).hash_one(value);
         if let Some(candidates) = self.candidates.get(&hash) {
             for candidate in candidates {
                 let index =
@@ -443,6 +452,61 @@ impl EmbeddedFrameIndex {
         self.timestamp_offset_ordinal_ordered
     }
 
+    pub(crate) fn cache_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.layout_ids.values.capacity())
+            .saturating_add(
+                self.residual_layout_ids
+                    .capacity()
+                    .saturating_mul(size_of::<u32>()),
+            )
+            .saturating_add(
+                self.term_membership
+                    .words
+                    .len()
+                    .saturating_mul(size_of::<u64>()),
+            )
+            .saturating_add(
+                self.terms
+                    .capacity()
+                    .saturating_mul(size_of::<EmbeddedTermLocator>()),
+            )
+            .saturating_add(
+                self.terms
+                    .iter()
+                    .map(|locator| {
+                        locator
+                            .layout_ids
+                            .capacity()
+                            .saturating_mul(size_of::<u32>())
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.field_set_ids.values.capacity())
+            .saturating_add(
+                self.field_membership
+                    .words
+                    .len()
+                    .saturating_mul(size_of::<u64>()),
+            )
+            .saturating_add(
+                self.fields
+                    .capacity()
+                    .saturating_mul(size_of::<EmbeddedFieldLocator>()),
+            )
+            .saturating_add(
+                self.fields
+                    .iter()
+                    .map(|locator| {
+                        locator
+                            .field_set_ids
+                            .capacity()
+                            .saturating_mul(size_of::<u32>())
+                    })
+                    .sum::<usize>(),
+            )
+    }
+
     /// Returns a lossless candidate superset for a case-insensitive token.
     #[must_use]
     pub fn term_candidate_ordinals(&self, term: &str) -> Vec<u32> {
@@ -467,6 +531,86 @@ impl EmbeddedFrameIndex {
             &selected,
         )
         .expect("validated embedded layout column")
+    }
+
+    /// Returns the template layouts whose static literals contain a candidate
+    /// for `term`. Records that use the fallback layout or a layout with
+    /// dynamic values are deliberately excluded; callers can verify those
+    /// records after selective decode.
+    pub(crate) fn term_layout_ids(&self, term: &str) -> Vec<u32> {
+        let normalized = normalize_index_term(term);
+        if !self.term_membership.might_contain(normalized.as_bytes()) {
+            return Vec::new();
+        }
+        let fingerprint = index_fingerprint(membership_hash(normalized.as_bytes()));
+        self.terms
+            .binary_search_by_key(&fingerprint, |locator| locator.fingerprint)
+            .ok()
+            .map(|position| self.terms[position].layout_ids.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn term_might_contain(&self, term: &str) -> bool {
+        let normalized = normalize_index_term(term);
+        self.term_membership.might_contain(normalized.as_bytes())
+    }
+
+    pub(crate) fn residual_layout_ids(&self) -> &[u32] {
+        &self.residual_layout_ids
+    }
+
+    /// Materializes record ordinals for a set of validated layout IDs.
+    pub(crate) fn record_ordinals_for_layout_ids(&self, layout_ids: &[u32]) -> Vec<u32> {
+        matching_packed_ids(
+            &self.layout_ids,
+            self.record_count,
+            self.layout_count,
+            layout_ids,
+        )
+        .expect("validated embedded layout column")
+    }
+
+    /// Returns a lossless candidate superset for the union of token terms.
+    ///
+    /// The union is resolved against the packed layout column in one pass so
+    /// OR predicates do not allocate and scan one ordinal vector per term.
+    #[must_use]
+    pub fn term_candidate_ordinals_union(&self, terms: &[&str]) -> Vec<u32> {
+        if terms.is_empty() || self.record_count == 0 {
+            return Vec::new();
+        }
+        let mut selected_ids =
+            vec![false; usize::try_from(self.layout_count).expect("validated layout count")];
+        let mut any_term = false;
+        for term in terms {
+            let normalized = normalize_index_term(term);
+            if !self.term_membership.might_contain(normalized.as_bytes()) {
+                continue;
+            }
+            any_term = true;
+            for layout_id in &self.residual_layout_ids {
+                selected_ids[*layout_id as usize] = true;
+            }
+            let fingerprint = index_fingerprint(membership_hash(normalized.as_bytes()));
+            if let Ok(position) = self
+                .terms
+                .binary_search_by_key(&fingerprint, |locator| locator.fingerprint)
+            {
+                for layout_id in &self.terms[position].layout_ids {
+                    selected_ids[*layout_id as usize] = true;
+                }
+            }
+        }
+        if !any_term {
+            return Vec::new();
+        }
+        let mut ordinals = Vec::new();
+        for ordinal in 0..self.record_count {
+            if selected_ids[packed_id(&self.layout_ids, ordinal) as usize] {
+                ordinals.push(ordinal);
+            }
+        }
+        ordinals
     }
 
     /// Returns a lossless candidate superset for a metadata key/value pair.
@@ -1258,6 +1402,114 @@ pub fn decode_structural_records(
     encoded: &[u8],
     record_ordinals: &[u32],
 ) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
+    decode_structural_records_internal(encoded, record_ordinals, true, None, None)
+}
+
+#[cfg(test)]
+pub(crate) fn decode_structural_records_without_typed_metadata_with_embedded_index_and_templates(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    embedded_index: &EmbeddedFrameIndex,
+    templates: &[Vec<Vec<u8>>],
+    include_fields: bool,
+) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
+    decode_structural_records_internal_with_projection_and_messages(
+        encoded,
+        record_ordinals,
+        false,
+        None,
+        Some(embedded_index),
+        if include_fields {
+            FieldProjection::All
+        } else {
+            FieldProjection::SeverityText
+        },
+        None,
+        Some(templates),
+        None,
+        None,
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn decode_structural_records_without_typed_metadata_with_embedded_index_and_severity_text(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    embedded_index: &EmbeddedFrameIndex,
+) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
+    decode_structural_records_internal_with_projection(
+        encoded,
+        record_ordinals,
+        false,
+        None,
+        Some(embedded_index),
+        FieldProjection::SeverityText,
+    )
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum FieldProjection {
+    All,
+    SeverityText,
+    None,
+}
+
+fn decode_structural_records_internal(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    include_typed_metadata: bool,
+    cached_typed_metadata: Option<&PackedLogMetadata>,
+    cached_embedded_index: Option<&EmbeddedFrameIndex>,
+) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
+    decode_structural_records_internal_with_projection(
+        encoded,
+        record_ordinals,
+        include_typed_metadata,
+        cached_typed_metadata,
+        cached_embedded_index,
+        FieldProjection::All,
+    )
+}
+
+fn decode_structural_records_internal_with_projection(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    include_typed_metadata: bool,
+    cached_typed_metadata: Option<&PackedLogMetadata>,
+    cached_embedded_index: Option<&EmbeddedFrameIndex>,
+    field_projection: FieldProjection,
+) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
+    decode_structural_records_internal_with_projection_and_messages(
+        encoded,
+        record_ordinals,
+        include_typed_metadata,
+        cached_typed_metadata,
+        cached_embedded_index,
+        field_projection,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_structural_records_internal_with_projection_and_messages(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    include_typed_metadata: bool,
+    cached_typed_metadata: Option<&PackedLogMetadata>,
+    cached_embedded_index: Option<&EmbeddedFrameIndex>,
+    field_projection: FieldProjection,
+    cached_messages: Option<&[Arc<str>]>,
+    cached_templates: Option<&[Vec<Vec<u8>>]>,
+    cached_positions: Option<(&[LogicalOffset], &[u64])>,
+    cached_attributes: Option<&DecodedAttributeTables>,
+    cached_fields: Option<&[Arc<Vec<MetadataField>>]>,
+) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
     if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
         return Err(TelemetryError::InvalidBlockEncoding(
             "missing structural block magic",
@@ -1282,67 +1534,202 @@ pub fn decode_structural_records(
     if cursor != encoded.len() {
         return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
     }
-    let embedded_index = EmbeddedFrameIndex::decode(
-        embedded_index_section,
-        u32::try_from(record_count).map_err(|_| TelemetryError::RecordTooLarge)?,
-    )?;
+    let embedded_index = match cached_embedded_index {
+        Some(index) => Cow::Borrowed(index),
+        None => Cow::Owned(EmbeddedFrameIndex::decode(
+            embedded_index_section,
+            u32::try_from(record_count).map_err(|_| TelemetryError::RecordTooLarge)?,
+        )?),
+    };
     if embedded_index.record_count as usize != record_count {
         return Err(TelemetryError::InvalidBlockEncoding(
             "embedded index record count mismatch",
         ));
     }
-    let offsets = decode_offsets(offsets_section, record_count)?;
-    let timestamps = decode_timestamps(timestamps_section, record_count)?;
-    let templates = decode_templates(templates_section)?;
-    let messages = decode_selected_bodies(
-        bodies_section,
-        &templates,
-        &embedded_index,
-        record_count,
-        record_ordinals,
-    )?;
-    let attributes = decode_attribute_tables(attributes_section)?;
-    let fields =
-        decode_selected_fields(fields_section, &attributes, record_count, record_ordinals)?;
-    let typed_metadata = decode_selected_typed_metadata(
-        typed_metadata_section,
-        record_count,
-        record_ordinals,
-        &timestamps,
-        &messages,
-        &fields,
-    )?;
+    let offsets = match cached_positions {
+        Some((offsets, _)) if offsets.len() == record_count => Cow::Borrowed(offsets),
+        Some(_) => {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "cached offset count does not match record count",
+            ));
+        }
+        None => Cow::Owned(decode_offsets(offsets_section, record_count)?),
+    };
+    let timestamps = match cached_positions {
+        Some((_, timestamps)) if timestamps.len() == record_count => Cow::Borrowed(timestamps),
+        Some(_) => {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "cached timestamp count does not match record count",
+            ));
+        }
+        None => Cow::Owned(decode_timestamps(timestamps_section, record_count)?),
+    };
+    let messages = if let Some(messages) = cached_messages {
+        if messages.len() != record_ordinals.len() {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "cached message count does not match selected ordinals",
+            ));
+        }
+        Cow::Borrowed(messages)
+    } else {
+        let templates = cached_templates
+            .map(Cow::Borrowed)
+            .map_or_else(|| decode_templates(templates_section).map(Cow::Owned), Ok)?;
+        Cow::Owned(decode_selected_bodies(
+            bodies_section,
+            &templates,
+            &embedded_index,
+            record_count,
+            record_ordinals,
+        )?)
+    };
+    let fields = match field_projection {
+        FieldProjection::All => {
+            let attributes = match cached_attributes {
+                Some(attributes) => Cow::Borrowed(attributes),
+                None => Cow::Owned(decode_attribute_tables(attributes_section)?),
+            };
+            if let Some(cached_fields) = cached_fields {
+                if cached_fields.len() != record_ordinals.len() {
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "cached field count does not match selected ordinals",
+                    ));
+                }
+                Cow::Borrowed(cached_fields)
+            } else {
+                Cow::Owned(decode_selected_fields(
+                    fields_section,
+                    &attributes,
+                    record_count,
+                    record_ordinals,
+                )?)
+            }
+        }
+        FieldProjection::SeverityText => {
+            let attributes = match cached_attributes {
+                Some(attributes) => Cow::Borrowed(attributes),
+                None => Cow::Owned(decode_attribute_tables(attributes_section)?),
+            };
+            Cow::Owned(decode_selected_fields_for_keys(
+                fields_section,
+                &attributes,
+                record_count,
+                record_ordinals,
+                &["otel.severity_text", "attr.loki.metadata.severity_text"],
+            )?)
+        }
+        FieldProjection::None => Cow::Owned(projected_empty_metadata_fields(record_ordinals.len())),
+    };
     let mut decoded = Vec::with_capacity(record_ordinals.len());
-    for (((record_ordinal, message), fields), metadata) in record_ordinals
-        .iter()
-        .copied()
-        .zip(messages)
-        .zip(fields)
-        .zip(typed_metadata)
-    {
-        let index = usize::try_from(record_ordinal).map_err(|_| {
-            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
-        })?;
-        decoded.push(DecodedStructuralRecord {
-            offset: offsets[index],
-            timestamp_unix_nanos: timestamps[index],
-            message,
-            fields,
-            observed_timestamp_unix_nanos: metadata.observed_timestamp_unix_nanos,
-            body: metadata.body,
-            attributes: metadata.attributes,
-            resource: metadata.resource,
-            scope: metadata.scope,
-            severity_number: metadata.severity_number,
-            severity_text: metadata.severity_text,
-            dropped_attributes_count: metadata.dropped_attributes_count,
-            flags: metadata.flags,
-            trace_id: metadata.trace_id,
-            span_id: metadata.span_id,
-            event_name: metadata.event_name,
-        });
+    if include_typed_metadata {
+        let typed_metadata = cached_typed_metadata.map_or_else(
+            || {
+                decode_selected_typed_metadata(
+                    typed_metadata_section,
+                    record_count,
+                    record_ordinals,
+                    &timestamps,
+                    &messages,
+                    &fields,
+                )
+            },
+            |packed| {
+                decode_selected_typed_metadata_from_packed(
+                    packed,
+                    record_count,
+                    record_ordinals,
+                    &timestamps,
+                    &messages,
+                    &fields,
+                )
+            },
+        )?;
+        for (((record_ordinal, message), fields), metadata) in record_ordinals
+            .iter()
+            .copied()
+            .zip(messages.iter().cloned())
+            .zip(fields.iter().cloned())
+            .zip(typed_metadata)
+        {
+            let index = usize::try_from(record_ordinal).map_err(|_| {
+                TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+            })?;
+            decoded.push(DecodedStructuralRecord {
+                offset: offsets[index],
+                timestamp_unix_nanos: timestamps[index],
+                message,
+                fields,
+                observed_timestamp_unix_nanos: metadata.observed_timestamp_unix_nanos,
+                body: metadata.body,
+                attributes: metadata.attributes,
+                resource: metadata.resource,
+                scope: metadata.scope,
+                severity_number: metadata.severity_number,
+                severity_text: metadata.severity_text,
+                dropped_attributes_count: metadata.dropped_attributes_count,
+                flags: metadata.flags,
+                trace_id: metadata.trace_id,
+                span_id: metadata.span_id,
+                event_name: metadata.event_name,
+            });
+        }
+    } else {
+        for ((record_ordinal, message), fields) in record_ordinals
+            .iter()
+            .copied()
+            .zip(messages.iter().cloned())
+            .zip(fields.iter().cloned())
+        {
+            let index = usize::try_from(record_ordinal).map_err(|_| {
+                TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+            })?;
+            decoded.push(DecodedStructuralRecord {
+                offset: offsets[index],
+                timestamp_unix_nanos: timestamps[index],
+                message,
+                fields,
+                observed_timestamp_unix_nanos: 0,
+                body: None,
+                attributes: projected_empty_telemetry_attributes(),
+                resource: projected_empty_resource_context(),
+                scope: projected_empty_scope_context(),
+                severity_number: 0,
+                severity_text: projected_empty_text(),
+                dropped_attributes_count: 0,
+                flags: 0,
+                trace_id: None,
+                span_id: None,
+                event_name: projected_empty_text(),
+            });
+        }
     }
     Ok(decoded)
+}
+
+fn projected_empty_metadata_fields(count: usize) -> Vec<Arc<Vec<MetadataField>>> {
+    static EMPTY: OnceLock<Arc<Vec<MetadataField>>> = OnceLock::new();
+    let empty = EMPTY.get_or_init(|| Arc::new(Vec::new()));
+    (0..count).map(|_| Arc::clone(empty)).collect()
+}
+
+fn projected_empty_telemetry_attributes() -> Arc<Vec<TelemetryAttribute>> {
+    static EMPTY: OnceLock<Arc<Vec<TelemetryAttribute>>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(Vec::new())))
+}
+
+fn projected_empty_resource_context() -> Arc<ResourceContext> {
+    static EMPTY: OnceLock<Arc<ResourceContext>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(ResourceContext::default())))
+}
+
+fn projected_empty_scope_context() -> Arc<ScopeContext> {
+    static EMPTY: OnceLock<Arc<ScopeContext>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(ScopeContext::default())))
+}
+
+fn projected_empty_text() -> Arc<str> {
+    static EMPTY: OnceLock<Arc<str>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from("")))
 }
 
 /// Decodes only the durable offset and timestamp lanes used to rank selective
@@ -1378,9 +1765,33 @@ pub(crate) fn decode_structural_positions(
 
 /// Decodes only selected message bodies, leaving typed metadata and field
 /// values compressed until a message predicate has been verified.
+#[cfg(test)]
 pub(crate) fn decode_structural_messages(
     encoded: &[u8],
     record_ordinals: &[u32],
+) -> TelemetryResult<Vec<Arc<str>>> {
+    decode_structural_messages_internal(encoded, record_ordinals, None, None)
+}
+
+pub(crate) fn decode_structural_messages_with_embedded_index_and_templates(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    embedded_index: &EmbeddedFrameIndex,
+    templates: &[Vec<Vec<u8>>],
+) -> TelemetryResult<Vec<Arc<str>>> {
+    decode_structural_messages_internal(
+        encoded,
+        record_ordinals,
+        Some(embedded_index),
+        Some(templates),
+    )
+}
+
+fn decode_structural_messages_internal(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    cached_embedded_index: Option<&EmbeddedFrameIndex>,
+    cached_templates: Option<&[Vec<Vec<u8>>]>,
 ) -> TelemetryResult<Vec<Arc<str>>> {
     if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
         return Err(TelemetryError::InvalidBlockEncoding(
@@ -1406,17 +1817,339 @@ pub(crate) fn decode_structural_messages(
     if cursor != encoded.len() {
         return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
     }
-    let embedded_index = EmbeddedFrameIndex::decode(
-        embedded_index_section,
-        u32::try_from(record_count).map_err(|_| TelemetryError::RecordTooLarge)?,
-    )?;
-    let templates = decode_templates(templates_section)?;
+    let embedded_index = match cached_embedded_index {
+        Some(index) => Cow::Borrowed(index),
+        None => Cow::Owned(EmbeddedFrameIndex::decode(
+            embedded_index_section,
+            u32::try_from(record_count).map_err(|_| TelemetryError::RecordTooLarge)?,
+        )?),
+    };
+    if embedded_index.record_count as usize != record_count {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "embedded index record count mismatch",
+        ));
+    }
+    let templates = match cached_templates {
+        Some(templates) => Cow::Borrowed(templates),
+        None => Cow::Owned(decode_templates(templates_section)?),
+    };
     decode_selected_bodies(
         bodies_section,
         &templates,
         &embedded_index,
         record_count,
         record_ordinals,
+    )
+}
+
+pub(crate) fn decode_structural_templates(encoded: &[u8]) -> TelemetryResult<Vec<Vec<Vec<u8>>>> {
+    if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "missing structural block magic",
+        ));
+    }
+    let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+    let record_count = read_usize(encoded, &mut cursor)?;
+    ensure_count_within(
+        record_count,
+        encoded.len().saturating_sub(cursor),
+        "record count",
+    )?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let templates_section = read_section(encoded, &mut cursor)?;
+    for _ in 0..5 {
+        let _ = read_section(encoded, &mut cursor)?;
+    }
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    decode_templates(templates_section)
+}
+
+pub(crate) fn decode_structural_attribute_tables(
+    encoded: &[u8],
+) -> TelemetryResult<DecodedAttributeTables> {
+    if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "missing structural block magic",
+        ));
+    }
+    let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+    let record_count = read_usize(encoded, &mut cursor)?;
+    ensure_count_within(
+        record_count,
+        encoded.len().saturating_sub(cursor),
+        "record count",
+    )?;
+    for _ in 0..4 {
+        let _ = read_section(encoded, &mut cursor)?;
+    }
+    let attributes_section = read_section(encoded, &mut cursor)?;
+    for _ in 0..3 {
+        let _ = read_section(encoded, &mut cursor)?;
+    }
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    decode_attribute_tables(attributes_section)
+}
+
+/// Decodes and validates the packed typed metadata lane so query caches can
+/// reuse it across projected reads of the same structural frame.
+pub(crate) fn decode_structural_typed_metadata(
+    encoded: &[u8],
+    record_count: usize,
+) -> TelemetryResult<(PackedLogMetadata, usize)> {
+    if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "missing structural block magic",
+        ));
+    }
+    let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+    let encoded_record_count = read_usize(encoded, &mut cursor)?;
+    if encoded_record_count != record_count {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "typed metadata record count mismatch",
+        ));
+    }
+    for _ in 0..6 {
+        let _ = read_section(encoded, &mut cursor)?;
+    }
+    let typed_metadata_section = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    if typed_metadata_section.is_empty() {
+        return Ok((
+            PackedLogMetadata {
+                bodies: Vec::new(),
+                attribute_sets: Vec::new(),
+                resources: Vec::new(),
+                scopes: Vec::new(),
+                strings: Vec::new(),
+                rows: vec![None; record_count],
+            },
+            0,
+        ));
+    }
+    decode_packed_typed_metadata_with_size(typed_metadata_section, record_count)
+}
+
+/// Decodes only selected trace IDs from the packed typed metadata lane.
+///
+/// Most OTLP and Loki records store the trace ID directly in the typed row.
+/// Older records can mark the ID as an `otel.trace_id` structural field; only
+/// those selected rows fall back to the field lane so this path stays narrow.
+pub(crate) fn decode_structural_trace_ids(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+) -> TelemetryResult<Vec<Option<TraceId>>> {
+    if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "missing structural block magic",
+        ));
+    }
+    let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+    let record_count = read_usize(encoded, &mut cursor)?;
+    ensure_count_within(
+        record_count,
+        encoded.len().saturating_sub(cursor),
+        "record count",
+    )?;
+    validate_selected_ordinals(record_ordinals, record_count)?;
+    for _ in 0..5 {
+        let _ = read_section(encoded, &mut cursor)?;
+    }
+    let _fields_section = read_section(encoded, &mut cursor)?;
+    let typed_metadata_section = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    if typed_metadata_section.is_empty() {
+        return Ok(vec![None; record_ordinals.len()]);
+    }
+    let packed = decode_packed_typed_metadata(typed_metadata_section, record_count)?;
+    let needs_field_fallback = record_ordinals.iter().any(|ordinal| {
+        usize::try_from(*ordinal)
+            .ok()
+            .and_then(|index| packed.rows.get(index))
+            .and_then(Option::as_ref)
+            .is_some_and(|row| row.trace_id_from_fields)
+    });
+    let fields = needs_field_fallback.then(|| decode_structural_fields(encoded, record_ordinals));
+    let fields = fields.transpose()?;
+    record_ordinals
+        .iter()
+        .enumerate()
+        .map(|(selected_index, ordinal)| {
+            let index = usize::try_from(*ordinal)
+                .map_err(|_| TelemetryError::InvalidBlockEncoding("trace ID ordinal overflow"))?;
+            let row = packed
+                .rows
+                .get(index)
+                .ok_or(TelemetryError::InvalidBlockEncoding(
+                    "trace ID ordinal out of range",
+                ))?
+                .as_ref();
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            if row.trace_id_from_fields {
+                let fields = fields
+                    .as_ref()
+                    .and_then(|fields| fields.get(selected_index))
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
+                        "trace ID field fallback is missing",
+                    ))?;
+                Ok(Some(resolve_trace_id_field(fields, "otel.trace_id")?))
+            } else {
+                Ok(row.trace_id)
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_structural_records_with_cached_frame_data(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    embedded_index: &EmbeddedFrameIndex,
+    templates: &[Vec<Vec<u8>>],
+    offsets: &[LogicalOffset],
+    timestamps: &[u64],
+    include_typed_metadata: bool,
+    include_all_fields: bool,
+    cached_messages: Option<&[Arc<str>]>,
+    packed_typed_metadata: Option<&PackedLogMetadata>,
+    cached_attributes: Option<&DecodedAttributeTables>,
+) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
+    decode_structural_records_internal_with_projection_and_messages(
+        encoded,
+        record_ordinals,
+        include_typed_metadata,
+        packed_typed_metadata,
+        Some(embedded_index),
+        if include_all_fields {
+            FieldProjection::All
+        } else {
+            FieldProjection::None
+        },
+        cached_messages,
+        Some(templates),
+        Some((offsets, timestamps)),
+        cached_attributes,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_structural_records_with_cached_frame_data_and_fields(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    embedded_index: &EmbeddedFrameIndex,
+    templates: &[Vec<Vec<u8>>],
+    offsets: &[LogicalOffset],
+    timestamps: &[u64],
+    include_typed_metadata: bool,
+    include_all_fields: bool,
+    cached_messages: Option<&[Arc<str>]>,
+    packed_typed_metadata: Option<&PackedLogMetadata>,
+    cached_attributes: Option<&DecodedAttributeTables>,
+    cached_fields: Option<&[Arc<Vec<MetadataField>>]>,
+) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
+    decode_structural_records_internal_with_projection_and_messages(
+        encoded,
+        record_ordinals,
+        include_typed_metadata,
+        packed_typed_metadata,
+        Some(embedded_index),
+        if include_all_fields {
+            FieldProjection::All
+        } else {
+            FieldProjection::None
+        },
+        cached_messages,
+        Some(templates),
+        Some((offsets, timestamps)),
+        cached_attributes,
+        cached_fields,
+    )
+}
+
+/// Decodes only selected metadata fields, leaving typed log metadata and body
+/// values compressed until a field predicate has been verified.
+pub(crate) fn decode_structural_fields(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+) -> TelemetryResult<Vec<Arc<Vec<MetadataField>>>> {
+    if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "missing structural block magic",
+        ));
+    }
+    let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+    let record_count = read_usize(encoded, &mut cursor)?;
+    ensure_count_within(
+        record_count,
+        encoded.len().saturating_sub(cursor),
+        "record count",
+    )?;
+    validate_selected_ordinals(record_ordinals, record_count)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let attributes_section = read_section(encoded, &mut cursor)?;
+    let fields_section = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    let attributes = decode_attribute_tables(attributes_section)?;
+    decode_selected_fields(fields_section, &attributes, record_count, record_ordinals)
+}
+
+/// Decodes only the requested metadata fields for selected records.
+pub(crate) fn decode_structural_fields_for_keys(
+    encoded: &[u8],
+    record_ordinals: &[u32],
+    wanted_keys: &[&str],
+) -> TelemetryResult<Vec<Arc<Vec<MetadataField>>>> {
+    if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "missing structural block magic",
+        ));
+    }
+    let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+    let record_count = read_usize(encoded, &mut cursor)?;
+    ensure_count_within(
+        record_count,
+        encoded.len().saturating_sub(cursor),
+        "record count",
+    )?;
+    validate_selected_ordinals(record_ordinals, record_count)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let attributes_section = read_section(encoded, &mut cursor)?;
+    let fields_section = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    let attributes = decode_attribute_tables(attributes_section)?;
+    decode_selected_fields_for_keys(
+        fields_section,
+        &attributes,
+        record_count,
+        record_ordinals,
+        wanted_keys,
     )
 }
 
@@ -1888,8 +2621,11 @@ fn encode_typed_metadata<R: StructuralRecordView>(records: &[R]) -> TelemetryRes
     };
     let raw = rmp_serde::to_vec(&packed)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
-    let compressed = zstd::bulk::compress(&raw, 1)
-        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    let compressed = TYPED_METADATA_COMPRESSOR.with_borrow_mut(|compressor| {
+        compressor
+            .compress(&raw)
+            .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))
+    })?;
     let mut encoded = Vec::with_capacity(4 + compressed.len());
     encoded.extend_from_slice(
         &u32::try_from(raw.len())
@@ -1951,6 +2687,29 @@ fn decode_selected_typed_metadata(
         return Ok(vec![StructuralLogMetadata::default(); selected.len()]);
     }
     let packed = decode_packed_typed_metadata(encoded, record_count)?;
+    decode_selected_typed_metadata_from_packed(
+        &packed,
+        record_count,
+        selected,
+        timestamps,
+        messages,
+        fields,
+    )
+}
+
+fn decode_selected_typed_metadata_from_packed(
+    packed: &PackedLogMetadata,
+    record_count: usize,
+    selected: &[u32],
+    timestamps: &[u64],
+    messages: &[Arc<str>],
+    fields: &[Arc<Vec<MetadataField>>],
+) -> TelemetryResult<Vec<StructuralLogMetadata>> {
+    if packed.rows.len() != record_count {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "typed log metadata count mismatch",
+        ));
+    }
     selected
         .iter()
         .zip(messages)
@@ -1965,7 +2724,7 @@ fn decode_selected_typed_metadata(
                 .ok_or(TelemetryError::InvalidBlockEncoding(
                     "typed metadata ordinal out of range",
                 ))?;
-            unpack_typed_metadata(&packed, row.as_ref(), timestamps[index], message, fields)
+            unpack_typed_metadata(packed, row.as_ref(), timestamps[index], message, fields)
         })
         .collect()
 }
@@ -1991,6 +2750,13 @@ fn decode_packed_typed_metadata(
     encoded: &[u8],
     record_count: usize,
 ) -> TelemetryResult<PackedLogMetadata> {
+    decode_packed_typed_metadata_with_size(encoded, record_count).map(|(packed, _)| packed)
+}
+
+fn decode_packed_typed_metadata_with_size(
+    encoded: &[u8],
+    record_count: usize,
+) -> TelemetryResult<(PackedLogMetadata, usize)> {
     if encoded.len() < 4 {
         return Err(TelemetryError::InvalidBlockEncoding(
             "truncated typed log metadata lane",
@@ -2002,8 +2768,11 @@ fn decode_packed_typed_metadata(
             "typed log metadata lane exceeds safety limit",
         ));
     }
-    let raw = zstd::bulk::decompress(&encoded[4..], raw_len)
-        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid typed log metadata lane"))?;
+    let raw = TYPED_METADATA_DECOMPRESSOR.with_borrow_mut(|decompressor| {
+        decompressor
+            .decompress(&encoded[4..], raw_len)
+            .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid typed log metadata lane"))
+    })?;
     if raw.len() != raw_len {
         return Err(TelemetryError::InvalidBlockEncoding(
             "typed log metadata length mismatch",
@@ -2016,7 +2785,7 @@ fn decode_packed_typed_metadata(
             "typed log metadata count mismatch",
         ));
     }
-    Ok(packed)
+    Ok((packed, raw_len))
 }
 
 fn unpack_typed_metadata(
@@ -2364,6 +3133,17 @@ fn decode_selected_bodies(
 ) -> TelemetryResult<Vec<Arc<str>>> {
     validate_body_layout(index, templates.len(), record_count)?;
     let lane = decode_seekable_record_lane(encoded, record_count)?;
+    let template_fixed_bytes = templates
+        .iter()
+        .map(|literals| {
+            literals.iter().try_fold(0usize, |total, literal| {
+                total
+                    .checked_add(literal.len())
+                    .ok_or(TelemetryError::RecordTooLarge)
+            })
+        })
+        .collect::<TelemetryResult<Vec<_>>>()?;
+    let mut exact_templates = vec![None::<Arc<str>>; templates.len()];
     let mut selected_index = 0usize;
     let mut messages = Vec::with_capacity(selected.len());
     while selected_index < selected.len() {
@@ -2409,13 +3189,28 @@ fn decode_selected_bodies(
                             "template has no first literal",
                         ))?;
                     if retain {
-                        let mut reconstructed = first.clone();
-                        for literal in &literals[1..] {
-                            reconstructed
-                                .extend_from_slice(read_bytes(checkpoint_payload, &mut cursor)?);
-                            reconstructed.extend_from_slice(literal);
+                        if literals.len() == 1 {
+                            let message = if let Some(message) = &exact_templates[template_id] {
+                                Arc::clone(message)
+                            } else {
+                                let message = decode_text(first.clone())?;
+                                exact_templates[template_id] = Some(Arc::clone(&message));
+                                message
+                            };
+                            messages.push(message);
+                        } else {
+                            let mut reconstructed =
+                                Vec::with_capacity(template_fixed_bytes[template_id]);
+                            reconstructed.extend_from_slice(first);
+                            for literal in &literals[1..] {
+                                reconstructed.extend_from_slice(read_bytes(
+                                    checkpoint_payload,
+                                    &mut cursor,
+                                )?);
+                                reconstructed.extend_from_slice(literal);
+                            }
+                            messages.push(decode_text(reconstructed)?);
                         }
-                        messages.push(decode_text(reconstructed)?);
                     } else {
                         for _ in &literals[1..] {
                             let _ = read_bytes(checkpoint_payload, &mut cursor)?;
@@ -2648,10 +3443,11 @@ fn decode_selected_fields(
         let checkpoint_payload = lane.checkpoint_payload(checkpoint)?;
         let mut cursor = 0usize;
         let mut retained = selected_index;
+        let mut next_selected = usize::try_from(selected[retained]).map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+        })?;
         for record_ordinal in checkpoint * lane.interval..=final_ordinal {
-            let retain = usize::try_from(selected[retained])
-                .ok()
-                .is_some_and(|selected| selected == record_ordinal);
+            let retain = next_selected == record_ordinal;
             let field_count = read_usize(checkpoint_payload, &mut cursor)?;
             ensure_count_within(
                 field_count,
@@ -2670,7 +3466,11 @@ fn decode_selected_fields(
                 let value = match read_byte(checkpoint_payload, &mut cursor)? {
                     DIRECT_ATTRIBUTE_VALUE => {
                         let bytes = read_bytes(checkpoint_payload, &mut cursor)?;
-                        retain.then(|| decode_text(bytes.to_vec())).transpose()?
+                        if retain {
+                            Some(decode_text(bytes.to_vec())?)
+                        } else {
+                            None
+                        }
                     }
                     DICTIONARY_ATTRIBUTE_VALUE => {
                         let value_id = read_usize(checkpoint_payload, &mut cursor)?;
@@ -2693,6 +3493,117 @@ fn decode_selected_fields(
                     fields.push(MetadataField {
                         key: Arc::clone(key),
                         value: value.expect("retained field has a decoded value"),
+                    });
+                }
+            }
+            if let Some(fields) = fields {
+                records.push(Arc::new(fields));
+                retained += 1;
+                if retained < group_end {
+                    next_selected = usize::try_from(selected[retained]).map_err(|_| {
+                        TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+                    })?;
+                }
+            }
+        }
+        if final_ordinal + 1 == checkpoint_end {
+            require_consumed(checkpoint_payload, cursor)?;
+        }
+        selected_index = group_end;
+    }
+    Ok(records)
+}
+
+fn decode_selected_fields_for_keys(
+    encoded: &[u8],
+    tables: &DecodedAttributeTables,
+    record_count: usize,
+    selected: &[u32],
+    wanted_keys: &[&str],
+) -> TelemetryResult<Vec<Arc<Vec<MetadataField>>>> {
+    let lane = decode_seekable_record_lane(encoded, record_count)?;
+    let mut selected_index = 0usize;
+    let mut records = Vec::with_capacity(selected.len());
+    while selected_index < selected.len() {
+        let first_ordinal = usize::try_from(selected[selected_index]).map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+        })?;
+        let checkpoint = first_ordinal / lane.interval;
+        let checkpoint_end = (checkpoint + 1)
+            .saturating_mul(lane.interval)
+            .min(record_count);
+        let mut group_end = selected_index + 1;
+        while group_end < selected.len()
+            && usize::try_from(selected[group_end])
+                .ok()
+                .is_some_and(|ordinal| ordinal < checkpoint_end)
+        {
+            group_end += 1;
+        }
+        let final_ordinal = usize::try_from(selected[group_end - 1]).map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+        })?;
+        let checkpoint_payload = lane.checkpoint_payload(checkpoint)?;
+        let mut cursor = 0usize;
+        let mut retained = selected_index;
+        for record_ordinal in checkpoint * lane.interval..=final_ordinal {
+            let retain = usize::try_from(selected[retained])
+                .ok()
+                .is_some_and(|selected| selected == record_ordinal);
+            let field_count = read_usize(checkpoint_payload, &mut cursor)?;
+            ensure_count_within(
+                field_count,
+                checkpoint_payload.len().saturating_sub(cursor),
+                "field count",
+            )?;
+            let mut fields = retain.then(Vec::new);
+            for _ in 0..field_count {
+                let key_id = read_usize(checkpoint_payload, &mut cursor)?;
+                let key = tables
+                    .0
+                    .get(key_id)
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
+                        "unknown attribute key ID",
+                    ))?;
+                let wanted = wanted_keys.iter().any(|wanted| *wanted == key.as_ref());
+                let value =
+                    match read_byte(checkpoint_payload, &mut cursor)? {
+                        DIRECT_ATTRIBUTE_VALUE => {
+                            let bytes = read_bytes(checkpoint_payload, &mut cursor)?;
+                            wanted.then(|| decode_text(bytes.to_vec())).transpose()?
+                        }
+                        DICTIONARY_ATTRIBUTE_VALUE => {
+                            let value_id = read_usize(checkpoint_payload, &mut cursor)?;
+                            let values = tables.1.get(key_id).ok_or(
+                                TelemetryError::InvalidBlockEncoding(
+                                    "unknown attribute value dictionary ID",
+                                ),
+                            )?;
+                            if wanted {
+                                Some(Arc::clone(values.get(value_id).ok_or(
+                                    TelemetryError::InvalidBlockEncoding(
+                                        "unknown attribute value dictionary ID",
+                                    ),
+                                )?))
+                            } else {
+                                if value_id >= values.len() {
+                                    return Err(TelemetryError::InvalidBlockEncoding(
+                                        "unknown attribute value dictionary ID",
+                                    ));
+                                }
+                                None
+                            }
+                        }
+                        _ => {
+                            return Err(TelemetryError::InvalidBlockEncoding(
+                                "invalid attribute value kind",
+                            ));
+                        }
+                    };
+                if let (Some(fields), Some(value)) = (&mut fields, value) {
+                    fields.push(MetadataField {
+                        key: Arc::clone(key),
+                        value,
                     });
                 }
             }
@@ -3881,6 +4792,16 @@ mod tests {
             indexed.index.term_candidate_ordinals("req"),
             LogQuery::new(records[0].record_ref.topic_partition).with_term("req"),
         );
+        let mut expected_union = indexed.index.term_candidate_ordinals("error");
+        expected_union.extend(indexed.index.term_candidate_ordinals("req"));
+        expected_union.sort_unstable();
+        expected_union.dedup();
+        assert_eq!(
+            indexed
+                .index
+                .term_candidate_ordinals_union(&["error", "req"]),
+            expected_union
+        );
         assert_query(
             indexed.index.term_candidate_ordinals("1002"),
             LogQuery::new(records[0].record_ref.topic_partition).with_term("1002"),
@@ -4038,7 +4959,7 @@ mod tests {
 
     #[test]
     fn selective_decode_matches_full_decode_without_allocating_other_records() {
-        let records = (0..1_000u64)
+        let mut records = (0..1_000u64)
             .map(|offset| {
                 record(
                     offset,
@@ -4048,8 +4969,23 @@ mod tests {
                     ),
                 )
                 .with_field("request.id", format!("req-{offset:08}"))
+                .with_field(
+                    if offset.is_multiple_of(2) {
+                        "otel.severity_text"
+                    } else {
+                        "attr.loki.metadata.severity_text"
+                    },
+                    if offset.is_multiple_of(2) {
+                        "ERROR"
+                    } else {
+                        "WARN"
+                    },
+                )
             })
             .collect::<Vec<_>>();
+        let trace_id = TraceId::from_bytes([7; 16]).expect("trace ID is valid");
+        records[7].trace_id = Some(trace_id);
+        records[0].body = Some(TelemetryValue::Boolean(true));
         let encoded = encode_structural_block(&records).expect("block encodes");
         let full = decode_structural_block(&encoded).expect("full block decodes");
         let (offsets, timestamps) =
@@ -4065,15 +5001,92 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let selected_ordinals = [0, 7, 500, 999];
+        assert_eq!(
+            decode_structural_trace_ids(&encoded, &selected_ordinals).expect("trace IDs decode"),
+            vec![None, Some(trace_id), None, None]
+        );
         let selected =
             decode_structural_records(&encoded, &selected_ordinals).expect("selection decodes");
+        let embedded_index = decode_embedded_frame_index(&encoded).expect("embedded index decodes");
+        let templates = decode_structural_templates(&encoded).expect("templates decode");
+        let projected =
+            decode_structural_records_without_typed_metadata_with_embedded_index_and_templates(
+                &encoded,
+                &selected_ordinals,
+                &embedded_index,
+                &templates,
+                true,
+            )
+            .expect("projection selection decodes");
+        assert_eq!(
+            projected
+                .iter()
+                .map(|record| (
+                    record.offset,
+                    record.timestamp_unix_nanos,
+                    Arc::clone(&record.message),
+                    Arc::clone(&record.fields),
+                ))
+                .collect::<Vec<_>>(),
+            selected
+                .iter()
+                .map(|record| (
+                    record.offset,
+                    record.timestamp_unix_nanos,
+                    Arc::clone(&record.message),
+                    Arc::clone(&record.fields),
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(projected.iter().all(|record| record.body.is_none()));
+        let severity_projected =
+            decode_structural_records_without_typed_metadata_with_embedded_index_and_severity_text(
+                &encoded,
+                &selected_ordinals,
+                &embedded_index,
+            )
+            .expect("severity projection decodes");
+        assert_eq!(
+            severity_projected
+                .iter()
+                .map(|record| record
+                    .fields
+                    .iter()
+                    .map(|field| (field.key.as_ref(), field.value.as_ref()))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            selected
+                .iter()
+                .map(|record| {
+                    record
+                        .fields
+                        .iter()
+                        .filter(|field| {
+                            matches!(
+                                field.key.as_ref(),
+                                "otel.severity_text" | "attr.loki.metadata.severity_text"
+                            )
+                        })
+                        .map(|field| (field.key.as_ref(), field.value.as_ref()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        );
         let messages =
             decode_structural_messages(&encoded, &selected_ordinals).expect("messages decode");
+        let fields = decode_structural_fields(&encoded, &selected_ordinals).expect("fields decode");
         assert_eq!(
             messages,
             selected
                 .iter()
                 .map(|record| Arc::clone(&record.message))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fields,
+            selected
+                .iter()
+                .map(|record| Arc::clone(&record.fields))
                 .collect::<Vec<_>>()
         );
         assert_eq!(

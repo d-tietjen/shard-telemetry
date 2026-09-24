@@ -15,6 +15,7 @@ use crate::{TelemetryError, TelemetryResult};
 const MAGIC: &[u8; 8] = b"STELSNK1";
 const CHECKSUM_BYTES: usize = 32;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const BATCH_SYNC_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct RecoveredAppend {
@@ -34,6 +35,7 @@ pub(crate) struct RecoveredTransaction {
 struct JournalState {
     file: File,
     bytes: u64,
+    unsynced_bytes: u64,
     checkpoints: HashMap<TopicPartition, DurableSinkCheckpoint>,
 }
 
@@ -41,6 +43,7 @@ struct JournalState {
 #[derive(Debug)]
 pub(crate) struct SinkJournal {
     max_bytes: u64,
+    sync_each_append: bool,
     state: Mutex<JournalState>,
 }
 
@@ -49,6 +52,7 @@ impl SinkJournal {
         directory: &Path,
         shard_id: ShardId,
         max_bytes: u64,
+        sync_each_append: bool,
     ) -> TelemetryResult<(Self, Vec<RecoveredTransaction>)> {
         if max_bytes < MAGIC.len() as u64 {
             return Err(TelemetryError::InvalidConfig(
@@ -88,9 +92,11 @@ impl SinkJournal {
         Ok((
             Self {
                 max_bytes,
+                sync_each_append,
                 state: Mutex::new(JournalState {
                     file,
                     bytes,
+                    unsynced_bytes: 0,
                     checkpoints,
                 }),
             },
@@ -145,8 +151,15 @@ impl SinkJournal {
             .write_all(&length)
             .and_then(|()| state.file.write_all(&payload))
             .and_then(|()| state.file.write_all(checksum.as_bytes()))
-            .and_then(|()| state.file.sync_data())
             .map_err(|error| journal_io("append transaction", error))?;
+        state.unsynced_bytes = state.unsynced_bytes.saturating_add(frame_bytes as u64);
+        if self.sync_each_append || state.unsynced_bytes >= BATCH_SYNC_BYTES {
+            state
+                .file
+                .sync_data()
+                .map_err(|error| journal_io("sync transaction batch", error))?;
+            state.unsynced_bytes = 0;
+        }
         state.bytes = next_bytes;
         state.checkpoints.insert(next.topic_partition, next);
         Ok(())

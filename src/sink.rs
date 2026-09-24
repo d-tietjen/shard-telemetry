@@ -1,25 +1,29 @@
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
 use bytes::Bytes;
+use foldhash::HashSet;
 use shard_stream_core::{ShardId, TopicPartition};
 use shard_stream_engine::{
     DurableAppend, DurableAppendSink, DurableAppendSinkFactory, DurableSinkApply,
     DurableSinkCheckpoint, EngineError, EngineResult,
 };
 
+use crate::analytics::RelevanceScorer;
 use crate::correlation::{metric_matches_correlation, span_matches_correlation};
 use crate::ingest_pack::validate_ingest_pack;
-use crate::metric::metric_query_matches;
+use crate::metric::{metric_exact_series_point_matches, metric_query_matches};
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
+use crate::stripe::LogMessageMatch;
 use crate::tier::CachedObjectRange;
-use crate::trace::decode_trace_block_matching;
+use crate::trace::{TraceProjection, decode_trace_block_matching};
 use crate::{
     CorrelationConfig, CorrelationIndex, CorrelationQuery, DictionaryCatalog, DurableMetricPoint,
     DurableSpan, LogMatch, LogPredicate, LogQuery, LogStripe, MetricApplyOutcome,
@@ -28,7 +32,7 @@ use crate::{
     SharedTelemetryObjectStore, SsdCacheConfig, SsdCacheStats, SsdObjectCache, StripeConfig,
     TelemetryEnvelope, TelemetryError, TelemetryObjectTier, TelemetryRecordRef, TelemetryResult,
     TelemetryRouter, TelemetrySignal, TierArtifactKind, TierCheckpoint, TierQueryRange,
-    TierRetentionReport, TraceApplyOutcome, TraceQuery, TraceStripe, decode_metric_chunk,
+    TierRetentionReport, TraceApplyOutcome, TraceId, TraceQuery, TraceStripe, decode_metric_chunk,
     decode_signal_recovery_state, decode_trace_block, stage_signal_group,
 };
 
@@ -67,6 +71,15 @@ pub struct ObjectTierCacheStats {
     pub payload: SsdCacheStats,
 }
 
+/// Exact timestamp probes used by serialized Remote Write conflict checks.
+#[derive(Debug, Clone)]
+pub(crate) struct MetricTimestampQuery {
+    pub(crate) tenant: Arc<str>,
+    pub(crate) partition: TopicPartition,
+    pub(crate) series: crate::SeriesFingerprint,
+    pub(crate) timestamps: Arc<[u64]>,
+}
+
 /// Configuration for shard-telemetry's per-shard native and OTLP index sinks.
 #[derive(Debug, Clone)]
 pub struct OtlpSinkConfig {
@@ -84,6 +97,10 @@ pub struct OtlpSinkConfig {
     pub state_directory: Option<PathBuf>,
     /// Maximum bytes retained in each physical stripe's sink journal.
     pub max_journal_bytes: u64,
+    /// Sync every journal transaction when the journal is needed to survive
+    /// source-WAL reclamation. Non-retention stores batch journal barriers so
+    /// the authoritative WAL remains the fast durable path.
+    pub journal_sync_each_append: bool,
     /// Optional immutable object tier for bounded recovery and cold queries.
     pub object_tier: Option<SinkObjectTierConfig>,
 }
@@ -97,6 +114,7 @@ impl Default for OtlpSinkConfig {
             queue_slots: 256,
             state_directory: None,
             max_journal_bytes: 64 * 1024 * 1024 * 1024,
+            journal_sync_each_append: true,
             object_tier: None,
         }
     }
@@ -183,9 +201,204 @@ pub struct TelemetrySinkFactory {
     available: Mutex<HashMap<ShardId, TelemetryStripeState>>,
     checkpoints: Arc<Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>>,
     journals: Mutex<HashMap<ShardId, Arc<SinkJournal>>>,
-    query_workers: Arc<Mutex<HashMap<ShardId, SyncSender<SinkCommand>>>>,
+    query_workers: Arc<RwLock<QueryWorkerRegistry>>,
+    correlation_buffers: Arc<Mutex<CorrelationBufferPool>>,
+    active_log_partition_cache: Arc<Mutex<HashMap<Arc<str>, Vec<TopicPartition>>>>,
+    validated_signal_cache: Arc<ValidatedSignalCache>,
     tier_caches: Option<TierCaches>,
     object_store: Option<SharedTelemetryObjectStore>,
+}
+
+const MAX_VALIDATED_SIGNAL_CACHE_ENTRIES: usize = 32;
+const MAX_VALIDATED_SIGNAL_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const VALIDATED_SIGNAL_CACHE_SHARDS: usize = 8;
+const MAX_VALIDATED_SIGNAL_CACHE_ENTRIES_PER_SHARD: usize =
+    MAX_VALIDATED_SIGNAL_CACHE_ENTRIES / VALIDATED_SIGNAL_CACHE_SHARDS;
+const MAX_VALIDATED_SIGNAL_CACHE_BYTES_PER_SHARD: usize =
+    MAX_VALIDATED_SIGNAL_CACHE_BYTES / VALIDATED_SIGNAL_CACHE_SHARDS;
+const MAX_CORRELATION_BUFFER_POOL_ENTRIES: usize = 64;
+const MAX_CORRELATION_BUFFER_CAPACITY: usize = 16_384;
+const MAX_FANOUT_RESULT_PREALLOC: usize = 64 * 1024;
+
+type ProjectedQueryResponse = (ShardId, TelemetryResult<Vec<LogMatch>>);
+
+#[derive(Clone)]
+struct IndexedProjectedQuery {
+    index: usize,
+    query: LogQuery,
+}
+
+thread_local! {
+    static TARGETED_PROJECTED_QUERY_RESPONSE: RefCell<Option<(
+        SyncSender<ProjectedQueryResponse>,
+        Receiver<ProjectedQueryResponse>,
+    )>> = const { RefCell::new(None) };
+}
+
+fn fanout_result_capacity(limit: Option<usize>, workers: usize) -> usize {
+    limit
+        .map(|limit| {
+            limit
+                .saturating_mul(workers)
+                .min(MAX_FANOUT_RESULT_PREALLOC)
+        })
+        .unwrap_or_default()
+}
+
+fn sort_and_limit<T>(
+    values: &mut Vec<T>,
+    limit: Option<usize>,
+    mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) {
+    let Some(limit) = limit else {
+        values.sort_unstable_by(compare);
+        return;
+    };
+    if values.len() > limit {
+        {
+            let (selected, _, _) = values.select_nth_unstable_by(limit, &mut compare);
+            selected.sort_unstable_by(&mut compare);
+        }
+        values.truncate(limit);
+    } else {
+        values.sort_unstable_by(compare);
+    }
+}
+
+#[derive(Debug, Default)]
+struct CorrelationBufferPool {
+    buffers: Vec<Vec<TelemetryRecordRef>>,
+}
+
+impl CorrelationBufferPool {
+    fn take(&mut self) -> Vec<TelemetryRecordRef> {
+        self.buffers.pop().unwrap_or_default()
+    }
+
+    fn recycle(&mut self, mut buffer: Vec<TelemetryRecordRef>) {
+        if buffer.capacity() > MAX_CORRELATION_BUFFER_CAPACITY
+            || self.buffers.len() >= MAX_CORRELATION_BUFFER_POOL_ENTRIES
+        {
+            return;
+        }
+        buffer.clear();
+        self.buffers.push(buffer);
+    }
+}
+
+#[derive(Debug)]
+enum ValidatedSignalPayload {
+    Traces(Vec<DurableSpan>),
+    Metrics(Vec<DurableMetricPoint>),
+}
+
+#[derive(Debug, Default)]
+struct ValidatedSignalCacheShard {
+    entries: HashMap<[u8; 32], (usize, ValidatedSignalPayload)>,
+    order: VecDeque<[u8; 32]>,
+    bytes: usize,
+}
+
+impl ValidatedSignalCacheShard {
+    fn insert(&mut self, key: [u8; 32], payload_bytes: usize, payload: ValidatedSignalPayload) {
+        if payload_bytes > MAX_VALIDATED_SIGNAL_CACHE_BYTES_PER_SHARD {
+            return;
+        }
+        self.remove(key);
+        while (self.entries.len() >= MAX_VALIDATED_SIGNAL_CACHE_ENTRIES_PER_SHARD
+            || self.bytes.saturating_add(payload_bytes)
+                > MAX_VALIDATED_SIGNAL_CACHE_BYTES_PER_SHARD)
+            && !self.entries.is_empty()
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((oldest_bytes, _)) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(oldest_bytes);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(payload_bytes);
+        self.order.push_back(key);
+        self.entries.insert(key, (payload_bytes, payload));
+    }
+
+    fn take(&mut self, key: [u8; 32]) -> Option<ValidatedSignalPayload> {
+        let (payload_bytes, payload) = self.entries.remove(&key)?;
+        self.bytes = self.bytes.saturating_sub(payload_bytes);
+        if let Some(position) = self.order.iter().position(|queued| *queued == key) {
+            self.order.remove(position);
+        }
+        Some(payload)
+    }
+
+    fn remove(&mut self, key: [u8; 32]) {
+        if let Some((payload_bytes, _)) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(payload_bytes);
+            if let Some(position) = self.order.iter().position(|queued| *queued == key) {
+                self.order.remove(position);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ValidatedSignalCache {
+    shards: Box<[Mutex<ValidatedSignalCacheShard>]>,
+}
+
+impl Default for ValidatedSignalCache {
+    fn default() -> Self {
+        Self {
+            shards: (0..VALIDATED_SIGNAL_CACHE_SHARDS)
+                .map(|_| Mutex::new(ValidatedSignalCacheShard::default()))
+                .collect(),
+        }
+    }
+}
+
+impl ValidatedSignalCache {
+    fn shard(&self, key: [u8; 32]) -> &Mutex<ValidatedSignalCacheShard> {
+        let shard =
+            usize::from(u16::from_le_bytes([key[0], key[1]])) % VALIDATED_SIGNAL_CACHE_SHARDS;
+        &self.shards[shard]
+    }
+
+    fn insert(&self, key: [u8; 32], payload_bytes: usize, payload: ValidatedSignalPayload) {
+        if let Ok(mut shard) = self.shard(key).lock() {
+            shard.insert(key, payload_bytes, payload);
+        }
+    }
+
+    fn take(&self, key: [u8; 32]) -> Option<ValidatedSignalPayload> {
+        self.shard(key).lock().ok()?.take(key)
+    }
+}
+
+#[derive(Debug, Default)]
+struct QueryWorkerRegistry {
+    by_shard: HashMap<ShardId, SyncSender<SinkCommand>>,
+    ordered: Vec<(ShardId, SyncSender<SinkCommand>)>,
+}
+
+impl QueryWorkerRegistry {
+    fn insert(&mut self, shard_id: ShardId, sender: SyncSender<SinkCommand>) {
+        self.by_shard.insert(shard_id, sender);
+        self.rebuild_ordered();
+    }
+
+    fn remove(&mut self, shard_id: ShardId) {
+        self.by_shard.remove(&shard_id);
+        self.rebuild_ordered();
+    }
+
+    fn rebuild_ordered(&mut self) {
+        self.ordered = self
+            .by_shard
+            .iter()
+            .map(|(shard_id, sender)| (*shard_id, sender.clone()))
+            .collect();
+        self.ordered.sort_unstable_by_key(|(shard_id, _)| *shard_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -409,8 +622,12 @@ impl TelemetrySinkFactory {
                 }
             }
             if let Some(directory) = &config.state_directory {
-                let (journal, recovered) =
-                    SinkJournal::open(directory, shard_id, config.max_journal_bytes)?;
+                let (journal, recovered) = SinkJournal::open(
+                    directory,
+                    shard_id,
+                    config.max_journal_bytes,
+                    config.journal_sync_each_append,
+                )?;
                 recovered_transactions.extend(
                     recovered
                         .into_iter()
@@ -502,6 +719,8 @@ impl TelemetrySinkFactory {
                     None,
                     &append.payload,
                     None,
+                    None,
+                    false,
                     (transaction.expected, transaction.next),
                 )?;
             }
@@ -512,7 +731,10 @@ impl TelemetrySinkFactory {
             available: Mutex::new(available),
             checkpoints: Arc::new(Mutex::new(recovered_checkpoints)),
             journals: Mutex::new(journals),
-            query_workers: Arc::new(Mutex::new(HashMap::new())),
+            query_workers: Arc::new(RwLock::new(QueryWorkerRegistry::default())),
+            correlation_buffers: Arc::new(Mutex::new(CorrelationBufferPool::default())),
+            active_log_partition_cache: Arc::new(Mutex::new(HashMap::new())),
+            validated_signal_cache: Arc::new(ValidatedSignalCache::default()),
             tier_caches,
             object_store,
         })
@@ -524,8 +746,11 @@ impl TelemetrySinkFactory {
     pub fn service(&self) -> TelemetryService {
         TelemetryService {
             workers: Arc::clone(&self.query_workers),
+            correlation_buffers: Arc::clone(&self.correlation_buffers),
+            active_log_partition_cache: Arc::clone(&self.active_log_partition_cache),
             tier_caches: self.tier_caches.clone(),
             object_store: self.object_store.clone(),
+            router: TelemetryRouter::from_config(&self.config.signals),
         }
     }
 }
@@ -537,7 +762,8 @@ impl DurableAppendSinkFactory for TelemetrySinkFactory {
                 "durable telemetry appends require the STEL envelope".into(),
             ));
         }
-        let envelope = TelemetryEnvelope::decode(payload).map_err(log_error_to_engine)?;
+        let envelope = crate::envelope::TelemetryEnvelope::decode_view(payload)
+            .map_err(log_error_to_engine)?;
         if envelope.item_count != record_count.get() {
             return Err(EngineError::InvalidConfig(format!(
                 "STEL envelope contains {} items, request reserved {}",
@@ -547,16 +773,34 @@ impl DurableAppendSinkFactory for TelemetrySinkFactory {
         }
         let decoded_count = match envelope.signal {
             TelemetrySignal::Logs => {
-                validate_ingest_pack(&envelope.payload, envelope.item_count)
+                validate_ingest_pack(envelope.payload, envelope.item_count)
                     .map_err(log_error_to_engine)?;
                 envelope.item_count as usize
             }
-            TelemetrySignal::Traces => decode_trace_block(&envelope.payload)
-                .map_err(log_error_to_engine)?
-                .len(),
-            TelemetrySignal::Metrics => decode_metric_chunk(&envelope.payload)
-                .map_err(log_error_to_engine)?
-                .len(),
+            TelemetrySignal::Traces => {
+                let records = decode_trace_block(envelope.payload).map_err(log_error_to_engine)?;
+                let decoded_count = records.len();
+                if decoded_count == envelope.item_count as usize {
+                    self.validated_signal_cache.insert(
+                        envelope.checksum,
+                        envelope.payload.len(),
+                        ValidatedSignalPayload::Traces(records),
+                    );
+                }
+                decoded_count
+            }
+            TelemetrySignal::Metrics => {
+                let records = decode_metric_chunk(envelope.payload).map_err(log_error_to_engine)?;
+                let decoded_count = records.len();
+                if decoded_count == envelope.item_count as usize {
+                    self.validated_signal_cache.insert(
+                        envelope.checksum,
+                        envelope.payload.len(),
+                        ValidatedSignalPayload::Metrics(records),
+                    );
+                }
+                decoded_count
+            }
         };
         if decoded_count != envelope.item_count as usize {
             return Err(EngineError::InvalidConfig(
@@ -596,14 +840,25 @@ impl DurableAppendSinkFactory for TelemetrySinkFactory {
             .lock()
             .map_err(|_| EngineError::CorruptState("shard-telemetry journal lock poisoned".into()))?
             .remove(&shard_id);
+        let active_log_partition_cache = Arc::clone(&self.active_log_partition_cache);
+        let validated_signal_cache = Arc::clone(&self.validated_signal_cache);
         let worker = thread::Builder::new()
             .name(format!("shard-telemetry-index-{shard_id}"))
-            .spawn(move || run_sink_worker(stripe, checkpoints, journal, receiver))
+            .spawn(move || {
+                run_sink_worker(
+                    stripe,
+                    checkpoints,
+                    journal,
+                    active_log_partition_cache,
+                    validated_signal_cache,
+                    receiver,
+                )
+            })
             .map_err(|error| {
                 EngineError::InvalidConfig(format!("failed to spawn shard-telemetry sink: {error}"))
             })?;
         self.query_workers
-            .lock()
+            .write()
             .map_err(|_| {
                 EngineError::CorruptState("shard-telemetry query registry poisoned".into())
             })?
@@ -626,31 +881,86 @@ struct SinkApplyCommand {
     response: SyncSender<EngineResult<DurableSinkApply>>,
 }
 
+#[allow(clippy::type_complexity)]
 enum SinkCommand {
     Apply(SinkApplyCommand),
     Query {
+        queries: Arc<[LogQuery]>,
+        response: SyncSender<(ShardId, TelemetryResult<Vec<LogMatch>>)>,
+    },
+    QueryProjected {
+        queries: Arc<[LogQuery]>,
+        include_typed_metadata: bool,
+        include_fields: bool,
+        response: SyncSender<(ShardId, TelemetryResult<Vec<LogMatch>>)>,
+    },
+    QueryProjectedSingle {
+        query: LogQuery,
+        include_typed_metadata: bool,
+        include_fields: bool,
+        response: SyncSender<ProjectedQueryResponse>,
+    },
+    QueryProjectedEach {
+        queries: Arc<[IndexedProjectedQuery]>,
+        include_typed_metadata: bool,
+        include_fields: bool,
+        response: SyncSender<(ShardId, TelemetryResult<Vec<(usize, Vec<LogMatch>)>>)>,
+    },
+    QueryMessagesTopK {
+        queries: Arc<[LogQuery]>,
+        scorer: RelevanceScorer,
+        limit: usize,
+        response: SyncSender<(ShardId, TelemetryResult<Vec<LogMessageMatch>>)>,
+    },
+    QueryTraceIds {
+        queries: Arc<[LogQuery]>,
+        response: SyncSender<(ShardId, TelemetryResult<Vec<TraceId>>)>,
+    },
+    QueryTraceIdIntersection {
+        outer_queries: Arc<[LogQuery]>,
+        inner_queries: Arc<[LogQuery]>,
+        response: SyncSender<(ShardId, TelemetryResult<Vec<TraceId>>)>,
+    },
+    CountQueries {
         queries: Vec<LogQuery>,
-        response: SyncSender<TelemetryResult<Vec<LogMatch>>>,
+        response: SyncSender<(ShardId, TelemetryResult<u64>)>,
+    },
+    GroupQueries {
+        queries: Vec<LogQuery>,
+        keys: Vec<crate::AnalyticsGroupKey>,
+        response: SyncSender<(
+            ShardId,
+            TelemetryResult<BTreeMap<Vec<Option<Arc<str>>>, u64>>,
+        )>,
     },
     CountLogs {
         tenant: Arc<str>,
         partitions: Vec<TopicPartition>,
-        response: SyncSender<TelemetryResult<u64>>,
+        response: SyncSender<(ShardId, TelemetryResult<u64>)>,
     },
     ActiveLogPartitions {
         tenant: Arc<str>,
-        response: SyncSender<TelemetryResult<Vec<TopicPartition>>>,
+        response: SyncSender<(ShardId, TelemetryResult<Vec<TopicPartition>>)>,
     },
     QueryTraces {
         query: TraceQuery,
         response: SyncSender<TelemetryResult<Vec<DurableSpan>>>,
     },
+    QueryTraceProjected {
+        query: TraceQuery,
+        response: SyncSender<TelemetryResult<Vec<TraceProjection>>>,
+    },
     QueryMetrics {
         query: MetricQuery,
         response: SyncSender<TelemetryResult<Vec<DurableMetricPoint>>>,
     },
+    QueryMetricTimestamps {
+        query: MetricTimestampQuery,
+        response: SyncSender<TelemetryResult<Vec<DurableMetricPoint>>>,
+    },
     Correlate {
         query: CorrelationQuery,
+        buffer: Vec<TelemetryRecordRef>,
         response: SyncSender<TelemetryResult<Vec<TelemetryRecordRef>>>,
     },
     Flush {
@@ -670,13 +980,13 @@ struct SinkState {
     shard_id: ShardId,
     sender: Mutex<Option<SyncSender<SinkCommand>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    query_workers: Arc<Mutex<HashMap<ShardId, SyncSender<SinkCommand>>>>,
+    query_workers: Arc<RwLock<QueryWorkerRegistry>>,
 }
 
 impl Drop for SinkState {
     fn drop(&mut self) {
-        if let Ok(mut workers) = self.query_workers.lock() {
-            workers.remove(&self.shard_id);
+        if let Ok(mut workers) = self.query_workers.write() {
+            workers.remove(self.shard_id);
         }
         if let Ok(sender) = self.sender.get_mut() {
             sender.take();
@@ -737,6 +1047,8 @@ fn run_sink_worker(
     mut stripe: TelemetryStripeState,
     checkpoints: Arc<Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>>,
     journal: Option<Arc<SinkJournal>>,
+    active_log_partition_cache: Arc<Mutex<HashMap<Arc<str>, Vec<TopicPartition>>>>,
+    validated_signal_cache: Arc<ValidatedSignalCache>,
     receiver: Receiver<SinkCommand>,
 ) {
     let mut apply_failure_reported = false;
@@ -747,6 +1059,7 @@ fn run_sink_worker(
                     &mut stripe,
                     &checkpoints,
                     journal.as_deref(),
+                    &validated_signal_cache,
                     command.expected,
                     &command.appends,
                     command.next,
@@ -762,30 +1075,157 @@ fn run_sink_worker(
                 } else {
                     apply_failure_reported = false;
                 }
+                if result.is_ok()
+                    && command
+                        .appends
+                        .iter()
+                        .any(|append| append.topic_partition().topic_id == crate::LOGS_TOPIC_ID)
+                    && let Ok(mut cache) = active_log_partition_cache.lock()
+                {
+                    cache.clear();
+                }
                 let _ = command.response.send(result);
             }
             SinkCommand::Query { queries, response } => {
                 let result = stripe.logs.query_partitions_checked(&queries);
-                let _ = response.send(result);
+                let _ = response.send((stripe.stream_shard_id, result));
+            }
+            SinkCommand::QueryProjected {
+                queries,
+                include_typed_metadata,
+                include_fields,
+                response,
+            } => {
+                let result = stripe.logs.query_partitions_checked_projected_with_fields(
+                    &queries,
+                    include_typed_metadata,
+                    include_fields,
+                );
+                let _ = response.send((stripe.stream_shard_id, result));
+            }
+            SinkCommand::QueryProjectedSingle {
+                query,
+                include_typed_metadata,
+                include_fields,
+                response,
+            } => {
+                let result = stripe.logs.query_partitions_checked_projected_with_fields(
+                    std::slice::from_ref(&query),
+                    include_typed_metadata,
+                    include_fields,
+                );
+                let _ = response.send((stripe.stream_shard_id, result));
+            }
+            SinkCommand::QueryProjectedEach {
+                queries,
+                include_typed_metadata,
+                include_fields,
+                response,
+            } => {
+                let indexed_queries = queries
+                    .iter()
+                    .map(|indexed| indexed.index)
+                    .collect::<Vec<_>>();
+                let query_refs = queries
+                    .iter()
+                    .map(|indexed| &indexed.query)
+                    .collect::<Vec<_>>();
+                let result = stripe
+                    .logs
+                    .query_partition_refs_checked_projected_each_with_fields(
+                        &query_refs,
+                        include_typed_metadata,
+                        include_fields,
+                    )
+                    .map(|matches| indexed_queries.into_iter().zip(matches).collect());
+                let _ = response.send((stripe.stream_shard_id, result));
+            }
+            SinkCommand::QueryMessagesTopK {
+                queries,
+                scorer,
+                limit,
+                response,
+            } => {
+                let result = stripe
+                    .logs
+                    .query_partitions_checked_messages_top_k(&queries, &scorer, limit);
+                let _ = response.send((stripe.stream_shard_id, result));
+            }
+            SinkCommand::QueryTraceIds { queries, response } => {
+                let result = stripe.logs.query_partitions_checked_trace_ids(&queries);
+                let _ = response.send((stripe.stream_shard_id, result));
+            }
+            SinkCommand::QueryTraceIdIntersection {
+                outer_queries,
+                inner_queries,
+                response,
+            } => {
+                let result = (|| {
+                    let outer = stripe
+                        .logs
+                        .query_partitions_checked_trace_ids(&outer_queries)?
+                        .into_iter()
+                        .collect::<HashSet<_>>();
+                    let inner = stripe
+                        .logs
+                        .query_partitions_checked_trace_ids(&inner_queries)?
+                        .into_iter()
+                        .collect::<HashSet<_>>();
+                    Ok::<Vec<_>, TelemetryError>(
+                        outer
+                            .into_iter()
+                            .filter(|trace_id| inner.contains(trace_id))
+                            .collect(),
+                    )
+                })();
+                let _ = response.send((stripe.stream_shard_id, result));
+            }
+            SinkCommand::CountQueries { queries, response } => {
+                let result = stripe.logs.count_query_partitions_checked(&queries);
+                let _ = response.send((stripe.stream_shard_id, result));
+            }
+            SinkCommand::GroupQueries {
+                queries,
+                keys,
+                response,
+            } => {
+                let result = stripe.logs.group_query_partitions_checked(&queries, &keys);
+                let _ = response.send((stripe.stream_shard_id, result));
             }
             SinkCommand::CountLogs {
                 tenant,
                 partitions,
                 response,
             } => {
-                let _ = response.send(stripe.logs.count_tenant_records(&tenant, &partitions));
+                let _ = response.send((
+                    stripe.stream_shard_id,
+                    stripe.logs.count_tenant_records(&tenant, &partitions),
+                ));
             }
             SinkCommand::ActiveLogPartitions { tenant, response } => {
-                let _ = response.send(stripe.logs.tenant_partitions(&tenant));
+                let _ = response.send((
+                    stripe.stream_shard_id,
+                    stripe.logs.tenant_partitions(&tenant),
+                ));
             }
             SinkCommand::QueryTraces { query, response } => {
                 let _ = response.send(query_trace_stripe(&stripe, &query));
             }
+            SinkCommand::QueryTraceProjected { query, response } => {
+                let _ = response.send(query_trace_projected_stripe(&stripe, &query));
+            }
             SinkCommand::QueryMetrics { query, response } => {
                 let _ = response.send(query_metric_stripe(&stripe, &query));
             }
-            SinkCommand::Correlate { query, response } => {
-                let _ = response.send(query_correlation_stripe(&stripe, &query));
+            SinkCommand::QueryMetricTimestamps { query, response } => {
+                let _ = response.send(query_metric_timestamps_stripe(&stripe, &query));
+            }
+            SinkCommand::Correlate {
+                query,
+                buffer,
+                response,
+            } => {
+                let _ = response.send(query_correlation_stripe(&stripe, &query, buffer));
             }
             SinkCommand::Flush { response } => {
                 let result = flush_object_tiers(&mut stripe, &checkpoints);
@@ -816,14 +1256,18 @@ fn run_sink_worker(
 
 /// Cloneable read service for the stripes owned by durable sink workers.
 ///
-/// Queries are sent to every active owner thread first, allowing the bounded
-/// stripe lookups to execute in parallel, and are then merged in the same
-/// deterministic order used by [`crate::ShardTelemetry`].
+/// Global queries are sent to every active owner thread so bounded stripe
+/// lookups can execute in parallel. Partition-affine queries are routed to
+/// their owner before the result is merged in the deterministic order used by
+/// [`crate::ShardTelemetry`].
 #[derive(Debug, Clone)]
 pub struct TelemetryService {
-    workers: Arc<Mutex<HashMap<ShardId, SyncSender<SinkCommand>>>>,
+    workers: Arc<RwLock<QueryWorkerRegistry>>,
+    correlation_buffers: Arc<Mutex<CorrelationBufferPool>>,
+    active_log_partition_cache: Arc<Mutex<HashMap<Arc<str>, Vec<TopicPartition>>>>,
     tier_caches: Option<TierCaches>,
     object_store: Option<SharedTelemetryObjectStore>,
+    router: TelemetryRouter,
 }
 
 impl TelemetryService {
@@ -869,7 +1313,10 @@ impl TelemetryService {
                 })?;
             responses.push((shard_id, receiver));
         }
-        let mut spans = Vec::new();
+        let mut spans = Vec::with_capacity(fanout_result_capacity(
+            Some(query.limit.max(1)),
+            responses.len(),
+        ));
         for (shard_id, receiver) in responses {
             spans.extend(receiver.recv().map_err(|_| {
                 TelemetryError::QueryWorkerUnavailable(format!(
@@ -877,18 +1324,22 @@ impl TelemetryService {
                 ))
             })??);
         }
-        if query.partition.is_some() {
-            spans.sort_unstable_by_key(|span| span.record_ref.offset);
-        } else {
-            spans.sort_unstable_by_key(|span| {
+        sort_and_limit(&mut spans, Some(query.limit.max(1)), |left, right| {
+            if query.partition.is_some() {
+                left.record_ref.offset.cmp(&right.record_ref.offset)
+            } else {
                 (
-                    span.trace_id,
-                    span.start_time_unix_nanos,
-                    span.record_ref.offset,
+                    left.trace_id,
+                    left.start_time_unix_nanos,
+                    left.record_ref.offset,
                 )
-            });
-        }
-        spans.truncate(query.limit.max(1));
+                    .cmp(&(
+                        right.trace_id,
+                        right.start_time_unix_nanos,
+                        right.record_ref.offset,
+                    ))
+            }
+        });
         Ok(spans)
     }
 
@@ -902,10 +1353,40 @@ impl TelemetryService {
         query: &TraceQuery,
     ) -> TelemetryResult<Vec<DurableSpan>> {
         let limit = query.limit.max(1);
+        let mut workers = self.worker_senders()?;
         let mut spans = Vec::with_capacity(limit);
-        for (shard_id, sender) in self.worker_senders()? {
+        if workers.is_empty() {
+            return Ok(spans);
+        }
+        let (first_shard_id, first_sender) = workers.remove(0);
+        let (first_response, first_receiver) = sync_channel(1);
+        let mut first_query = query.clone();
+        first_query.limit = limit;
+        first_sender
+            .send(SinkCommand::QueryTraces {
+                query: first_query,
+                response: first_response,
+            })
+            .map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {first_shard_id} stopped before accepting an unordered trace query"
+                ))
+            })?;
+        spans.extend(first_receiver.recv().map_err(|_| {
+            TelemetryError::QueryWorkerUnavailable(format!(
+                "stripe {first_shard_id} stopped while querying unordered traces"
+            ))
+        })??);
+        if spans.len() >= limit {
+            spans.truncate(limit);
+            return Ok(spans);
+        }
+
+        let remaining = limit.saturating_sub(spans.len());
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
             let mut stripe_query = query.clone();
-            stripe_query.limit = limit.saturating_sub(spans.len());
+            stripe_query.limit = remaining;
             let (response, receiver) = sync_channel(1);
             sender
                 .send(SinkCommand::QueryTraces {
@@ -917,17 +1398,131 @@ impl TelemetryService {
                         "stripe {shard_id} stopped before accepting an unordered trace query"
                     ))
                 })?;
+            responses.push((shard_id, receiver));
+        }
+        for (shard_id, receiver) in responses {
             spans.extend(receiver.recv().map_err(|_| {
                 TelemetryError::QueryWorkerUnavailable(format!(
                     "stripe {shard_id} stopped while querying unordered traces"
                 ))
             })??);
-            if spans.len() >= limit {
-                spans.truncate(limit);
-                break;
-            }
         }
+        spans.truncate(limit);
         Ok(spans)
+    }
+
+    /// Executes a bounded unordered span scan while retaining only scalar
+    /// projection fields for resource-filtered analytical queries.
+    pub(crate) fn query_traces_projected_unordered(
+        &self,
+        query: &TraceQuery,
+    ) -> TelemetryResult<Vec<TraceProjection>> {
+        let limit = query.limit.max(1);
+        let mut workers = self.worker_senders()?;
+        let mut spans = Vec::with_capacity(limit);
+        if workers.is_empty() {
+            return Ok(spans);
+        }
+        let (first_shard_id, first_sender) = workers.remove(0);
+        let (first_response, first_receiver) = sync_channel(1);
+        let mut first_query = query.clone();
+        first_query.limit = limit;
+        first_sender
+            .send(SinkCommand::QueryTraceProjected {
+                query: first_query,
+                response: first_response,
+            })
+            .map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {first_shard_id} stopped before accepting an unordered projected trace query"
+                ))
+            })?;
+        spans.extend(first_receiver.recv().map_err(|_| {
+            TelemetryError::QueryWorkerUnavailable(format!(
+                "stripe {first_shard_id} stopped while querying unordered projected traces"
+            ))
+        })??);
+        if spans.len() >= limit {
+            spans.truncate(limit);
+            return Ok(spans);
+        }
+
+        let remaining = limit.saturating_sub(spans.len());
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let mut stripe_query = query.clone();
+            stripe_query.limit = remaining;
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::QueryTraceProjected {
+                    query: stripe_query,
+                    response,
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting an unordered projected trace query"
+                    ))
+                })?;
+            responses.push((shard_id, receiver));
+        }
+        for (shard_id, receiver) in responses {
+            spans.extend(receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped while querying unordered projected traces"
+                ))
+            })??);
+        }
+        spans.truncate(limit);
+        Ok(spans)
+    }
+
+    /// Executes a partition-affine trace query on its owning worker.
+    pub(crate) fn query_traces_on_shard(
+        &self,
+        shard_id: ShardId,
+        query: &TraceQuery,
+    ) -> TelemetryResult<Vec<DurableSpan>> {
+        let sender = self.worker_sender(shard_id)?;
+        let (response, receiver) = sync_channel(1);
+        sender
+            .send(SinkCommand::QueryTraces {
+                query: query.clone(),
+                response,
+            })
+            .map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped before accepting a targeted trace query"
+                ))
+            })?;
+        receiver.recv().map_err(|_| {
+            TelemetryError::QueryWorkerUnavailable(format!(
+                "stripe {shard_id} stopped while executing a targeted trace query"
+            ))
+        })?
+    }
+
+    pub(crate) fn query_traces_projected_on_shard(
+        &self,
+        shard_id: ShardId,
+        query: &TraceQuery,
+    ) -> TelemetryResult<Vec<TraceProjection>> {
+        let sender = self.worker_sender(shard_id)?;
+        let (response, receiver) = sync_channel(1);
+        sender
+            .send(SinkCommand::QueryTraceProjected {
+                query: query.clone(),
+                response,
+            })
+            .map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped before accepting a targeted projected trace query"
+                ))
+            })?;
+        receiver.recv().map_err(|_| {
+            TelemetryError::QueryWorkerUnavailable(format!(
+                "stripe {shard_id} stopped while executing a targeted projected trace query"
+            ))
+        })?
     }
 
     /// Fans a native raw metric query across all owner stripes and merges by time/offset.
@@ -948,7 +1543,10 @@ impl TelemetryService {
                 })?;
             responses.push((shard_id, receiver));
         }
-        let mut points = Vec::new();
+        let mut points = Vec::with_capacity(fanout_result_capacity(
+            Some(query.limit.max(1)),
+            responses.len(),
+        ));
         for (shard_id, receiver) in responses {
             points.extend(receiver.recv().map_err(|_| {
                 TelemetryError::QueryWorkerUnavailable(format!(
@@ -956,15 +1554,98 @@ impl TelemetryService {
                 ))
             })??);
         }
-        if query.partition.is_some() {
-            points.sort_unstable_by_key(|point| point.record_ref.offset);
-        } else {
-            points.sort_unstable_by_key(|point| {
-                (point.timestamp_unix_nanos, point.record_ref.offset)
-            });
-        }
-        points.truncate(query.limit.max(1));
+        sort_and_limit(&mut points, Some(query.limit.max(1)), |left, right| {
+            if query.partition.is_some() {
+                left.record_ref.offset.cmp(&right.record_ref.offset)
+            } else {
+                (left.timestamp_unix_nanos, left.record_ref.offset)
+                    .cmp(&(right.timestamp_unix_nanos, right.record_ref.offset))
+            }
+        });
         Ok(points)
+    }
+
+    /// Executes a partition-affine metric query on its owning worker.
+    pub(crate) fn query_metrics_on_shard(
+        &self,
+        shard_id: ShardId,
+        query: &MetricQuery,
+    ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        let sender = self.worker_sender(shard_id)?;
+        let (response, receiver) = sync_channel(1);
+        sender
+            .send(SinkCommand::QueryMetrics {
+                query: query.clone(),
+                response,
+            })
+            .map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped before accepting a targeted metric query"
+                ))
+            })?;
+        receiver.recv().map_err(|_| {
+            TelemetryError::QueryWorkerUnavailable(format!(
+                "stripe {shard_id} stopped while executing a targeted metric query"
+            ))
+        })?
+    }
+
+    /// Fans an exact timestamp metric probe across owner stripes.
+    pub(crate) fn query_metric_timestamps(
+        &self,
+        query: &MetricTimestampQuery,
+    ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        let workers = self.worker_senders()?;
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::QueryMetricTimestamps {
+                    query: query.clone(),
+                    response,
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting an exact metric probe"
+                    ))
+                })?;
+            responses.push((shard_id, receiver));
+        }
+        let mut points = Vec::new();
+        for (shard_id, receiver) in responses {
+            points.extend(receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped while executing an exact metric probe"
+                ))
+            })??);
+        }
+        points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
+        Ok(points)
+    }
+
+    /// Executes an exact timestamp metric probe on one owner stripe.
+    pub(crate) fn query_metric_timestamps_on_shard(
+        &self,
+        shard_id: ShardId,
+        query: &MetricTimestampQuery,
+    ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        let sender = self.worker_sender(shard_id)?;
+        let (response, receiver) = sync_channel(1);
+        sender
+            .send(SinkCommand::QueryMetricTimestamps {
+                query: query.clone(),
+                response,
+            })
+            .map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped before accepting an exact metric probe"
+                ))
+            })?;
+        receiver.recv().map_err(|_| {
+            TelemetryError::QueryWorkerUnavailable(format!(
+                "stripe {shard_id} stopped while executing an exact metric probe"
+            ))
+        })?
     }
 
     /// Connects logs, spans, and metric exemplars through exact trace,
@@ -980,9 +1661,15 @@ impl TelemetryService {
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
             let (response, receiver) = sync_channel(1);
+            let buffer = self
+                .correlation_buffers
+                .lock()
+                .map(|mut pool| pool.take())
+                .unwrap_or_default();
             sender
                 .send(SinkCommand::Correlate {
                     query: query.clone(),
+                    buffer,
                     response,
                 })
                 .map_err(|_| {
@@ -992,14 +1679,23 @@ impl TelemetryService {
                 })?;
             responses.push((shard_id, receiver));
         }
-        let mut refs = Vec::new();
+        let mut refs: Option<Vec<TelemetryRecordRef>> = None;
         for (shard_id, receiver) in responses {
-            refs.extend(receiver.recv().map_err(|_| {
+            let worker_refs = receiver.recv().map_err(|_| {
                 TelemetryError::QueryWorkerUnavailable(format!(
                     "stripe {shard_id} stopped while querying correlations"
                 ))
-            })??);
+            })??;
+            if let Some(refs) = refs.as_mut() {
+                refs.extend(worker_refs.iter().copied());
+                if let Ok(mut pool) = self.correlation_buffers.lock() {
+                    pool.recycle(worker_refs);
+                }
+            } else {
+                refs = Some(worker_refs);
+            }
         }
+        let mut refs = refs.unwrap_or_default();
         refs.sort_unstable();
         refs.dedup();
         if let Some(after) = query.after {
@@ -1113,16 +1809,14 @@ impl TelemetryService {
     }
 
     fn worker_senders(&self) -> TelemetryResult<Vec<(ShardId, SyncSender<SinkCommand>)>> {
-        let mut workers = self
+        let workers = self
             .workers
-            .lock()
+            .read()
             .map_err(|_| {
                 TelemetryError::QueryWorkerUnavailable("query registry lock is poisoned".into())
             })?
-            .iter()
-            .map(|(shard_id, sender)| (*shard_id, sender.clone()))
-            .collect::<Vec<_>>();
-        workers.sort_unstable_by_key(|(shard_id, _)| *shard_id);
+            .ordered
+            .clone();
         if workers.is_empty() {
             return Err(TelemetryError::QueryWorkerUnavailable(
                 "no stripe workers are active".into(),
@@ -1131,37 +1825,90 @@ impl TelemetryService {
         Ok(workers)
     }
 
+    fn worker_sender(&self, shard_id: ShardId) -> TelemetryResult<SyncSender<SinkCommand>> {
+        self.workers
+            .read()
+            .map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable("query registry lock is poisoned".into())
+            })?
+            .by_shard
+            .get(&shard_id)
+            .cloned()
+            .ok_or_else(|| {
+                TelemetryError::QueryWorkerUnavailable(format!("stripe {shard_id} is not active"))
+            })
+    }
+
+    fn owner_shard_for_partition(&self, partition: TopicPartition) -> TelemetryResult<ShardId> {
+        let workers = self.worker_senders()?;
+        let owner =
+            usize::try_from(partition.partition_id.get()).unwrap_or_default() % workers.len();
+        Ok(workers[owner].0)
+    }
+
+    pub(crate) fn trace_query_owner_shard(
+        &self,
+        query: &TraceQuery,
+    ) -> TelemetryResult<Option<ShardId>> {
+        let partition = query.partition.or_else(|| {
+            query
+                .trace_id
+                .map(|trace_id| self.router.trace(&query.tenant, trace_id))
+        });
+        partition
+            .map(|partition| self.owner_shard_for_partition(partition))
+            .transpose()
+    }
+
+    pub(crate) fn metric_query_owner_shard(
+        &self,
+        query: &MetricQuery,
+    ) -> TelemetryResult<Option<ShardId>> {
+        let partition = query.partition.or_else(|| {
+            query
+                .series
+                .map(|series| self.router.metric(&query.tenant, series))
+        });
+        partition
+            .map(|partition| self.owner_shard_for_partition(partition))
+            .transpose()
+    }
+
     pub(crate) fn query_partitions(&self, queries: &[LogQuery]) -> TelemetryResult<Vec<LogMatch>> {
         let Some(ordering_query) = queries.first() else {
             return Ok(Vec::new());
         };
         let workers = self.worker_senders()?;
+        let worker_count = workers.len();
+        let shared_queries: Arc<[LogQuery]> = Arc::from(queries.to_vec());
 
-        let mut responses = Vec::with_capacity(workers.len());
+        let (response, receiver) = sync_channel(worker_count);
         for (shard_id, sender) in workers {
-            let (response, receiver) = sync_channel(1);
             sender
                 .send(SinkCommand::Query {
-                    queries: queries.to_vec(),
-                    response,
+                    queries: Arc::clone(&shared_queries),
+                    response: response.clone(),
                 })
                 .map_err(|_| {
                     TelemetryError::QueryWorkerUnavailable(format!(
                         "stripe {shard_id} stopped before accepting a query"
                     ))
                 })?;
-            responses.push((shard_id, receiver));
         }
 
-        let mut matches = Vec::new();
-        for (shard_id, receiver) in responses {
-            matches.extend(receiver.recv().map_err(|_| {
-                TelemetryError::QueryWorkerUnavailable(format!(
-                    "stripe {shard_id} stopped while executing a query"
-                ))
-            })??);
+        let mut matches =
+            Vec::with_capacity(fanout_result_capacity(ordering_query.limit, worker_count));
+        for _ in 0..worker_count {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while executing a query".to_string(),
+                )
+            })?;
+            let worker_matches = worker_result?;
+            matches.reserve(worker_matches.len());
+            matches.extend(worker_matches);
         }
-        matches.sort_unstable_by(|left, right| {
+        sort_and_limit(&mut matches, ordering_query.limit, |left, right| {
             ordering_query
                 .compare(&left.record, &right.record)
                 .then_with(|| {
@@ -1170,10 +1917,404 @@ impl TelemetryService {
                         .cmp(&right.record.stream_shard_id)
                 })
         });
-        if let Some(limit) = ordering_query.limit {
-            matches.truncate(limit);
+        Ok(matches)
+    }
+
+    pub(crate) fn query_partitions_projected_with_fields(
+        &self,
+        queries: &[LogQuery],
+        include_typed_metadata: bool,
+        include_fields: bool,
+    ) -> TelemetryResult<Vec<LogMatch>> {
+        let Some(ordering_query) = queries.first() else {
+            return Ok(Vec::new());
+        };
+        let workers = self.worker_senders()?;
+        let worker_count = workers.len();
+        let mut queries_by_worker = (0..worker_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<LogQuery>>>();
+        for query in queries {
+            let owner = usize::try_from(query.topic_partition.partition_id.get())
+                .unwrap_or_default()
+                % worker_count;
+            queries_by_worker[owner].push(query.clone());
+        }
+        let (response, receiver) = sync_channel(worker_count);
+        let mut dispatched_workers = 0usize;
+        for ((shard_id, sender), worker_queries) in workers.into_iter().zip(queries_by_worker) {
+            if worker_queries.is_empty() {
+                continue;
+            }
+            dispatched_workers += 1;
+            let worker_queries: Arc<[LogQuery]> = Arc::from(worker_queries);
+            sender
+                .send(SinkCommand::QueryProjected {
+                    queries: worker_queries,
+                    include_typed_metadata,
+                    include_fields,
+                    response: response.clone(),
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a projected query"
+                    ))
+                })?;
+        }
+
+        let mut matches = Vec::with_capacity(fanout_result_capacity(
+            ordering_query.limit,
+            dispatched_workers,
+        ));
+        for _ in 0..dispatched_workers {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while executing a projected query".to_string(),
+                )
+            })?;
+            let worker_matches = worker_result?;
+            matches.reserve(worker_matches.len());
+            matches.extend(worker_matches);
+        }
+        sort_and_limit(&mut matches, ordering_query.limit, |left, right| {
+            ordering_query
+                .compare(&left.record, &right.record)
+                .then_with(|| {
+                    left.record
+                        .stream_shard_id
+                        .cmp(&right.record.stream_shard_id)
+                })
+        });
+        Ok(matches)
+    }
+
+    pub(crate) fn query_partitions_projected_unordered_with_fields(
+        &self,
+        queries: &[LogQuery],
+        include_typed_metadata: bool,
+        include_fields: bool,
+    ) -> TelemetryResult<Vec<LogMatch>> {
+        Ok(self
+            .query_partitions_projected_each_with_fields(
+                queries,
+                include_typed_metadata,
+                include_fields,
+            )?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    pub(crate) fn query_partitions_projected_each_with_fields(
+        &self,
+        queries: &[LogQuery],
+        include_typed_metadata: bool,
+        include_fields: bool,
+    ) -> TelemetryResult<Vec<Vec<LogMatch>>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = self.worker_senders()?;
+        let worker_count = workers.len();
+        let (response, receiver) = sync_channel(worker_count);
+        let mut queries_by_worker = (0..worker_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<IndexedProjectedQuery>>>();
+        for (index, query) in queries.iter().enumerate() {
+            let owner = usize::try_from(query.topic_partition.partition_id.get())
+                .unwrap_or_default()
+                % worker_count;
+            queries_by_worker[owner].push(IndexedProjectedQuery {
+                index,
+                query: query.clone(),
+            });
+        }
+        let mut dispatched_workers = 0usize;
+        for ((shard_id, sender), worker_queries) in workers.into_iter().zip(queries_by_worker) {
+            if worker_queries.is_empty() {
+                continue;
+            }
+            dispatched_workers += 1;
+            let worker_queries: Arc<[IndexedProjectedQuery]> = Arc::from(worker_queries);
+            sender
+                .send(SinkCommand::QueryProjectedEach {
+                    queries: worker_queries,
+                    include_typed_metadata,
+                    include_fields,
+                    response: response.clone(),
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting an independent projected query"
+                    ))
+                })?;
+        }
+        let mut matches = queries.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+        for _ in 0..dispatched_workers {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while executing an independent projected query".to_string(),
+                )
+            })?;
+            let worker_matches = worker_result?;
+            for (index, worker) in worker_matches {
+                let combined = matches.get_mut(index).ok_or_else(|| {
+                    TelemetryError::QueryWorkerUnavailable(
+                        "query worker returned an invalid independent result index".into(),
+                    )
+                })?;
+                combined.extend(worker);
+            }
         }
         Ok(matches)
+    }
+
+    pub(crate) fn query_partitions_messages_top_k_unordered(
+        &self,
+        queries: &[LogQuery],
+        scorer: &RelevanceScorer,
+        limit: usize,
+    ) -> TelemetryResult<Vec<LogMessageMatch>> {
+        if queries.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let workers = self.worker_senders()?;
+        let worker_count = workers.len();
+        let mut queries_by_worker = (0..worker_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<LogQuery>>>();
+        for query in queries {
+            let owner = usize::try_from(query.topic_partition.partition_id.get())
+                .unwrap_or_default()
+                % worker_count;
+            queries_by_worker[owner].push(query.clone());
+        }
+        let (response, receiver) = sync_channel(worker_count);
+        let mut dispatched_workers = 0usize;
+        for ((shard_id, sender), worker_queries) in workers.into_iter().zip(queries_by_worker) {
+            if worker_queries.is_empty() {
+                continue;
+            }
+            dispatched_workers += 1;
+            sender
+                .send(SinkCommand::QueryMessagesTopK {
+                    queries: Arc::from(worker_queries),
+                    scorer: scorer.clone(),
+                    limit,
+                    response: response.clone(),
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a top-k message query"
+                    ))
+                })?;
+        }
+        let capacity = fanout_result_capacity(Some(limit), dispatched_workers);
+        let mut matches = Vec::with_capacity(capacity);
+        for _ in 0..dispatched_workers {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while executing a top-k message query".into(),
+                )
+            })?;
+            matches.extend(worker_result?);
+        }
+        Ok(matches)
+    }
+
+    /// Executes an unordered log query while decoding only matching trace IDs.
+    pub(crate) fn query_partitions_trace_ids_unordered(
+        &self,
+        queries: &[LogQuery],
+    ) -> TelemetryResult<Vec<TraceId>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = self.worker_senders()?;
+        let worker_count = workers.len();
+        let mut queries_by_worker = (0..worker_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<LogQuery>>>();
+        for query in queries {
+            let owner = usize::try_from(query.topic_partition.partition_id.get())
+                .unwrap_or_default()
+                % worker_count;
+            queries_by_worker[owner].push(query.clone());
+        }
+        let (response, receiver) = sync_channel(worker_count);
+        let mut dispatched_workers = 0usize;
+        for ((shard_id, sender), worker_queries) in workers.into_iter().zip(queries_by_worker) {
+            if worker_queries.is_empty() {
+                continue;
+            }
+            dispatched_workers += 1;
+            sender
+                .send(SinkCommand::QueryTraceIds {
+                    queries: Arc::from(worker_queries),
+                    response: response.clone(),
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a trace ID query"
+                    ))
+                })?;
+        }
+        let capacity = fanout_result_capacity(None, dispatched_workers);
+        let mut trace_ids = Vec::with_capacity(capacity);
+        for _ in 0..dispatched_workers {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while executing a trace ID query".into(),
+                )
+            })?;
+            trace_ids.extend(worker_result?);
+        }
+        Ok(trace_ids)
+    }
+
+    pub(crate) fn query_partitions_trace_ids_intersection_unordered(
+        &self,
+        outer_queries: &[LogQuery],
+        inner_queries: &[LogQuery],
+    ) -> TelemetryResult<Vec<TraceId>> {
+        if outer_queries.is_empty() || inner_queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = self.worker_senders()?;
+        let worker_count = workers.len();
+        let same_partitions = outer_queries.len() == inner_queries.len()
+            && outer_queries
+                .iter()
+                .zip(inner_queries)
+                .all(|(outer, inner)| outer.topic_partition == inner.topic_partition);
+        if !same_partitions {
+            let shared_outer_queries: Arc<[LogQuery]> = Arc::from(outer_queries.to_vec());
+            let shared_inner_queries: Arc<[LogQuery]> = Arc::from(inner_queries.to_vec());
+            let (response, receiver) = sync_channel(worker_count);
+            for (shard_id, sender) in workers {
+                sender
+                    .send(SinkCommand::QueryTraceIdIntersection {
+                        outer_queries: Arc::clone(&shared_outer_queries),
+                        inner_queries: Arc::clone(&shared_inner_queries),
+                        response: response.clone(),
+                    })
+                    .map_err(|_| {
+                        TelemetryError::QueryWorkerUnavailable(format!(
+                            "stripe {shard_id} stopped before accepting a trace ID intersection query"
+                        ))
+                    })?;
+            }
+            let capacity = fanout_result_capacity(None, worker_count);
+            let mut trace_ids = Vec::with_capacity(capacity);
+            for _ in 0..worker_count {
+                let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(
+                        "a stripe stopped while executing a trace ID intersection query".into(),
+                    )
+                })?;
+                trace_ids.extend(worker_result?);
+            }
+            return Ok(trace_ids);
+        }
+        let mut outer_by_worker = (0..worker_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<LogQuery>>>();
+        let mut inner_by_worker = (0..worker_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<LogQuery>>>();
+        for (outer, inner) in outer_queries.iter().zip(inner_queries) {
+            let owner = usize::try_from(outer.topic_partition.partition_id.get())
+                .unwrap_or_default()
+                % worker_count;
+            outer_by_worker[owner].push(outer.clone());
+            inner_by_worker[owner].push(inner.clone());
+        }
+        let (response, receiver) = sync_channel(worker_count);
+        let mut dispatched_workers = 0usize;
+        for (((shard_id, sender), outer_queries), inner_queries) in workers
+            .into_iter()
+            .zip(outer_by_worker)
+            .zip(inner_by_worker)
+        {
+            if outer_queries.is_empty() {
+                continue;
+            }
+            dispatched_workers += 1;
+            sender
+                .send(SinkCommand::QueryTraceIdIntersection {
+                    outer_queries: Arc::from(outer_queries),
+                    inner_queries: Arc::from(inner_queries),
+                    response: response.clone(),
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a trace ID intersection query"
+                    ))
+                })?;
+        }
+        let capacity = fanout_result_capacity(None, dispatched_workers);
+        let mut trace_ids = Vec::with_capacity(capacity);
+        for _ in 0..dispatched_workers {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while executing a trace ID intersection query".into(),
+                )
+            })?;
+            trace_ids.extend(worker_result?);
+        }
+        Ok(trace_ids)
+    }
+
+    /// Executes a single partition-affine projected log query on its owner.
+    pub(crate) fn query_partition_projected_on_shard(
+        &self,
+        shard_id: ShardId,
+        query: &LogQuery,
+        include_typed_metadata: bool,
+    ) -> TelemetryResult<Vec<LogMatch>> {
+        self.query_partition_projected_on_shard_with_fields(
+            shard_id,
+            query,
+            include_typed_metadata,
+            true,
+        )
+    }
+
+    pub(crate) fn query_partition_projected_on_shard_with_fields(
+        &self,
+        shard_id: ShardId,
+        query: &LogQuery,
+        include_typed_metadata: bool,
+        include_fields: bool,
+    ) -> TelemetryResult<Vec<LogMatch>> {
+        let sender = self.worker_sender(shard_id)?;
+        TARGETED_PROJECTED_QUERY_RESPONSE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(sync_channel(1));
+            }
+            let (response_sender, receiver) = slot
+                .as_ref()
+                .expect("targeted projected query response channel was initialized");
+            sender
+                .send(SinkCommand::QueryProjectedSingle {
+                    query: query.clone(),
+                    include_typed_metadata,
+                    include_fields,
+                    response: response_sender.clone(),
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a targeted projected query"
+                    ))
+                })?;
+            let (_response_shard_id, result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped while executing a targeted projected query"
+                ))
+            })?;
+            result
+        })
     }
 
     /// Counts exact tenant-bound log appends across every owner stripe without
@@ -1184,34 +2325,141 @@ impl TelemetryService {
         partitions: Vec<TopicPartition>,
     ) -> TelemetryResult<u64> {
         let workers = self.worker_senders()?;
-        let mut responses = Vec::with_capacity(workers.len());
+        let worker_count = workers.len();
+        let (response, receiver) = sync_channel(worker_count);
         for (shard_id, sender) in workers {
-            let (response, receiver) = sync_channel(1);
             sender
                 .send(SinkCommand::CountLogs {
                     tenant: Arc::clone(&tenant),
                     partitions: partitions.clone(),
-                    response,
+                    response: response.clone(),
                 })
                 .map_err(|_| {
                     TelemetryError::QueryWorkerUnavailable(format!(
                         "stripe {shard_id} stopped before accepting a log count"
                     ))
                 })?;
-            responses.push((shard_id, receiver));
         }
-        responses
-            .into_iter()
-            .try_fold(0_u64, |total, (shard_id, receiver)| {
-                let count = receiver.recv().map_err(|_| {
+        let mut total = 0_u64;
+        for _ in 0..worker_count {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while counting logs".into(),
+                )
+            })?;
+            let count = worker_result?;
+            total = total
+                .checked_add(count)
+                .ok_or(TelemetryError::RecordTooLarge)?;
+        }
+        Ok(total)
+    }
+
+    /// Counts exact matches across every owner stripe without constructing
+    /// normalized log rows.
+    pub(crate) fn count_queries(&self, queries: &[LogQuery]) -> TelemetryResult<u64> {
+        if queries.is_empty() {
+            return Ok(0);
+        }
+        let workers = self.worker_senders()?;
+        let worker_count = workers.len();
+        let mut queries_by_worker = (0..worker_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<LogQuery>>>();
+        for query in queries {
+            let owner = usize::try_from(query.topic_partition.partition_id.get())
+                .unwrap_or_default()
+                % worker_count;
+            queries_by_worker[owner].push(query.clone());
+        }
+        let (response, receiver) = sync_channel(worker_count);
+        let mut dispatched_workers = 0usize;
+        for ((shard_id, sender), worker_queries) in workers.into_iter().zip(queries_by_worker) {
+            if worker_queries.is_empty() {
+                continue;
+            }
+            dispatched_workers += 1;
+            sender
+                .send(SinkCommand::CountQueries {
+                    queries: worker_queries,
+                    response: response.clone(),
+                })
+                .map_err(|_| {
                     TelemetryError::QueryWorkerUnavailable(format!(
-                        "stripe {shard_id} stopped while counting logs"
+                        "stripe {shard_id} stopped before accepting a count query"
                     ))
-                })??;
-                total
+                })?;
+        }
+        let mut total = 0_u64;
+        for _ in 0..dispatched_workers {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while counting query matches".into(),
+                )
+            })?;
+            let count = worker_result?;
+            total = total
+                .checked_add(count)
+                .ok_or(TelemetryError::RecordTooLarge)?;
+        }
+        Ok(total)
+    }
+
+    /// Counts grouped matches across every owner stripe without materializing
+    /// normalized log rows.
+    pub(crate) fn group_queries(
+        &self,
+        queries: &[LogQuery],
+        keys: &[crate::AnalyticsGroupKey],
+    ) -> TelemetryResult<BTreeMap<Vec<Option<Arc<str>>>, u64>> {
+        if queries.is_empty() || keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let workers = self.worker_senders()?;
+        let worker_count = workers.len();
+        let mut queries_by_worker = (0..worker_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<LogQuery>>>();
+        for query in queries {
+            let owner = usize::try_from(query.topic_partition.partition_id.get())
+                .unwrap_or_default()
+                % worker_count;
+            queries_by_worker[owner].push(query.clone());
+        }
+        let (response, receiver) = sync_channel(worker_count);
+        let mut dispatched_workers = 0usize;
+        for ((shard_id, sender), worker_queries) in workers.into_iter().zip(queries_by_worker) {
+            if worker_queries.is_empty() {
+                continue;
+            }
+            dispatched_workers += 1;
+            sender
+                .send(SinkCommand::GroupQueries {
+                    queries: worker_queries,
+                    keys: keys.to_vec(),
+                    response: response.clone(),
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a grouped query"
+                    ))
+                })?;
+        }
+        let mut total = BTreeMap::<Vec<Option<Arc<str>>>, u64>::new();
+        for _ in 0..dispatched_workers {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while counting grouped matches".into(),
+                )
+            })?;
+            for (key, count) in worker_result? {
+                let total_count = total.entry(key).or_default();
+                *total_count = total_count
                     .checked_add(count)
-                    .ok_or(TelemetryError::RecordTooLarge)
-            })
+                    .ok_or(TelemetryError::RecordTooLarge)?;
+            }
+        }
+        Ok(total)
     }
 
     /// Resolves the exact logical log partitions currently containing a
@@ -1220,33 +2468,42 @@ impl TelemetryService {
         &self,
         tenant: Arc<str>,
     ) -> TelemetryResult<Vec<TopicPartition>> {
+        let mut cache = self.active_log_partition_cache.lock().map_err(|_| {
+            TelemetryError::QueryWorkerUnavailable(
+                "active log partition cache lock poisoned".into(),
+            )
+        })?;
+        if let Some(partitions) = cache.get(&tenant) {
+            return Ok(partitions.clone());
+        }
         let workers = self.worker_senders()?;
-        let mut responses = Vec::with_capacity(workers.len());
+        let worker_count = workers.len();
+        let (response, receiver) = sync_channel(worker_count);
         for (shard_id, sender) in workers {
-            let (response, receiver) = sync_channel(1);
             sender
                 .send(SinkCommand::ActiveLogPartitions {
                     tenant: Arc::clone(&tenant),
-                    response,
+                    response: response.clone(),
                 })
                 .map_err(|_| {
                     TelemetryError::QueryWorkerUnavailable(format!(
                         "stripe {shard_id} stopped before resolving active log partitions"
                     ))
                 })?;
-            responses.push((shard_id, receiver));
         }
 
         let mut partitions = Vec::new();
-        for (shard_id, receiver) in responses {
-            partitions.extend(receiver.recv().map_err(|_| {
-                TelemetryError::QueryWorkerUnavailable(format!(
-                    "stripe {shard_id} stopped while resolving active log partitions"
-                ))
-            })??);
+        for _ in 0..worker_count {
+            let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "a stripe stopped while resolving active log partitions".into(),
+                )
+            })?;
+            partitions.extend(worker_result?);
         }
         partitions.sort_unstable();
         partitions.dedup();
+        cache.insert(tenant, partitions.clone());
         Ok(partitions)
     }
 }
@@ -1255,6 +2512,7 @@ fn apply_durable_appends(
     stripe: &mut TelemetryStripeState,
     checkpoints: &Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>,
     journal: Option<&SinkJournal>,
+    validated_signal_cache: &ValidatedSignalCache,
     expected: DurableSinkCheckpoint,
     appends: &[DurableAppend],
     next: DurableSinkCheckpoint,
@@ -1290,7 +2548,18 @@ fn apply_durable_appends(
             .append(expected, appends, next)
             .map_err(log_error_to_engine)?;
     }
-    index_durable_appends(stripe, appends, expected, next).map_err(log_error_to_engine)?;
+    // StreamEngine calls the sink factory's validate_append before delivering
+    // live commands. The Bytes payload is then forwarded unchanged, so the
+    // indexer can retain its slice without repeating the envelope checksum.
+    index_durable_appends(
+        stripe,
+        appends,
+        validated_signal_cache,
+        true,
+        expected,
+        next,
+    )
+    .map_err(log_error_to_engine)?;
     stripe
         .logs
         .offload_indexed_groups(false)
@@ -1314,6 +2583,8 @@ fn apply_durable_appends(
 fn index_durable_appends(
     stripe: &mut TelemetryStripeState,
     appends: &[DurableAppend],
+    validated_signal_cache: &ValidatedSignalCache,
+    already_validated: bool,
     expected: DurableSinkCheckpoint,
     next: DurableSinkCheckpoint,
 ) -> TelemetryResult<()> {
@@ -1333,19 +2604,24 @@ fn index_durable_appends(
             Some(append.reservation.record_count.get()),
             &append.payload,
             append.transient_context.as_deref(),
+            Some(validated_signal_cache),
+            already_validated,
             (expected, next),
         )?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn index_payload(
     stripe: &mut TelemetryStripeState,
     topic_partition: TopicPartition,
     first_offset: shard_stream_core::LogicalOffset,
     expected_count: Option<u32>,
-    payload: &[u8],
+    payload: &Bytes,
     transient_context: Option<&[u8]>,
+    validated_signal_cache: Option<&ValidatedSignalCache>,
+    already_validated: bool,
     checkpoints: (DurableSinkCheckpoint, DurableSinkCheckpoint),
 ) -> TelemetryResult<()> {
     if !TelemetryEnvelope::is_encoded(payload) {
@@ -1353,7 +2629,11 @@ fn index_payload(
             "durable telemetry append is not a STEL envelope",
         ));
     }
-    let envelope = TelemetryEnvelope::decode(payload)?;
+    let envelope = if already_validated {
+        crate::envelope::TelemetryEnvelope::decode_view_after_validation(payload)?
+    } else {
+        crate::envelope::TelemetryEnvelope::decode_view(payload)?
+    };
     if envelope.signal.topic_id() != topic_partition.topic_id {
         return Err(TelemetryError::InvalidTelemetryEnvelope(
             "signal does not match its shard-stream topic",
@@ -1364,21 +2644,37 @@ fn index_payload(
             "durable reservation count disagrees with envelope",
         ));
     }
+    let cached_signal = match envelope.signal {
+        TelemetrySignal::Logs => None,
+        TelemetrySignal::Traces | TelemetrySignal::Metrics => {
+            validated_signal_cache.and_then(|cache| cache.take(envelope.checksum))
+        }
+    };
     match envelope.signal {
         TelemetrySignal::Logs => {
-            validate_ingest_pack(&envelope.payload, envelope.item_count)?;
+            // `decode_indexed_ingest_frames` validates every compressed group
+            // before publishing its frame metadata. Repeating that checksum
+            // scan here only burns CPU on the live path; the same validation
+            // remains active during recovery through the stripe apply path.
+            let payload_start = payload.len().checked_sub(envelope.payload.len()).ok_or(
+                TelemetryError::InvalidTelemetryEnvelope("log payload is outside its envelope"),
+            )?;
             stripe.logs.apply_checkpointed_ingest_pack(
-                Arc::clone(&envelope.tenant),
+                Arc::from(envelope.tenant),
                 topic_partition,
                 first_offset,
                 envelope.item_count,
-                Bytes::copy_from_slice(&envelope.payload),
+                payload.slice(payload_start..),
                 transient_context,
+                already_validated,
                 checkpoints,
             )?;
         }
         TelemetrySignal::Traces => {
-            let records = decode_trace_block(&envelope.payload)?;
+            let records = match cached_signal {
+                Some(ValidatedSignalPayload::Traces(records)) => records,
+                _ => decode_trace_block(envelope.payload)?,
+            };
             validate_relative_offsets(
                 records.iter().map(|record| record.record_ref.offset),
                 envelope.item_count,
@@ -1391,7 +2687,7 @@ fn index_payload(
                     absolute_offset(topic_partition, first_offset, record.record_ref.offset)?,
                 );
                 let append_time = record.end_time_unix_nanos().unwrap_or(u64::MAX);
-                let outcome = stripe.traces.apply(record.clone(), append_time)?;
+                let outcome = stripe.traces.apply_ref(&record, append_time)?;
                 if matches!(
                     outcome,
                     TraceApplyOutcome::Inserted | TraceApplyOutcome::Replaced
@@ -1417,7 +2713,10 @@ fn index_payload(
                 ));
             }
             let protocol = MetricIngestProtocol::from_wire(envelope.routing_metadata[4])?;
-            let records = decode_metric_chunk(&envelope.payload)?;
+            let records = match cached_signal {
+                Some(ValidatedSignalPayload::Metrics(records)) => records,
+                _ => decode_metric_chunk(envelope.payload)?,
+            };
             validate_relative_offsets(
                 records.iter().map(|record| record.record_ref.offset),
                 envelope.item_count,
@@ -1429,7 +2728,7 @@ fn index_payload(
                     topic_partition,
                     absolute_offset(topic_partition, first_offset, record.record_ref.offset)?,
                 );
-                let outcome = stripe.metrics.apply(record.clone(), protocol)?;
+                let outcome = stripe.metrics.apply_ref(&record, protocol)?;
                 if matches!(
                     outcome,
                     MetricApplyOutcome::Inserted
@@ -1784,6 +3083,9 @@ fn query_trace_stripe(
     stripe: &TelemetryStripeState,
     query: &TraceQuery,
 ) -> TelemetryResult<Vec<DurableSpan>> {
+    let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Traces) else {
+        return stripe.traces.query(query);
+    };
     let mut storage_query = query.clone();
     storage_query.start_offset = None;
     let mut winners = BTreeMap::new();
@@ -1793,36 +3095,34 @@ fn query_trace_stripe(
             span,
         );
     }
-    if let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Traces) {
-        let partitions = if let Some(partition) = query.partition {
-            vec![partition]
-        } else {
-            query.trace_id.map_or_else(
-                || state.tiers.keys().copied().collect::<Vec<_>>(),
-                |trace_id| vec![stripe.router.trace(&query.tenant, trace_id)],
-            )
-        };
-        let identity = query
-            .trace_id
-            .map(|trace_id| u128::from_be_bytes(*trace_id.as_bytes()));
-        for payload in read_signal_tier_payloads(
-            state,
-            &partitions,
-            TierQueryRange {
-                min_timestamp_unix_nanos: query.start_time_unix_nanos,
-                max_timestamp_unix_nanos: query.end_time_unix_nanos,
-                signal_identity: identity,
-                ..TierQueryRange::default()
-            },
-            None,
-        )? {
-            for span in decode_trace_block_matching(payload.as_ref(), &storage_query)? {
-                let key = (Arc::clone(&span.tenant), span.trace_id, span.span_id);
-                if winners.get(&key).is_none_or(|existing: &DurableSpan| {
-                    existing.record_ref.offset < span.record_ref.offset
-                }) {
-                    winners.insert(key, span);
-                }
+    let partitions = if let Some(partition) = query.partition {
+        vec![partition]
+    } else {
+        query.trace_id.map_or_else(
+            || state.tiers.keys().copied().collect::<Vec<_>>(),
+            |trace_id| vec![stripe.router.trace(&query.tenant, trace_id)],
+        )
+    };
+    let identity = query
+        .trace_id
+        .map(|trace_id| u128::from_be_bytes(*trace_id.as_bytes()));
+    for payload in read_signal_tier_payloads(
+        state,
+        &partitions,
+        TierQueryRange {
+            min_timestamp_unix_nanos: query.start_time_unix_nanos,
+            max_timestamp_unix_nanos: query.end_time_unix_nanos,
+            signal_identity: identity,
+            ..TierQueryRange::default()
+        },
+        None,
+    )? {
+        for span in decode_trace_block_matching(payload.as_ref(), &storage_query)? {
+            let key = (Arc::clone(&span.tenant), span.trace_id, span.span_id);
+            if winners.get(&key).is_none_or(|existing: &DurableSpan| {
+                existing.record_ref.offset < span.record_ref.offset
+            }) {
+                winners.insert(key, span);
             }
         }
     }
@@ -1849,6 +3149,94 @@ fn query_trace_stripe(
     Ok(spans)
 }
 
+fn query_trace_projected_stripe(
+    stripe: &TelemetryStripeState,
+    query: &TraceQuery,
+) -> TelemetryResult<Vec<TraceProjection>> {
+    if stripe.signal_tiers.contains_key(&TelemetrySignal::Traces) {
+        return query_trace_stripe(stripe, query)
+            .map(|spans| spans.iter().map(TraceProjection::from_span).collect());
+    }
+    stripe.traces.query_projected(query)
+}
+
+fn query_metric_timestamps_stripe(
+    stripe: &TelemetryStripeState,
+    query: &MetricTimestampQuery,
+) -> TelemetryResult<Vec<DurableMetricPoint>> {
+    let Some(first_timestamp) = query.timestamps.first().copied() else {
+        return Ok(Vec::new());
+    };
+    let last_timestamp = query
+        .timestamps
+        .last()
+        .copied()
+        .expect("nonempty timestamp query has a last timestamp");
+    let storage_query = MetricQuery {
+        tenant: Arc::clone(&query.tenant),
+        partition: Some(query.partition),
+        series: Some(query.series),
+        start_time_unix_nanos: Some(first_timestamp),
+        end_time_unix_nanos: Some(last_timestamp),
+        limit: usize::MAX,
+        ..MetricQuery::default()
+    };
+    let mut winners = BTreeMap::<u64, DurableMetricPoint>::new();
+    for point in stripe
+        .metrics
+        .query_exact_timestamps(&storage_query, &query.timestamps)?
+    {
+        winners.insert(point.timestamp_unix_nanos, point);
+    }
+
+    let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Metrics) else {
+        return Ok(winners.into_values().collect());
+    };
+    let partitions = [query.partition];
+    if partitions.iter().all(|partition| {
+        state
+            .tiers
+            .get(partition)
+            .is_none_or(|tier| tier.root().pages.is_empty())
+    }) {
+        return Ok(winners.into_values().collect());
+    }
+    for payload in read_signal_tier_payloads(
+        state,
+        &partitions,
+        TierQueryRange {
+            min_timestamp_unix_nanos: Some(first_timestamp),
+            max_timestamp_unix_nanos: Some(last_timestamp),
+            signal_identity: Some(query.series.get()),
+            ..TierQueryRange::default()
+        },
+        None,
+    )? {
+        let points = decode_metric_chunk(payload.as_ref())?;
+        if points
+            .first()
+            .is_none_or(|point| point.series_fingerprint() != query.series)
+        {
+            continue;
+        }
+        for point in points.into_iter().filter(|point| {
+            point.record_ref.topic_partition == query.partition
+                && query
+                    .timestamps
+                    .binary_search(&point.timestamp_unix_nanos)
+                    .is_ok()
+        }) {
+            if winners
+                .get(&point.timestamp_unix_nanos)
+                .is_none_or(|existing| existing.record_ref.offset < point.record_ref.offset)
+            {
+                winners.insert(point.timestamp_unix_nanos, point);
+            }
+        }
+    }
+    Ok(winners.into_values().collect())
+}
+
 fn query_metric_stripe(
     stripe: &TelemetryStripeState,
     query: &MetricQuery,
@@ -1857,8 +3245,30 @@ fn query_metric_stripe(
     storage_query.start_offset = None;
     let resident = stripe.metrics.query(&storage_query)?;
     let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Metrics) else {
+        if query.start_offset.is_none() {
+            return Ok(resident);
+        }
         return Ok(finalize_metric_query(resident, query));
     };
+    let partitions = if let Some(partition) = query.partition {
+        vec![partition]
+    } else {
+        query.series.map_or_else(
+            || state.tiers.keys().copied().collect::<Vec<_>>(),
+            |series| vec![stripe.router.metric(&query.tenant, series)],
+        )
+    };
+    if partitions.iter().all(|partition| {
+        state
+            .tiers
+            .get(partition)
+            .is_none_or(|tier| tier.root().pages.is_empty())
+    }) {
+        if query.start_offset.is_none() {
+            return Ok(resident);
+        }
+        return Ok(finalize_metric_query(resident, query));
+    }
     let mut winners = BTreeMap::new();
     for point in resident {
         winners.insert(
@@ -1869,14 +3279,6 @@ fn query_metric_stripe(
             point,
         );
     }
-    let partitions = if let Some(partition) = query.partition {
-        vec![partition]
-    } else {
-        query.series.map_or_else(
-            || state.tiers.keys().copied().collect::<Vec<_>>(),
-            |series| vec![stripe.router.metric(&query.tenant, series)],
-        )
-    };
     for payload in read_signal_tier_payloads(
         state,
         &partitions,
@@ -1889,28 +3291,48 @@ fn query_metric_stripe(
         None,
     )? {
         let points = decode_metric_chunk(payload.as_ref())?;
+        let chunk_series = points.first().map(DurableMetricPoint::series_fingerprint);
         if let Some(series) = query.series
-            && points
-                .first()
-                .is_some_and(|point| point.series_fingerprint() != series)
+            && chunk_series.is_some_and(|chunk_series| chunk_series != series)
         {
             continue;
         }
-        for point in points
-            .into_iter()
-            .filter(|point| metric_query_matches(&storage_query, point))
-        {
-            let key = (
-                query.series.unwrap_or_else(|| point.series_fingerprint()),
-                point.timestamp_unix_nanos,
-            );
-            if winners
-                .get(&key)
-                .is_none_or(|existing: &DurableMetricPoint| {
-                    existing.record_ref.offset < point.record_ref.offset
-                })
+        if let Some(series) = query.series {
+            // A metric tier payload is encoded from one series. The first
+            // point check above verifies that invariant before the hot loop,
+            // so avoid recomputing the full identity and label predicate for
+            // every decoded point.
+            for point in points
+                .into_iter()
+                .filter(|point| metric_exact_series_point_matches(&storage_query, point))
             {
-                winners.insert(key, point);
+                let key = (series, point.timestamp_unix_nanos);
+                if winners
+                    .get(&key)
+                    .is_none_or(|existing: &DurableMetricPoint| {
+                        existing.record_ref.offset < point.record_ref.offset
+                    })
+                {
+                    winners.insert(key, point);
+                }
+            }
+        } else {
+            for point in points
+                .into_iter()
+                .filter(|point| metric_query_matches(&storage_query, point))
+            {
+                let key = (
+                    chunk_series.expect("metric tier payload is nonempty"),
+                    point.timestamp_unix_nanos,
+                );
+                if winners
+                    .get(&key)
+                    .is_none_or(|existing: &DurableMetricPoint| {
+                        existing.record_ref.offset < point.record_ref.offset
+                    })
+                {
+                    winners.insert(key, point);
+                }
             }
         }
     }
@@ -1941,16 +3363,18 @@ fn finalize_metric_query(
 fn query_correlation_stripe(
     stripe: &TelemetryStripeState,
     query: &CorrelationQuery,
+    mut refs: Vec<TelemetryRecordRef>,
 ) -> TelemetryResult<Vec<TelemetryRecordRef>> {
+    refs.clear();
     if query.limit == 0
         || (query.trace_id.is_none()
             && query.resource_id.is_none()
             && query.scope_id.is_none()
             && query.attributes.is_empty())
     {
-        return Ok(Vec::new());
+        return Ok(refs);
     }
-    let mut refs = stripe.correlations.query(query);
+    stripe.correlations.query_into(query, &mut refs);
     if query
         .signal
         .is_none_or(|signal| signal == TelemetrySignal::Logs)
@@ -2172,6 +3596,80 @@ mod tests {
     use super::*;
 
     struct TempDir(PathBuf);
+
+    #[test]
+    fn query_worker_registry_keeps_a_sorted_snapshot() {
+        let (sender_three, _receiver_three) = sync_channel::<SinkCommand>(1);
+        let (sender_one, _receiver_one) = sync_channel::<SinkCommand>(1);
+        let (sender_two, _receiver_two) = sync_channel::<SinkCommand>(1);
+        let mut registry = QueryWorkerRegistry::default();
+
+        registry.insert(ShardId::new(3), sender_three);
+        registry.insert(ShardId::new(1), sender_one);
+        registry.insert(ShardId::new(2), sender_two);
+        assert_eq!(
+            registry
+                .ordered
+                .iter()
+                .map(|(shard_id, _)| shard_id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        registry.remove(ShardId::new(2));
+        assert_eq!(
+            registry
+                .ordered
+                .iter()
+                .map(|(shard_id, _)| shard_id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn validated_signal_cache_shards_retain_and_consume_payloads() {
+        let cache = ValidatedSignalCache::default();
+        let mut trace_key = [0_u8; 32];
+        trace_key[0] = 3;
+        let mut metric_key = [0_u8; 32];
+        metric_key[0] = 4;
+
+        cache.insert(trace_key, 1, ValidatedSignalPayload::Traces(Vec::new()));
+        cache.insert(metric_key, 1, ValidatedSignalPayload::Metrics(Vec::new()));
+
+        assert!(matches!(
+            cache.take(trace_key),
+            Some(ValidatedSignalPayload::Traces(_))
+        ));
+        assert!(matches!(
+            cache.take(metric_key),
+            Some(ValidatedSignalPayload::Metrics(_))
+        ));
+        assert!(cache.take(trace_key).is_none());
+    }
+
+    #[test]
+    fn correlation_buffer_pool_reuses_only_bounded_buffers() {
+        let mut pool = CorrelationBufferPool::default();
+        pool.recycle(Vec::with_capacity(8));
+        let reused = pool.take();
+        assert!(reused.capacity() >= 8);
+        assert!(reused.is_empty());
+
+        pool.recycle(Vec::with_capacity(MAX_CORRELATION_BUFFER_CAPACITY + 1));
+        assert!(pool.buffers.is_empty());
+    }
+
+    #[test]
+    fn bounded_fanout_merge_sorts_only_the_selected_prefix() {
+        let mut values = vec![9, 1, 5, 1, 3, 8, 2];
+        sort_and_limit(&mut values, Some(4), Ord::cmp);
+        assert_eq!(values, vec![1, 1, 2, 3]);
+
+        sort_and_limit(&mut values, None, Ord::cmp);
+        assert_eq!(values, vec![1, 1, 2, 3]);
+    }
 
     impl TempDir {
         fn new(name: &str) -> Self {

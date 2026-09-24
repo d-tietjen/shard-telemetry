@@ -1,12 +1,15 @@
 use std::future::Future;
 use std::io;
+use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::loki_api::LokiApiError;
+use crate::native_protocol::{NativeEncodedPartitionAppend, encode_native_log_query_matches};
 use crate::{
     DurableTelemetryStore, MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeCapabilities,
     NativeFrame, NativeFrameHeader, NativeOpcode, NativeStatus, NativeTelemetryBatch,
@@ -14,6 +17,23 @@ use crate::{
     decode_native_trace_query, encode_native_capabilities, encode_native_log_query_result,
     encode_native_metric_query_result, encode_native_trace_query_result, is_native_telemetry_batch,
 };
+
+enum ValidatedNativeAppend {
+    Owned {
+        batch: NativeTelemetryBatch,
+        wire_ranges: Vec<(Range<usize>, Option<Range<usize>>)>,
+    },
+    Borrowed {
+        topic_partition: shard_stream_core::TopicPartition,
+        tenant: Arc<str>,
+        item_count: u32,
+        envelope_range: Range<usize>,
+        transient_range: Option<Range<usize>>,
+    },
+    BorrowedMany {
+        partitions: Vec<NativeEncodedPartitionAppend>,
+    },
+}
 
 /// Product-owned admission check evaluated for every native append and query.
 ///
@@ -380,7 +400,9 @@ async fn serve_connection(
         } else {
             reader.read_exact(&mut payload).await?;
         }
-        header.verify_payload(&payload).map_err(invalid_data)?;
+        let payload_hash = header
+            .verify_payload_and_hash(&payload)
+            .map_err(invalid_data)?;
         if !authenticated {
             let response = authenticate_frame(header, &payload, &config);
             authenticated = response.header.status == NativeStatus::Ok;
@@ -434,7 +456,7 @@ async fn serve_connection(
                     "clients must send request frames with status OK",
                 )
             } else {
-                dispatch(header, payload, store, &request_config).await
+                dispatch(header, payload, payload_hash, store, &request_config).await
             };
             let _ = enqueue_response(
                 &responses,
@@ -502,6 +524,7 @@ fn authenticate_frame(
 async fn dispatch(
     header: NativeFrameHeader,
     payload: Vec<u8>,
+    payload_hash: blake3::Hash,
     store: Arc<DurableTelemetryStore>,
     config: &NativeServerConfig,
 ) -> NativeFrame {
@@ -551,7 +574,7 @@ async fn dispatch(
             NativeStatus::BadRequest,
             "connection is already authenticated",
         ),
-        NativeOpcode::Append => {
+        NativeOpcode::Append | NativeOpcode::AppendUntracked => {
             let runtime = config.production.clone();
             let ingest_permit = match runtime.as_ref() {
                 Some(runtime) => match runtime.try_ingest(payload.len()) {
@@ -581,22 +604,130 @@ async fn dispatch(
                     "native append requires the signal-aware STB1 payload",
                 );
             }
-            let telemetry_batch = match NativeTelemetryBatch::decode_native_append(&payload) {
-                Ok(batch) => batch,
-                Err(error) => {
-                    return error_frame(header, NativeStatus::BadRequest, &error.to_string());
+            let retryable = header.opcode == NativeOpcode::Append;
+            let multi_partition_untracked = !retryable
+                && payload.len() >= 6
+                && u16::from_le_bytes([payload[4], payload[5]]) > 1;
+            let validated = if config.request_gate.is_some() {
+                let (telemetry_batch, wire_ranges) = if retryable {
+                    let (batch, envelope_range) =
+                        match NativeTelemetryBatch::decode_native_append_with_envelope_range(
+                            &payload,
+                        ) {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                return error_frame(
+                                    header,
+                                    NativeStatus::BadRequest,
+                                    &error.to_string(),
+                                );
+                            }
+                        };
+                    (batch, vec![(envelope_range, None)])
+                } else {
+                    match NativeTelemetryBatch::decode_with_envelope_ranges(&payload) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            return error_frame(
+                                header,
+                                NativeStatus::BadRequest,
+                                &error.to_string(),
+                            );
+                        }
+                    }
+                };
+                if let Some(gate) = &config.request_gate
+                    && let Err(error) = gate.check_partitions(&telemetry_batch.partitions)
+                {
+                    return error_frame(header, NativeStatus::Unavailable, &error);
+                }
+                if telemetry_batch.partitions.windows(2).any(|partitions| {
+                    partitions[0].envelope.tenant != partitions[1].envelope.tenant
+                }) {
+                    return error_frame(
+                        header,
+                        NativeStatus::BadRequest,
+                        "native telemetry batch must contain one tenant",
+                    );
+                }
+                ValidatedNativeAppend::Owned {
+                    batch: telemetry_batch,
+                    wire_ranges,
+                }
+            } else if multi_partition_untracked {
+                let (views, wire_ranges) =
+                    match NativeTelemetryBatch::decode_native_append_views_with_ranges(&payload) {
+                        Ok(views) => views,
+                        Err(error) => {
+                            return error_frame(
+                                header,
+                                NativeStatus::BadRequest,
+                                &error.to_string(),
+                            );
+                        }
+                    };
+                if views.is_empty() {
+                    return error_frame(
+                        header,
+                        NativeStatus::BadRequest,
+                        "native telemetry batch requires at least one partition",
+                    );
+                }
+                if views
+                    .windows(2)
+                    .any(|partitions| partitions[0].tenant != partitions[1].tenant)
+                {
+                    return error_frame(
+                        header,
+                        NativeStatus::BadRequest,
+                        "native telemetry batch must contain one tenant",
+                    );
+                }
+                let partitions: Vec<NativeEncodedPartitionAppend> = views
+                    .into_iter()
+                    .zip(wire_ranges)
+                    .map(
+                        |(view, (envelope_range, transient_range))| NativeEncodedPartitionAppend {
+                            topic_partition: view.topic_partition,
+                            tenant: Arc::from(view.tenant),
+                            item_count: view.item_count,
+                            envelope_range,
+                            transient_range,
+                        },
+                    )
+                    .collect();
+                ValidatedNativeAppend::BorrowedMany { partitions }
+            } else {
+                let (view, envelope_range, transient_range) =
+                    match NativeTelemetryBatch::decode_native_append_view_with_ranges(&payload) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            return error_frame(
+                                header,
+                                NativeStatus::BadRequest,
+                                &error.to_string(),
+                            );
+                        }
+                    };
+                ValidatedNativeAppend::Borrowed {
+                    topic_partition: view.topic_partition,
+                    tenant: Arc::from(view.tenant),
+                    item_count: view.item_count,
+                    envelope_range,
+                    transient_range,
                 }
             };
-            if let Some(gate) = &config.request_gate
-                && let Err(error) = gate.check_partitions(&telemetry_batch.partitions)
-            {
-                return error_frame(header, NativeStatus::Unavailable, &error);
-            }
+            let tenant = match &validated {
+                ValidatedNativeAppend::Owned { batch, .. } => {
+                    Arc::clone(&batch.partitions[0].envelope.tenant)
+                }
+                ValidatedNativeAppend::Borrowed { tenant, .. } => Arc::clone(tenant),
+                ValidatedNativeAppend::BorrowedMany { partitions } => {
+                    Arc::clone(&partitions[0].tenant)
+                }
+            };
             if let Some(runtime) = &runtime
-                && telemetry_batch
-                    .partitions
-                    .iter()
-                    .any(|partition| partition.envelope.tenant.as_ref() != runtime.tenant())
+                && tenant.as_ref() != runtime.tenant()
             {
                 return error_frame(
                     header,
@@ -605,34 +736,118 @@ async fn dispatch(
                 );
             }
             let wait_for_index = config.wait_for_index;
-            let payload_digest = blake3::hash(&payload).to_hex().to_string();
+            let payload_digest = retryable.then(|| payload_hash.to_hex().to_string());
+            let wire = Bytes::from(payload);
             let retry_id = header.request_id;
-            let append = move || {
-                let records = telemetry_batch
-                    .partitions
-                    .iter()
-                    .fold(0_u32, |total, partition| {
-                        total.saturating_add(partition.envelope.item_count)
-                    });
-                let result = store
-                    .append_validated_telemetry_batch_with_retry_id(
-                        &telemetry_batch,
-                        wait_for_index,
-                        retry_id,
-                        payload_digest,
-                    )
-                    .and_then(|ack| {
-                        ack.encode()
-                            .map(|encoded| (encoded, records))
-                            .map_err(|error| LokiApiError::internal(error.to_string()))
-                    });
-                drop(ingest_permit);
-                result
+            let append_result = match validated {
+                ValidatedNativeAppend::Owned { batch, wire_ranges } => {
+                    let records = batch
+                        .partitions
+                        .iter()
+                        .map(|partition| partition.envelope.item_count as usize)
+                        .sum::<usize>();
+                    tokio::task::spawn_blocking(move || {
+                        let result = if retryable {
+                            let encoded_envelope = wire.slice(
+                                wire_ranges
+                                    .first()
+                                    .expect("retryable native append has one range")
+                                    .0
+                                    .clone(),
+                            );
+                            store
+                                .append_validated_telemetry_batch_with_retry_id_and_encoded_envelope(
+                                    &batch,
+                                    encoded_envelope,
+                                    wait_for_index,
+                                    retry_id,
+                                    payload_digest.expect("retryable native append has a digest"),
+                                )
+                        } else {
+                            store.append_validated_telemetry_batch_with_encoded_envelopes(
+                                &batch,
+                                wire,
+                                &wire_ranges,
+                                wait_for_index,
+                            )
+                        }
+                            .and_then(|ack| {
+                                ack.encode()
+                                    .map(|encoded| (encoded, records))
+                                    .map_err(|error| LokiApiError::internal(error.to_string()))
+                            });
+                        drop(ingest_permit);
+                        result
+                    })
+                    .await
+                }
+                ValidatedNativeAppend::Borrowed {
+                    topic_partition,
+                    item_count,
+                    envelope_range,
+                    transient_range,
+                    ..
+                } => {
+                    let encoded_envelope = wire.slice(envelope_range);
+                    let transient_context = transient_range.map(|range| wire.slice(range));
+                    tokio::task::spawn_blocking(move || {
+                        let result = if retryable {
+                            store
+                                .append_validated_native_metadata_with_retry_id_and_encoded_envelope(
+                                    topic_partition,
+                                    item_count,
+                                    encoded_envelope,
+                                    transient_context,
+                                    wait_for_index,
+                                    retry_id,
+                                    payload_digest.expect("retryable native append has a digest"),
+                                )
+                        } else {
+                            store.append_validated_native_metadata_with_encoded_envelope(
+                                topic_partition,
+                                item_count,
+                                encoded_envelope,
+                                transient_context,
+                                wait_for_index,
+                            )
+                        }
+                            .and_then(|ack| {
+                                ack.encode()
+                                    .map(|encoded| (encoded, item_count as usize))
+                                    .map_err(|error| LokiApiError::internal(error.to_string()))
+                            });
+                        drop(ingest_permit);
+                        result
+                    })
+                    .await
+                }
+                ValidatedNativeAppend::BorrowedMany { partitions } => {
+                    let records = partitions
+                        .iter()
+                        .map(|partition| partition.item_count as usize)
+                        .sum::<usize>();
+                    tokio::task::spawn_blocking(move || {
+                        let result = store
+                            .append_validated_native_metadata_with_encoded_envelopes(
+                                &partitions,
+                                wire,
+                                wait_for_index,
+                            )
+                            .and_then(|ack| {
+                                ack.encode()
+                                    .map(|encoded| (encoded, records))
+                                    .map_err(|error| LokiApiError::internal(error.to_string()))
+                            });
+                        drop(ingest_permit);
+                        result
+                    })
+                    .await
+                }
             };
-            match tokio::task::spawn_blocking(append).await {
+            match append_result {
                 Ok(Ok((ack, records))) => {
                     if let Some(runtime) = &config.production {
-                        runtime.record_ingest(source_bytes, records as usize);
+                        runtime.record_ingest(source_bytes, records);
                     }
                     ok_frame(header, ack)
                 }
@@ -695,7 +910,14 @@ async fn dispatch(
                 .as_ref()
                 .map(|runtime| runtime.query_timeout());
             let worker = tokio::task::spawn_blocking(move || {
-                let result = store.query_native(&query);
+                let result = (|| match store.query_native_projected(&query)? {
+                    Some(matches) => encode_native_log_query_matches(&tenant, matches)
+                        .map_err(|error| LokiApiError::internal(error.to_string())),
+                    None => store.query_native(&query).and_then(|entries| {
+                        encode_native_log_query_result(&tenant, entries)
+                            .map_err(|error| LokiApiError::internal(error.to_string()))
+                    }),
+                })();
                 drop(query_permit);
                 result
             });
@@ -713,10 +935,7 @@ async fn dispatch(
                 None => worker.await,
             };
             match result {
-                Ok(Ok(entries)) => match encode_native_log_query_result(&tenant, entries) {
-                    Ok(encoded) => ok_frame(header, encoded),
-                    Err(error) => error_frame(header, NativeStatus::Internal, &error.to_string()),
-                },
+                Ok(Ok(encoded)) => ok_frame(header, encoded),
                 Ok(Err(error)) => store_error_frame(header, error),
                 Err(error) => error_frame(
                     header,
@@ -1140,7 +1359,47 @@ mod tests {
         let NativeLogQueryResult { tenant, entries } =
             decode_native_log_query_result(&response.payload).expect("results");
         assert_eq!(tenant, "tenant-a");
-        assert_eq!(entries, vec![entry]);
+        assert_eq!(entries, vec![entry.clone()]);
+
+        let multi_partition_batch = NativeTelemetryBatch {
+            partitions: vec![
+                NativePartitionAppend {
+                    topic_partition,
+                    envelope: prepare_loki_log_envelope("tenant-a", vec![entry.clone()])
+                        .expect("first multi-partition envelope"),
+                    transient_context: None,
+                },
+                NativePartitionAppend {
+                    topic_partition: TopicPartition::new(
+                        crate::LOGS_TOPIC_ID,
+                        LogicalPartitionId::new(1),
+                    ),
+                    envelope: prepare_loki_log_envelope("tenant-a", vec![entry])
+                        .expect("second multi-partition envelope"),
+                    transient_context: None,
+                },
+            ],
+        }
+        .encode()
+        .expect("multi-partition batch");
+        let append_untracked =
+            NativeFrame::request(NativeOpcode::AppendUntracked, 10, multi_partition_batch)
+                .expect("multi-partition append");
+        write_frame(&mut client, &append_untracked).await;
+        let response = read_frame(&mut client).await;
+        assert_eq!(response.header.request_id, 10);
+        assert_eq!(response.header.status, NativeStatus::Ok);
+        let acknowledgement =
+            NativeTelemetryAppendAck::decode(&response.payload).expect("multi-partition ack");
+        assert_eq!(acknowledgement.partitions.len(), 2);
+        assert_eq!(
+            acknowledgement.partitions[0].topic_partition,
+            topic_partition
+        );
+        assert_eq!(
+            acknowledgement.partitions[1].topic_partition,
+            TopicPartition::new(crate::LOGS_TOPIC_ID, LogicalPartitionId::new(1))
+        );
 
         drop(client);
         stop.send(()).expect("stop");

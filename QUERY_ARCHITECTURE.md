@@ -81,10 +81,13 @@ fields, plus token and exact case-sensitive field leaves under top-level
 conjunctions, use postings. Literal message exact, contains, prefix, and suffix
 leaves under those same conjunctions use the trigram rejection filters. A
 message literal under OR or NOT is not required and therefore cannot prune a
-block. Regex, existence, set, and numeric predicates receive a safe superset
-of candidates. Decoded candidates then pass through `LogQuery::select`, which
-applies every range, cursor, legacy constraint, and Boolean residual before
-sorting and limiting.
+block. A regex with only conservative mandatory ASCII literal fragments uses
+the same trigram filters; alternation, groups, character classes, and unsafe
+quantifiers remain residual-only. Field existence, set, text, regex, and
+numeric predicates use the persistent field-value dictionary to select blocks
+and exact record postings before decode. Decoded candidates still pass through
+`LogQuery::select`, which applies every range, cursor, legacy constraint, and
+Boolean residual before sorting and limiting.
 The persistent planner applies an early limit only for a posting-only offset
 query with no residual or boundary check. This rule is what prevents false
 negatives for expressions such as `(error OR status >= 500) AND NOT env=dev`.
@@ -103,10 +106,12 @@ Postings use one of two resident representations:
 - `(start, length)` runs for dense matches.
 
 The same delta/run distinction is retained in the deterministic `SLOGQIX2`
-wire format, wrapped in a `SLOGQIZ2` zstd frame. Dense postings are decoded
-directly into runs rather than expanded. `posting_cardinality` and
-`posting_storage_bytes` expose the logical and resident posting sizes for
-operational diagnostics.
+wire format, wrapped in a `SLOGQIZ2` zstd frame. The compressed decoder keeps
+delta/run posting slices in one shared backing allocation and records sparse
+delta checkpoints, so startup does not expand every posting into a resident
+ordinal array. Query planning decodes only the selected posting prefix,
+suffix, or intersection; `posting_cardinality` and `posting_storage_bytes`
+expose the logical and resident posting sizes for operational diagnostics.
 
 Each message filter hashes every UTF-8 byte trigram after applying the same
 Unicode lowercase transformation as case-insensitive literal matching. ASCII
@@ -150,6 +155,64 @@ template IDs, attribute IDs, and every directory bound it touches. The full
 every record and proves that every checkpoint points to an actual boundary.
 Pack queries additionally verify the stored payload checksum before selective
 decoding.
+
+Resident compressed frames have a separate bounded query cache. The first
+lookup for a frame decompresses its structural lane once and retains the
+structural bytes plus offset and timestamp positions. The cache is capped at
+768 MiB per stripe and uses insertion-order eviction; cache hits perform a
+single map lookup and do not maintain an exact LRU queue on the query path.
+This keeps the common hit path constant-time while bounding derived memory.
+Repeated result pages also retain selected metadata field vectors per frame,
+bounded to 1,024 rows and 512 KiB. These vectors share the decoded field
+allocations with the result records, so repeated native pages avoid rescanning
+the field lane and do not add another durable representation.
+
+Tiered frames retain their immutable frame IDs across resident and object-tier
+storage. A frame that is already resident can therefore answer another query
+without a payload range read or decompression. A second bounded cache keeps
+exact message and field postings keyed by frame ID, allowing candidate scans to
+skip frames whose postings are known to be empty even after the structural
+frame cache evicts them. Active tenant partition resolution is cached per
+stripe and invalidated when ingestion changes the visible partition set, so
+requests do not repeatedly decode every tier query index just to find the
+same partitions.
+
+For a query with no legacy terms, offset bounds, or cursor, whose Boolean
+predicate is an AND of safe ASCII exact message tokens, the frame cache also
+builds lazy exact postings. Sensitive and insensitive token predicates use
+separate keys, and exact metadata fields are intersected with the same
+ordinal set. A frame builds at most 32 message-term and 8 field postings;
+missing entries are derived by scanning only that frame's structural message
+or metadata lane. Materialized queries use these ordinals before normal
+decoding, while cardinality-only analytics queries use the same postings
+without constructing result rows. The regular `LogQuery` matcher still runs
+after candidate selection, so the postings remain an optimization rather than
+a second query implementation.
+
+Queries with legacy terms, non-ASCII token semantics, offset bounds, cursors,
+OR/NOT, regexes, substring predicates, numeric predicates, or other residual
+operators retain the embedded-index candidate superset and exact post-decode
+filter. Indexed compressed frames additionally build a bounded per-key field
+value posting cache on demand; high-cardinality keys fall back to decoding only
+the selected field lane. Tiered cold payloads retain their checksum and
+structural validation path. This gives every query shape the same result
+contract while allowing resident and recovered frames to avoid full typed-record
+decoding for field predicates.
+
+Analytical log scans also use projection pushdown. In the ordered scan path,
+when deletes and typed OTLP filters are absent, requests containing only
+timestamp, message, labels, metadata, partition, offset, ordinal, tenant, or
+signal decode the structural offsets, timestamps, messages, and normalized
+fields while leaving the typed OTLP metadata lane unparsed. Requests for body,
+severity, trace, resource, scope, or typed attribute columns use the full
+decoder. Query matching remains based on the same structural lanes in both
+cases, and the enclosing frame checksum and structural framing are still
+validated. This is a general analytical optimization: selecting fewer columns
+reduces work and allocation without changing which records qualify. For JSONL
+responses, the requested scalar and map values are written directly to the
+output stream instead of being assembled into a temporary JSON object for
+every row. JSON escaping, null handling, and requested column order remain
+unchanged while narrow scans avoid another per-row allocation pass.
 
 ## Exactness and filtering
 
@@ -202,8 +265,8 @@ The former adversarial missing-substring query scanned all 10,240 blocks and
 607,363,459 records in 35.92 seconds. It now finds an absent required trigram
 in the global union and returns with zero candidate blocks in 0.91 microseconds
 at cold p50. ClickHouse took 1.794 seconds in the same sequential harness.
-Regex does not yet extract safe literal fragments, so the next residual-query
-optimizations are body-lane-only decode, regex literal-prefix extraction, and
+The persistent planner also extracts conservative mandatory regex fragments;
+remaining residual-query optimizations are body-lane-only decode and
 allocation-free vectorized evaluation inside surviving blocks.
 
 The monolithic benchmark index remains a useful cold-start baseline. Loading it
@@ -236,11 +299,13 @@ five-term queries. An exact missing term returned in 0.15 microseconds p50
 without reading a payload. Canonical results matched ClickHouse byte-for-byte.
 
 The same run identified a more important scaling cost than selective decode.
-The 114,420,962-byte compressed index expands to 17,071,691,984 bytes of
-resident postings, 83,886,080 bytes of block filters, and two derived 8 KiB
-aggregate masks, and takes about 23 seconds to load. Full indexed ingest peaked
-at 97.65 GiB RSS. Query latency is already competitive; reducing posting
-expansion and startup cost is now the primary query-architecture priority.
+The former decoder expanded the 114,420,962-byte compressed index to
+17,071,691,984 bytes of resident postings, 83,886,080 bytes of block filters,
+and two derived 8 KiB aggregate masks, and took about 23 seconds to load. Full
+indexed ingest peaked at 97.65 GiB RSS. Compressed index loads now retain
+delta/run slices and expand only postings selected by a query; reducing
+materialization during multi-posting intersections remains the next scaling
+target.
 
 See [BENCHMARKS.md](BENCHMARKS.md) for the hot-index and real-pack harnesses,
 provenance requirements, and methodological caveats.
@@ -250,7 +315,7 @@ provenance requirements, and methodological caveats.
 The production worker constructs and publishes one immutable query-index
 artifact per bounded append-aligned group. Catalog pages and groups are pruned
 before that artifact is loaded, and candidate frames are range-read through the
-SSD cache. A future optimization can intersect compressed run/delta postings
+SSD cache. A further optimization can intersect compressed run/delta postings
 without materializing each selected segment's ordinal arrays. The monolithic
 benchmark file remains useful only for reproducible single-host comparisons.
 

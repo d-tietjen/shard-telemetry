@@ -1,0 +1,8 @@
+signal	engine	stored_bytes	compression_ratio	load_seconds	warm_median_seconds	warm_p95_seconds	warm_p99_seconds	warm_max_seconds	query_sum_seconds	queries	date	notes
+traces	ShardTelemetry	902077	119.291076		0.002	0.002	0.006				2026-09-23	synthetic signal payload; 16-core Linux run
+traces	ClickHouse	5775860	18.630946		0.003	0.007	0.011				2026-09-23	synthetic signal payload; same workload
+metrics	ShardTelemetry	1966452	64.304304		0.002	0.004	0.009				2026-09-23	synthetic signal payload; 16-core Linux run
+metrics	ClickHouse	3897201	32.446704		0.003	0.006	0.008				2026-09-23	synthetic signal payload; same workload
+logs	ShardTelemetry	55669872		16.052	0.0043115	0.5304778	0.9546768	0.9561	5.388754	92/92	2026-09-23	three tries; per-query median; seven-column adapter projection
+logs	SereneDB 26.09.1	141666298		5.10	0.007	0.0159	0.02254	0.028	0.761	92/92	2026-09-21	one recorded result per query; full 15-column table
+logs	ClickHouse 26.8.2.7 sorted	178762564		2.28	0.0075	0.05075	0.17184	0.216	1.266	70/92	2026-09-21	one recorded result per supported query; full 15-column table; 22 BM25 queries unsupported

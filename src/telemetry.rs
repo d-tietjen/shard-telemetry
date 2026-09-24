@@ -1,4 +1,5 @@
 use std::fmt;
+use std::mem::size_of;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
@@ -325,6 +326,103 @@ impl ScopeContext {
             append_bytes(output, &attribute);
         }
     }
+}
+
+const ARC_ALLOCATION_OVERHEAD: usize = 2 * size_of::<usize>();
+
+/// Estimates the storage occupied by one Arc-backed string without encoding it.
+pub(crate) fn estimated_arc_str_bytes(value: &Arc<str>) -> usize {
+    ARC_ALLOCATION_OVERHEAD.saturating_add(value.len())
+}
+
+/// Estimates the Arc, Vec header, and element-buffer storage for a vector.
+pub(crate) fn estimated_arc_vec_storage<T>(capacity: usize) -> usize {
+    ARC_ALLOCATION_OVERHEAD
+        .saturating_add(size_of::<Vec<T>>())
+        .saturating_add(capacity.saturating_mul(size_of::<T>()))
+}
+
+fn estimated_telemetry_value_heap_bytes(value: &TelemetryValue) -> usize {
+    match value {
+        TelemetryValue::String(value) => estimated_arc_str_bytes(value),
+        TelemetryValue::Bytes(value) => ARC_ALLOCATION_OVERHEAD.saturating_add(value.len()),
+        TelemetryValue::Array(values) => {
+            estimated_arc_vec_storage::<TelemetryValue>(values.capacity()).saturating_add(
+                values
+                    .iter()
+                    .map(estimated_telemetry_value_heap_bytes)
+                    .sum(),
+            )
+        }
+        TelemetryValue::Map(values) => {
+            estimated_arc_vec_storage::<TelemetryAttribute>(values.capacity())
+                .saturating_add(values.iter().map(estimated_telemetry_attribute_bytes).sum())
+        }
+        TelemetryValue::Empty
+        | TelemetryValue::Boolean(_)
+        | TelemetryValue::Integer(_)
+        | TelemetryValue::DoubleBits(_)
+        | TelemetryValue::StringTableIndex(_) => 0,
+    }
+}
+
+pub(crate) fn estimated_telemetry_attribute_bytes(attribute: &TelemetryAttribute) -> usize {
+    size_of::<TelemetryAttribute>()
+        .saturating_add(estimated_arc_str_bytes(&attribute.key))
+        .saturating_add(
+            attribute
+                .value
+                .as_ref()
+                .map_or(0, estimated_telemetry_value_heap_bytes),
+        )
+}
+
+pub(crate) fn estimated_telemetry_attributes_bytes(
+    attributes: &Arc<Vec<TelemetryAttribute>>,
+) -> usize {
+    estimated_arc_vec_storage::<TelemetryAttribute>(attributes.capacity()).saturating_add(
+        attributes
+            .iter()
+            .map(estimated_telemetry_attribute_bytes)
+            .sum(),
+    )
+}
+
+fn estimated_entity_ref_bytes(entity: &TelemetryEntityRef) -> usize {
+    size_of::<TelemetryEntityRef>()
+        .saturating_add(estimated_arc_str_bytes(&entity.schema_url))
+        .saturating_add(estimated_arc_str_bytes(&entity.entity_type))
+        .saturating_add(estimated_arc_str_vec_bytes(&entity.id_keys))
+        .saturating_add(estimated_arc_str_vec_bytes(&entity.description_keys))
+}
+
+fn estimated_arc_str_vec_bytes(values: &Arc<Vec<Arc<str>>>) -> usize {
+    estimated_arc_vec_storage::<Arc<str>>(values.capacity())
+        .saturating_add(values.iter().map(estimated_arc_str_bytes).sum())
+}
+
+pub(crate) fn estimated_resource_context_bytes(context: &Arc<ResourceContext>) -> usize {
+    size_of::<ResourceContext>()
+        .saturating_add(estimated_telemetry_attributes_bytes(&context.attributes))
+        .saturating_add(estimated_arc_str_bytes(&context.schema_url))
+        .saturating_add(estimated_arc_vec_storage::<TelemetryEntityRef>(
+            context.entity_refs.capacity(),
+        ))
+        .saturating_add(
+            context
+                .entity_refs
+                .iter()
+                .map(estimated_entity_ref_bytes)
+                .sum(),
+        )
+}
+
+pub(crate) fn estimated_scope_context_bytes(context: &Arc<ScopeContext>) -> usize {
+    size_of::<ScopeContext>()
+        .saturating_add(estimated_arc_str_bytes(&context.name))
+        .saturating_add(estimated_arc_str_bytes(&context.version))
+        .saturating_add(estimated_telemetry_attributes_bytes(&context.attributes))
+        .saturating_add(estimated_arc_str_bytes(&context.schema_url))
 }
 
 macro_rules! context_identity {

@@ -55,10 +55,12 @@ mod tier_ingest;
 mod trace;
 mod traceql;
 mod types;
+mod usage_ledger;
 
 pub use analytics::{
-    ANALYTICS_SCHEMA_VERSION, AnalyticsColumn, AnalyticsRelation, AnalyticsRow, AnalyticsScanOrder,
-    AnalyticsScanRequest, AnalyticsWireFormat, CLICKHOUSE_COMPATIBILITY_TARGET,
+    ANALYTICS_SCHEMA_VERSION, AnalyticsColumn, AnalyticsGroupKey, AnalyticsGroupOrder,
+    AnalyticsGroupRow, AnalyticsRelation, AnalyticsRow, AnalyticsScanOrder, AnalyticsScanRequest,
+    AnalyticsWireFormat, CLICKHOUSE_COMPATIBILITY_TARGET,
 };
 pub use block::{BlockCatalog, BlockDescriptor, BlockId, CompressionCodec};
 pub use correlation::{
@@ -70,8 +72,8 @@ pub use dictionary::{
     DictionaryId, DictionaryInsert, DictionaryPublication,
 };
 pub use embedded::{
-    EmbeddedEvictionPolicy, EmbeddedTelemetryConfig, EmbeddedTelemetryRuntime,
-    EmbeddedTelemetryState,
+    EmbeddedEvictionPolicy, EmbeddedMaintenanceWorker, EmbeddedStorageHealth,
+    EmbeddedTelemetryConfig, EmbeddedTelemetryRuntime, EmbeddedTelemetryState,
 };
 pub use envelope::{MAX_TELEMETRY_ENVELOPE_BYTES, TelemetryEnvelope};
 pub use error::{TelemetryError, TelemetryResult};
@@ -155,6 +157,10 @@ pub use telemetry::{
     TRACES_TOPIC_ID, TelemetryAttribute, TelemetryEntityRef, TelemetryRouter, TelemetrySignal,
     TelemetryValue, TraceId,
 };
+pub(crate) use telemetry::{
+    estimated_arc_str_bytes, estimated_arc_vec_storage, estimated_resource_context_bytes,
+    estimated_scope_context_bytes, estimated_telemetry_attribute_bytes,
+};
 pub use telemetry_store::{
     DurableTelemetryConfig, DurableTelemetryLimits, DurableTelemetryStore, FetchedTelemetryBatch,
     LifetimeRollupReport, RetentionReport, TelemetryAppendDurability, TelemetryAppendGate,
@@ -182,4 +188,8 @@ pub use types::{
     CaseSensitivity, DurableLog, LogMatch, LogPredicate, LogQuery, LogRegex, MetadataField,
     NumericComparison, QueryCursor, QueryOrder, QuerySort, TelemetryRecordRef, TextMatchKind,
     TextMatcher,
+};
+pub use usage_ledger::{
+    EmbeddedUsageHealth, EmbeddedUsageLedger, EmbeddedUsageLedgerConfig, EmbeddedUsageSnapshot,
+    FeatureUsage, MonthlyUsage, UnknownFeaturePolicy,
 };

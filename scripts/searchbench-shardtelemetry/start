@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ST_BINARY:?ST_BINARY must be set}"
+: "${ST_ENGINE_DATA_DIR:?ST_ENGINE_DATA_DIR must be set}"
+: "${ST_TOKEN_FILE:?ST_TOKEN_FILE must be set}"
+
+if [[ -f "$ST_ENGINE_DATA_DIR/pid" ]] && kill -0 "$(cat "$ST_ENGINE_DATA_DIR/pid")" 2>/dev/null; then
+    exit 0
+fi
+
+taskset -c "${ST_CPU_SET:-0-31}" "$ST_BINARY" \
+    --insecure-development-mode \
+    --listen "127.0.0.1:${ST_HTTP_PORT}" \
+    --native-listen "127.0.0.1:${ST_NATIVE_PORT:-32101}" \
+    --otlp-grpc-listen "127.0.0.1:${ST_GRPC_PORT:-34317}" \
+    --otlp-http-listen "127.0.0.1:${ST_OTLP_PORT}" \
+    --default-tenant "$ST_TENANT" \
+    --data-directory "$ST_ENGINE_DATA_DIR/data" \
+    --shards "$ST_SHARDS" \
+    --runtime-worker-threads "$ST_RUNTIME_WORKERS" \
+    --tenant-partitions "${ST_TENANT_PARTITIONS:-256}" \
+    --append-linger-micros "${ST_APPEND_LINGER_MICROS:-250}" \
+    --clickhouse-token-file "$ST_TOKEN_FILE" \
+    >"$ST_ENGINE_DATA_DIR/server.log" 2>&1 &
+echo $! >"$ST_ENGINE_DATA_DIR/pid"

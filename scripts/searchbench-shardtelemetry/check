@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+curl --fail --silent "http://127.0.0.1:${ST_HTTP_PORT:-32100}/ready" >/dev/null

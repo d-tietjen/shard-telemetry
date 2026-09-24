@@ -32,7 +32,7 @@ done
     exit 2
 }
 
-CPU=$(lscpu -p=CPU,CORE | awk -F, '!/^#/ && !seen[$2]++ { print $1; exit }')
+CPU=${BENCHMARK_CPU:-$(lscpu -p=CPU,CORE | awk -F, '!/^#/ && !seen[$2]++ { print $1; exit }')}
 [[ -n $CPU ]] || {
     echo "unable to select one physical CPU" >&2
     exit 2
@@ -47,7 +47,13 @@ exec > >(tee "$RUN_DIR/harness.log") 2>&1
 
 CH_CONTAINER="shard-telemetry-signals-${RUN_ID//[^a-zA-Z0-9_.-]/-}"
 CH_STARTED=0
+SHARD_STARTED=0
+SHARD_PID=''
 cleanup() {
+    if [[ $SHARD_STARTED -eq 1 ]] && kill -0 "$SHARD_PID" 2>/dev/null; then
+        kill -TERM "$SHARD_PID" 2>/dev/null || true
+        wait "$SHARD_PID" 2>/dev/null || true
+    fi
     if [[ $CH_STARTED -eq 1 ]]; then
         docker logs "$CH_CONTAINER" >"$RUN_DIR/clickhouse-container.log" 2>&1 || true
         docker stop --time 60 "$CH_CONTAINER" >/dev/null 2>&1 || true
@@ -57,7 +63,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 IMAGE_ID=$(docker image inspect "$CLICKHOUSE_IMAGE" --format '{{.Id}}')
-[[ $IMAGE_ID == "$CLICKHOUSE_IMAGE" ]] || {
+EXPECTED_IMAGE_ID="$CLICKHOUSE_IMAGE"
+if [[ "$CLICKHOUSE_IMAGE" == *@* ]]; then
+    EXPECTED_IMAGE_ID=${CLICKHOUSE_IMAGE##*@}
+fi
+[[ $IMAGE_ID == "$EXPECTED_IMAGE_ID" ]] || {
     echo "ClickHouse image mismatch: got $IMAGE_ID, expected $CLICKHOUSE_IMAGE" >&2
     exit 2
 }
@@ -100,8 +110,8 @@ sha256sum "$CORPUS_DIR"/* >"$RUN_DIR/corpus-sha256.txt"
     echo "records_per_signal=$RECORDS"
     echo "lookup_iterations=$LOOKUP_ITERATIONS"
     echo "product_repository=$SHARD_TELEMETRY_REPOSITORY"
-    echo "product_revision=$(git -C "$SHARD_TELEMETRY_REPOSITORY" rev-parse HEAD)"
-    echo "product_status=$(git -C "$SHARD_TELEMETRY_REPOSITORY" status --porcelain | wc -l) modified entries"
+    echo "product_revision=$(git -C "$SHARD_TELEMETRY_REPOSITORY" rev-parse HEAD 2>/dev/null || echo unavailable)"
+    echo "product_status=$(git -C "$SHARD_TELEMETRY_REPOSITORY" status --porcelain 2>/dev/null | wc -l) modified entries"
     echo "binary=$SHARD_TELEMETRY_BIN"
     echo "binary_sha256=$(sha256sum "$SHARD_TELEMETRY_BIN" | awk '{ print $1 }')"
     echo "server_binary=$SHARD_TELEMETRY_SERVER"
@@ -122,14 +132,13 @@ mkdir -p "$CH_DATA" "$CH_LOGS"
 echo "ClickHouse: starting isolated one-core container"
 docker run --detach \
     --name "$CH_CONTAINER" \
+    --network host \
     --cpuset-cpus "$CPU" \
-    --publish "127.0.0.1:$SHARD_HTTP_PORT:$SHARD_HTTP_PORT" \
     --ulimit nofile=262144:262144 \
     --env CLICKHOUSE_SKIP_USER_SETUP=1 \
     --volume "$CH_DATA:/var/lib/clickhouse" \
     --volume "$CH_LOGS:/var/log/clickhouse-server" \
     --volume "$RUN_DIR:/benchmark-results" \
-    --volume "$SHARD_TELEMETRY_SERVER:/benchmark/shard-telemetry-server:ro" \
     "$CLICKHOUSE_IMAGE" >"$RUN_DIR/clickhouse-container-id.txt"
 CH_STARTED=1
 
@@ -142,22 +151,23 @@ done
 docker exec "$CH_CONTAINER" clickhouse-client --query 'SELECT version()' \
     >"$RUN_DIR/clickhouse-version.txt"
 
-echo "ShardTelemetry: restarting the durable store inside the pinned CPU namespace"
-docker exec --detach --user "$(id -u):$(id -g)" "$CH_CONTAINER" /bin/bash -c \
-    "exec /benchmark/shard-telemetry-server \
-        --insecure-development-mode \
-        --listen 0.0.0.0:$SHARD_HTTP_PORT \
-        --native-listen 0.0.0.0:${SHARD_NATIVE_ADDRESS##*:} \
-        --otlp-grpc-listen 0.0.0.0:${SHARD_OTLP_GRPC_ADDRESS##*:} \
-        --otlp-http-listen 0.0.0.0:${SHARD_OTLP_HTTP_ADDRESS##*:} \
-        --default-tenant '$TENANT' \
-        --data-directory /benchmark-results/shard-data \
-        --recovery-journal \
-        --shards 1 \
-        --tenant-partitions 256 \
-        --append-linger-micros 0 \
-        --clickhouse-token-file /benchmark-results/clickhouse-token \
-        >/benchmark-results/shard-server.log 2>&1"
+echo "ShardTelemetry: starting the native Linux server on the pinned CPU namespace"
+taskset -c "$CPU" "$SHARD_TELEMETRY_SERVER" \
+    --insecure-development-mode \
+    --listen "$SHARD_HTTP_ADDRESS" \
+    --native-listen "$SHARD_NATIVE_ADDRESS" \
+    --otlp-grpc-listen "$SHARD_OTLP_GRPC_ADDRESS" \
+    --otlp-http-listen "$SHARD_OTLP_HTTP_ADDRESS" \
+    --default-tenant "$TENANT" \
+    --data-directory "$RUN_DIR/shard-data" \
+    --recovery-journal \
+    --shards 1 \
+    --tenant-partitions 256 \
+    --append-linger-micros 0 \
+    --clickhouse-token-file "$RUN_DIR/clickhouse-token" \
+    >"$RUN_DIR/shard-server.log" 2>&1 &
+SHARD_PID=$!
+SHARD_STARTED=1
 for _ in $(seq 1 120); do
     if curl --fail --silent "http://127.0.0.1:$SHARD_HTTP_PORT/ready" >"$RUN_DIR/shard-ready.txt"; then
         break

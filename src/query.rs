@@ -8,7 +8,13 @@ use crate::{
 pub(crate) struct RequiredIndexConstraints<'a> {
     pub(crate) terms: Vec<&'a str>,
     pub(crate) fields: Vec<(&'a str, &'a str)>,
+    pub(crate) field_exists: Vec<&'a str>,
+    pub(crate) field_in: Vec<(&'a str, Vec<&'a str>)>,
+    pub(crate) field_text: Vec<(&'a str, &'a TextMatcher)>,
+    pub(crate) field_regex: Vec<(&'a str, &'a crate::LogRegex)>,
+    pub(crate) field_numeric: Vec<(&'a str, NumericComparison, i128)>,
     pub(crate) message_literals: Vec<&'a str>,
+    pub(crate) case_sensitive_message_literals: Vec<&'a str>,
     pub(crate) impossible: bool,
 }
 
@@ -87,6 +93,13 @@ impl LogQuery {
     }
 
     pub(crate) fn required_index_constraints(&self) -> RequiredIndexConstraints<'_> {
+        self.required_index_constraints_with_message_phrases(false)
+    }
+
+    pub(crate) fn required_index_constraints_with_message_phrases(
+        &self,
+        include_message_phrases: bool,
+    ) -> RequiredIndexConstraints<'_> {
         let mut constraints = RequiredIndexConstraints {
             terms: self.terms.iter().map(AsRef::as_ref).collect(),
             fields: self
@@ -94,10 +107,16 @@ impl LogQuery {
                 .iter()
                 .map(|field| (field.key.as_ref(), field.value.as_ref()))
                 .collect(),
+            field_exists: Vec::new(),
+            field_in: Vec::new(),
+            field_text: Vec::new(),
+            field_regex: Vec::new(),
+            field_numeric: Vec::new(),
             message_literals: Vec::new(),
+            case_sensitive_message_literals: Vec::new(),
             impossible: false,
         };
-        collect_required_constraints(&self.predicate, &mut constraints);
+        collect_required_constraints(&self.predicate, &mut constraints, include_message_phrases);
         constraints
     }
 
@@ -119,6 +138,97 @@ impl LogQuery {
             || !predicate_is_index_only_conjunction(&self.predicate)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn can_use_message_only_filter(&self) -> bool {
+        self.can_use_indexed_message_filter()
+            && self.start_timestamp_unix_nanos.is_none()
+            && self.end_timestamp_unix_nanos.is_none()
+    }
+
+    pub(crate) fn can_use_indexed_message_filter(&self) -> bool {
+        self.start_offset.is_none()
+            && self.end_offset.is_none()
+            && self.after.is_none()
+            && self.sort == QuerySort::Offset
+            && self.message_candidate_matches("").is_some()
+    }
+
+    /// Returns a safe exact-token conjunction that can be answered from the
+    /// frame's lazily-built ClickHouse-compatible postings.
+    ///
+    /// The caller still performs the normal record matcher after using these
+    /// postings. They are therefore only a necessary-candidate optimization;
+    /// this method deliberately rejects legacy terms, offset bounds, cursors,
+    /// and every predicate shape other than AND of exact message tokens.
+    pub(crate) fn exact_message_token_conjunction(&self) -> Option<Vec<(&str, CaseSensitivity)>> {
+        if !self.terms.is_empty()
+            || self.start_offset.is_some()
+            || self.end_offset.is_some()
+            || self.after.is_some()
+        {
+            return None;
+        }
+        fn collect<'a>(
+            predicate: &'a LogPredicate,
+            tokens: &mut Vec<(&'a str, CaseSensitivity)>,
+        ) -> bool {
+            match predicate {
+                LogPredicate::MatchAll => true,
+                LogPredicate::MessageToken {
+                    value,
+                    case_sensitivity,
+                } if clickhouse_token_is_index_safe(value) => {
+                    tokens.push((value, *case_sensitivity));
+                    true
+                }
+                LogPredicate::And(predicates) => predicates
+                    .iter()
+                    .all(|predicate| collect(predicate, tokens)),
+                _ => false,
+            }
+        }
+        let mut tokens = Vec::new();
+        collect(&self.predicate, &mut tokens).then_some(tokens)
+    }
+
+    /// Returns a safe exact-token disjunction suitable for posting-list
+    /// union. This is intentionally limited to a single OR node so callers
+    /// can answer count queries directly without evaluating residual logic.
+    pub(crate) fn exact_message_token_disjunction(&self) -> Option<Vec<(&str, CaseSensitivity)>> {
+        if !self.terms.is_empty()
+            || self.start_offset.is_some()
+            || self.end_offset.is_some()
+            || self.after.is_some()
+        {
+            return None;
+        }
+        let predicate = match &self.predicate {
+            LogPredicate::Or(predicates) => predicates,
+            LogPredicate::And(predicates) if predicates.len() == 1 => {
+                let LogPredicate::Or(predicates) = &predicates[0] else {
+                    return None;
+                };
+                predicates
+            }
+            _ => return None,
+        };
+        if predicate.is_empty() {
+            return Some(Vec::new());
+        }
+        predicate
+            .iter()
+            .map(|predicate| match predicate {
+                LogPredicate::MessageToken {
+                    value,
+                    case_sensitivity,
+                } if clickhouse_token_is_index_safe(value) => {
+                    Some((value.as_ref(), *case_sensitivity))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn has_residual_predicate(&self) -> bool {
         !predicate_is_index_only_conjunction(&self.predicate)
     }
@@ -135,10 +245,13 @@ impl LogQuery {
     }
 
     pub(crate) fn matches_index_candidate<R: StructuralRecordView>(&self, record: &R) -> bool {
+        self.matches_index_bounds(record) && predicate_matches(&self.predicate, record)
+    }
+
+    pub(crate) fn matches_index_bounds<R: StructuralRecordView>(&self, record: &R) -> bool {
         self.offset_matches(record.structural_offset())
             && self.timestamp_matches(record.structural_timestamp_unix_nanos())
             && self.cursor_matches(record)
-            && predicate_matches(&self.predicate, record)
     }
 
     pub(crate) fn has_invalid_range(&self) -> bool {
@@ -156,7 +269,7 @@ impl LogQuery {
             && self.end_offset.is_none_or(|end| offset < end)
     }
 
-    fn timestamp_matches(&self, timestamp_unix_nanos: u64) -> bool {
+    pub(crate) fn timestamp_matches(&self, timestamp_unix_nanos: u64) -> bool {
         self.start_timestamp_unix_nanos
             .is_none_or(|start| timestamp_unix_nanos >= start)
             && self
@@ -199,6 +312,7 @@ impl LogQuery {
 fn collect_required_constraints<'a>(
     predicate: &'a LogPredicate,
     constraints: &mut RequiredIndexConstraints<'a>,
+    include_message_phrases: bool,
 ) {
     match predicate {
         LogPredicate::MatchAll => {}
@@ -213,24 +327,100 @@ fn collect_required_constraints<'a>(
         {
             constraints.fields.push((key, &matcher.value));
         }
+        LogPredicate::Field { key, matcher } => constraints.field_text.push((key, matcher)),
+        LogPredicate::FieldExists(key) => constraints.field_exists.push(key),
+        LogPredicate::FieldIn { key, values } => constraints
+            .field_in
+            .push((key, values.iter().map(AsRef::as_ref).collect())),
+        LogPredicate::FieldRegex { key, regex } => constraints.field_regex.push((key, regex)),
+        LogPredicate::FieldNumeric {
+            key,
+            comparison,
+            value,
+        } => constraints.field_numeric.push((key, *comparison, *value)),
         LogPredicate::And(predicates) => {
             for predicate in predicates {
-                collect_required_constraints(predicate, constraints);
+                collect_required_constraints(predicate, constraints, include_message_phrases);
             }
         }
         LogPredicate::Message(matcher) => {
             constraints.message_literals.push(matcher.value.as_ref());
+            if matcher.case_sensitivity == CaseSensitivity::Sensitive {
+                constraints
+                    .case_sensitive_message_literals
+                    .push(matcher.value.as_ref());
+            }
         }
+        LogPredicate::MessagePhrase { terms, .. } if include_message_phrases => {
+            constraints.terms.extend(
+                terms.iter().filter_map(|term| {
+                    clickhouse_token_is_index_safe(term).then_some(term.as_ref())
+                }),
+            );
+        }
+        LogPredicate::MessagePhrase { .. } => {}
         LogPredicate::MessageToken { .. }
-        | LogPredicate::MessageRegex(_)
-        | LogPredicate::FieldExists(_)
-        | LogPredicate::Field { .. }
-        | LogPredicate::FieldIn { .. }
-        | LogPredicate::FieldRegex { .. }
-        | LogPredicate::FieldNumeric { .. }
+        | LogPredicate::MessageTokenPrefix { .. }
+        | LogPredicate::MessageFuzzy { .. }
         | LogPredicate::Or(_)
         | LogPredicate::Not(_) => {}
+        LogPredicate::MessageRegex(regex) => {
+            if let Some(literals) = regex_required_literals(regex.pattern()) {
+                constraints
+                    .message_literals
+                    .extend(literals.iter().copied());
+                if regex.case_sensitivity() == CaseSensitivity::Sensitive {
+                    constraints.case_sensitive_message_literals.extend(literals);
+                }
+            }
+        }
+        LogPredicate::MessageTokenRegex(regex) => {
+            if let Some(literals) = regex_required_literals(regex.pattern()) {
+                constraints
+                    .message_literals
+                    .extend(literals.iter().copied());
+                if regex.case_sensitivity() == CaseSensitivity::Sensitive {
+                    constraints.case_sensitive_message_literals.extend(literals);
+                }
+            }
+        }
     }
+}
+
+pub(crate) fn regex_required_literals(pattern: &str) -> Option<Vec<&str>> {
+    let mut literals = Vec::new();
+    let mut start = None;
+    let mut escaped = false;
+    let mut unsafe_pattern = false;
+    for (index, byte) in pattern.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            start = None;
+            continue;
+        }
+        if byte == b'\\' {
+            start = None;
+            escaped = true;
+            continue;
+        }
+        if byte.is_ascii_alphanumeric() {
+            start.get_or_insert(index);
+            continue;
+        }
+        let was_literal = start.is_some();
+        if let Some(begin) = start.take() {
+            literals.push(&pattern[begin..index]);
+        }
+        if matches!(byte, b'|' | b'(' | b')' | b'[' | b']' | b'{' | b'}')
+            || (matches!(byte, b'?' | b'+' | b'*') && was_literal)
+        {
+            unsafe_pattern = true;
+        }
+    }
+    if let Some(begin) = start {
+        literals.push(&pattern[begin..]);
+    }
+    (!unsafe_pattern && !literals.is_empty()).then_some(literals)
 }
 
 fn predicate_is_index_only_conjunction(predicate: &LogPredicate) -> bool {
@@ -248,16 +438,24 @@ fn predicate_is_index_only_conjunction(predicate: &LogPredicate) -> bool {
             ..
         } => true,
         LogPredicate::And(predicates) => predicates.iter().all(predicate_is_index_only_conjunction),
+        LogPredicate::MessageToken {
+            case_sensitivity: CaseSensitivity::Insensitive,
+            ..
+        } => true,
+        LogPredicate::Not(predicate) => predicate_is_index_only_conjunction(predicate),
         LogPredicate::MessageToken { .. }
         | LogPredicate::Message(_)
         | LogPredicate::MessageRegex(_)
+        | LogPredicate::MessageTokenRegex(_)
+        | LogPredicate::MessageTokenPrefix { .. }
+        | LogPredicate::MessagePhrase { .. }
+        | LogPredicate::MessageFuzzy { .. }
         | LogPredicate::FieldExists(_)
         | LogPredicate::Field { .. }
         | LogPredicate::FieldIn { .. }
         | LogPredicate::FieldRegex { .. }
         | LogPredicate::FieldNumeric { .. }
-        | LogPredicate::Or(_)
-        | LogPredicate::Not(_) => false,
+        | LogPredicate::Or(_) => false,
     }
 }
 
@@ -272,6 +470,27 @@ fn predicate_matches<R: StructuralRecordView>(predicate: &LogPredicate, record: 
         } => message_has_clickhouse_token(record.structural_message(), value, *case_sensitivity),
         LogPredicate::Message(matcher) => text_matches(record.structural_message(), matcher),
         LogPredicate::MessageRegex(regex) => regex.is_match(record.structural_message()),
+        LogPredicate::MessageTokenRegex(regex) => {
+            message_has_token_regex(record.structural_message(), regex)
+        }
+        LogPredicate::MessageTokenPrefix {
+            value,
+            case_sensitivity,
+        } => message_has_token_prefix(record.structural_message(), value, *case_sensitivity),
+        LogPredicate::MessagePhrase {
+            terms,
+            max_gap,
+            case_sensitivity,
+        } => message_has_phrase(
+            record.structural_message(),
+            terms,
+            *max_gap,
+            *case_sensitivity,
+        ),
+        LogPredicate::MessageFuzzy {
+            value,
+            max_distance,
+        } => message_has_fuzzy_token(record.structural_message(), value, *max_distance),
         LogPredicate::FieldExists(key) => {
             fields(record).any(|(observed, _)| observed == key.as_ref())
         }
@@ -303,6 +522,54 @@ fn predicate_matches<R: StructuralRecordView>(predicate: &LogPredicate, record: 
     }
 }
 
+pub(crate) fn predicate_fields_match(predicate: &LogPredicate, fields: &[MetadataField]) -> bool {
+    match predicate {
+        LogPredicate::MatchAll
+        | LogPredicate::Term(_)
+        | LogPredicate::Message(_)
+        | LogPredicate::MessageRegex(_)
+        | LogPredicate::MessageToken { .. }
+        | LogPredicate::MessageTokenRegex(_)
+        | LogPredicate::MessageTokenPrefix { .. }
+        | LogPredicate::MessagePhrase { .. }
+        | LogPredicate::MessageFuzzy { .. } => true,
+        LogPredicate::MatchNone => false,
+        LogPredicate::FieldExists(key) => fields
+            .iter()
+            .any(|field| field.key.as_ref() == key.as_ref()),
+        LogPredicate::Field { key, matcher } => fields
+            .iter()
+            .any(|field| field.key.as_ref() == key.as_ref() && text_matches(&field.value, matcher)),
+        LogPredicate::FieldIn { key, values } => fields.iter().any(|field| {
+            field.key.as_ref() == key.as_ref()
+                && values
+                    .iter()
+                    .any(|expected| field.value.as_ref() == expected.as_ref())
+        }),
+        LogPredicate::FieldRegex { key, regex } => fields
+            .iter()
+            .any(|field| field.key.as_ref() == key.as_ref() && regex.is_match(&field.value)),
+        LogPredicate::FieldNumeric {
+            key,
+            comparison,
+            value,
+        } => fields.iter().any(|field| {
+            field.key.as_ref() == key.as_ref()
+                && field
+                    .value
+                    .parse::<i128>()
+                    .is_ok_and(|observed| compare_numeric(observed, *comparison, *value))
+        }),
+        LogPredicate::And(predicates) => predicates
+            .iter()
+            .all(|predicate| predicate_fields_match(predicate, fields)),
+        LogPredicate::Or(predicates) => predicates
+            .iter()
+            .any(|predicate| predicate_fields_match(predicate, fields)),
+        LogPredicate::Not(predicate) => !predicate_fields_match(predicate, fields),
+    }
+}
+
 fn message_only_predicate_matches(predicate: &LogPredicate, message: &str) -> Option<bool> {
     match predicate {
         LogPredicate::MatchAll => Some(true),
@@ -318,6 +585,25 @@ fn message_only_predicate_matches(predicate: &LogPredicate, message: &str) -> Op
         )),
         LogPredicate::Message(matcher) => Some(text_matches(message, matcher)),
         LogPredicate::MessageRegex(regex) => Some(regex.is_match(message)),
+        LogPredicate::MessageTokenRegex(regex) => Some(message_has_token_regex(message, regex)),
+        LogPredicate::MessageTokenPrefix {
+            value,
+            case_sensitivity,
+        } => Some(message_has_token_prefix(message, value, *case_sensitivity)),
+        LogPredicate::MessagePhrase {
+            terms,
+            max_gap,
+            case_sensitivity,
+        } => Some(message_has_phrase(
+            message,
+            terms,
+            *max_gap,
+            *case_sensitivity,
+        )),
+        LogPredicate::MessageFuzzy {
+            value,
+            max_distance,
+        } => Some(message_has_fuzzy_token(message, value, *max_distance)),
         LogPredicate::And(predicates) => {
             let mut matched = true;
             for predicate in predicates {
@@ -360,6 +646,40 @@ pub(crate) fn message_has_term(message: &str, expected: &str) -> bool {
     matched
 }
 
+#[derive(Clone, Copy)]
+struct ClickhouseTokenIter<'a> {
+    message: &'a str,
+    offset: usize,
+}
+
+impl<'a> ClickhouseTokenIter<'a> {
+    fn new(message: &'a str) -> Self {
+        Self { message, offset: 0 }
+    }
+}
+
+impl<'a> Iterator for ClickhouseTokenIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let bytes = self.message.as_bytes();
+        while self.offset < bytes.len() && clickhouse_token_separator(bytes[self.offset]) {
+            self.offset += 1;
+        }
+        let start = self.offset;
+        while self.offset < bytes.len() && !clickhouse_token_separator(bytes[self.offset]) {
+            self.offset += 1;
+        }
+        (start < self.offset).then(|| &self.message[start..self.offset])
+    }
+}
+
+pub(crate) fn scan_clickhouse_tokens(message: &str, mut on_token: impl FnMut(&str)) {
+    for token in ClickhouseTokenIter::new(message) {
+        on_token(token);
+    }
+}
+
 pub(crate) fn message_has_clickhouse_token(
     message: &str,
     expected: &str,
@@ -388,15 +708,139 @@ pub(crate) fn message_has_clickhouse_token(
         })
 }
 
+pub(crate) fn message_has_token_prefix(
+    message: &str,
+    prefix: &str,
+    case_sensitivity: CaseSensitivity,
+) -> bool {
+    if prefix.is_empty() || prefix.bytes().any(clickhouse_token_separator) {
+        return false;
+    }
+    let mut matched = false;
+    scan_clickhouse_tokens(message, |token| {
+        matched |= match case_sensitivity {
+            CaseSensitivity::Sensitive => token.starts_with(prefix),
+            CaseSensitivity::Insensitive => token
+                .get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix)),
+        };
+    });
+    matched
+}
+
+pub(crate) fn message_has_token_regex(message: &str, regex: &crate::LogRegex) -> bool {
+    let mut matched = false;
+    scan_clickhouse_tokens(message, |token| matched |= regex.is_match(token));
+    matched
+}
+
+pub(crate) fn message_has_phrase(
+    message: &str,
+    terms: &[std::sync::Arc<str>],
+    max_gap: usize,
+    case_sensitivity: CaseSensitivity,
+) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let matches_term = |token: &str, term: &str| match case_sensitivity {
+        CaseSensitivity::Sensitive => token == term,
+        CaseSensitivity::Insensitive => token.eq_ignore_ascii_case(term),
+    };
+    if max_gap == 0 {
+        let first = terms[0].as_ref();
+        let mut next = 0usize;
+        for token in ClickhouseTokenIter::new(message) {
+            if matches_term(token, &terms[next]) {
+                next += 1;
+                if next == terms.len() {
+                    return true;
+                }
+            } else {
+                next = usize::from(matches_term(token, first));
+            }
+        }
+        return false;
+    }
+    let mut starts = ClickhouseTokenIter::new(message);
+    while let Some(first) = starts.next() {
+        if !matches_term(first, &terms[0]) {
+            continue;
+        }
+        let mut remaining = starts;
+        let mut matched = true;
+        for term in &terms[1..] {
+            let mut found = false;
+            for _ in 0..=max_gap {
+                let Some(candidate) = remaining.next() else {
+                    break;
+                };
+                if matches_term(candidate, term) {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn message_has_fuzzy_token(message: &str, value: &str, max_distance: u8) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let mut matched = false;
+    scan_clickhouse_tokens(message, |token| {
+        matched |= bounded_levenshtein(token, value, usize::from(max_distance));
+    });
+    matched
+}
+
+pub(crate) fn bounded_levenshtein(left: &str, right: &str, max_distance: usize) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len().abs_diff(right.len()) > max_distance {
+        return false;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_byte) in left.iter().copied().enumerate() {
+        current[0] = left_index + 1;
+        let mut row_min = current[0];
+        for (right_index, right_byte) in right.iter().copied().enumerate() {
+            let substitution = if left_byte.eq_ignore_ascii_case(&right_byte) {
+                previous[right_index]
+            } else {
+                previous[right_index] + 1
+            };
+            current[right_index + 1] =
+                (substitution.min(previous[right_index + 1] + 1)).min(current[right_index] + 1);
+            row_min = row_min.min(current[right_index + 1]);
+        }
+        if row_min > max_distance {
+            return false;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()] <= max_distance
+}
+
 fn clickhouse_token_is_index_safe(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
-const fn clickhouse_token_separator(byte: u8) -> bool {
+pub(crate) const fn clickhouse_token_separator(byte: u8) -> bool {
     byte.is_ascii() && !(byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn text_matches(observed: &str, matcher: &TextMatcher) -> bool {
+pub(crate) fn text_matches(observed: &str, matcher: &TextMatcher) -> bool {
     match matcher.kind {
         TextMatchKind::Exact => text_equal(observed, &matcher.value, matcher.case_sensitivity),
         TextMatchKind::Contains => {
@@ -466,6 +910,8 @@ const fn compare_numeric(observed: i128, comparison: NumericComparison, expected
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
     use super::*;
@@ -562,5 +1008,80 @@ mod tests {
         let constraints = query.required_index_constraints();
         assert_eq!(constraints.terms, ["Cannot"]);
         assert!(query.requires_post_decode());
+    }
+
+    #[test]
+    fn case_insensitive_ascii_tokens_can_use_message_only_filter() {
+        let query = LogQuery::new(record("unused").record_ref.topic_partition).where_predicate(
+            LogPredicate::message_token("Cannot", CaseSensitivity::Insensitive),
+        );
+        assert!(query.can_use_message_only_filter());
+        assert!(!query.requires_post_decode());
+    }
+
+    #[test]
+    fn exact_frame_token_fast_path_accepts_both_case_modes_and_timestamp_sort() {
+        let query = LogQuery::new(record("unused").record_ref.topic_partition)
+            .where_predicate(LogPredicate::and(vec![
+                LogPredicate::message_token("Cannot", CaseSensitivity::Sensitive),
+                LogPredicate::message_token("checkout", CaseSensitivity::Insensitive),
+            ]))
+            .sort_by_timestamp();
+        assert_eq!(
+            query.exact_message_token_conjunction(),
+            Some(vec![
+                ("Cannot", CaseSensitivity::Sensitive),
+                ("checkout", CaseSensitivity::Insensitive),
+            ])
+        );
+        assert!(
+            LogQuery::new(record("unused").record_ref.topic_partition)
+                .with_term("Cannot")
+                .exact_message_token_conjunction()
+                .is_none()
+        );
+        assert!(
+            LogQuery::new(record("unused").record_ref.topic_partition)
+                .where_predicate(LogPredicate::message_token(
+                    "two words",
+                    CaseSensitivity::Sensitive,
+                ))
+                .exact_message_token_conjunction()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn token_phrase_prefix_regex_and_fuzzy_predicates_match_message_tokens() {
+        let message = "failed to place order connection";
+        assert!(message_has_token_prefix(
+            message,
+            "conn",
+            CaseSensitivity::Insensitive
+        ));
+        let regex = LogRegex::new("charg.*", CaseSensitivity::Insensitive).unwrap();
+        assert!(message_has_token_regex("charge failed", &regex));
+        assert!(message_has_phrase(
+            message,
+            &[Arc::from("failed"), Arc::from("order")],
+            2,
+            CaseSensitivity::Insensitive
+        ));
+        assert!(!message_has_phrase(
+            message,
+            &[Arc::from("failed"), Arc::from("order")],
+            1,
+            CaseSensitivity::Insensitive
+        ));
+        assert!(message_has_fuzzy_token(
+            "connection refused",
+            "conection",
+            1
+        ));
+        assert!(!message_has_fuzzy_token(
+            "connection refused",
+            "conection",
+            0
+        ));
     }
 }

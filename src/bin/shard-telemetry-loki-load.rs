@@ -12,10 +12,10 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
-use shard_stream_core::TopicPartition;
+use shard_stream_core::{LogicalPartitionId, TopicPartition};
 use shard_telemetry::{
-    DockerLogRecord, DockerLogStream, NATIVE_FRAME_HEADER_BYTES, NativeFrame, NativeFrameHeader,
-    NativeOpcode, NativePartitionAppend, NativeStatus, NativeTelemetryAppendAck,
+    DockerLogRecord, DockerLogStream, LOGS_TOPIC_ID, NATIVE_FRAME_HEADER_BYTES, NativeFrame,
+    NativeFrameHeader, NativeOpcode, NativePartitionAppend, NativeStatus, NativeTelemetryAppendAck,
     NativeTelemetryBatch, TelemetryRouter, prepare_docker_log_envelope_with_context,
 };
 
@@ -51,6 +51,19 @@ struct Arguments {
     /// Native requests allowed in flight on each persistent connection.
     #[arg(long, default_value_t = 1)]
     pipeline_depth: usize,
+    /// Stable logical partitions configured on the target server.
+    #[arg(long, default_value_t = 256)]
+    partitions: u16,
+    /// Distinct logical partitions packed into each native request.
+    #[arg(long, default_value_t = 1)]
+    partitions_per_request: usize,
+    /// Use durable request receipts for native appends.
+    ///
+    /// The default uses the normal untracked append path. Enable this when
+    /// measuring replay-safe idempotency, which intentionally persists one
+    /// receipt per request.
+    #[arg(long, default_value_t = false)]
+    retryable: bool,
     /// Loki tenant header.
     #[arg(long, default_value = "benchmark")]
     tenant: String,
@@ -84,9 +97,14 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         || arguments.batch_bytes < 1_024
         || arguments.pipeline_depth == 0
         || arguments.pipeline_depth > 64
+        || arguments.partitions == 0
+        || arguments.partitions_per_request == 0
+        || arguments.partitions_per_request > usize::from(arguments.partitions)
+        || (arguments.retryable && arguments.protocol != LoadProtocol::Native)
+        || (arguments.retryable && arguments.partitions_per_request != 1)
     {
         return Err(
-            "workers must be nonzero, batch-bytes must be at least 1024, and pipeline-depth must be in 1..=64"
+            "workers must be nonzero, batch-bytes must be at least 1024, pipeline-depth must be in 1..=64, partitions must be nonzero, partitions-per-request must be in 1..=partitions, and retryable native mode requires one partition per request"
                 .into(),
         );
     }
@@ -107,7 +125,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let port = arguments.port;
         let batch_bytes = arguments.batch_bytes;
         let pipeline_depth = arguments.pipeline_depth;
+        let partitions = arguments.partitions;
+        let partitions_per_request = arguments.partitions_per_request;
         let protocol = arguments.protocol;
+        let retryable = arguments.retryable;
         workers.push(thread::spawn(move || {
             run_worker(
                 &source,
@@ -119,7 +140,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 end,
                 batch_bytes,
                 pipeline_depth,
+                partitions,
+                partitions_per_request,
                 protocol,
+                retryable,
                 &next_request,
             )
         }));
@@ -138,6 +162,20 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("records: {}", aggregate.records);
     println!("malformed records skipped: {}", aggregate.malformed_records);
     println!("wire protocol: {:?}", arguments.protocol);
+    if arguments.protocol == LoadProtocol::Native {
+        println!(
+            "native append mode: {}",
+            if arguments.retryable {
+                "retryable"
+            } else {
+                "untracked"
+            }
+        );
+        println!(
+            "native partitions per request: {}",
+            arguments.partitions_per_request
+        );
+    }
     println!("pushed wire bytes: {}", aggregate.pushed_bytes);
     println!("ingest elapsed seconds: {elapsed:.6}");
     println!(
@@ -153,12 +191,15 @@ fn run_worker(
     host: &str,
     port: u16,
     tenant: &str,
-    _worker: usize,
+    worker: usize,
     start: u64,
     end: u64,
     batch_bytes: usize,
     pipeline_depth: usize,
+    partitions: u16,
+    partitions_per_request: usize,
     protocol: LoadProtocol,
+    retryable: bool,
     next_request: &AtomicU64,
 ) -> Result<WorkerResult, Box<dyn Error + Send + Sync>> {
     let mut file = File::open(source)?;
@@ -169,7 +210,16 @@ fn run_worker(
         let mut partial = Vec::new();
         position += reader.read_until(b'\n', &mut partial)? as u64;
     }
-    let mut connection = Connection::connect(protocol, host, port, tenant)?;
+    let mut connection = Connection::connect(
+        protocol,
+        host,
+        port,
+        tenant,
+        worker,
+        partitions,
+        partitions_per_request,
+        retryable,
+    )?;
     let mut result = WorkerResult::default();
     let mut batch = LoadBatch::new(protocol, batch_bytes);
     let mut line = Vec::with_capacity(4096);
@@ -296,15 +346,29 @@ enum Connection {
 }
 
 impl Connection {
+    #[allow(clippy::too_many_arguments)]
     fn connect(
         protocol: LoadProtocol,
         host: &str,
         port: u16,
         tenant: &str,
+        worker: usize,
+        partitions: u16,
+        partitions_per_request: usize,
+        retryable: bool,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         match protocol {
-            LoadProtocol::Loki => HttpConnection::connect(host, port).map(Self::Loki),
-            LoadProtocol::Native => NativeConnection::connect(host, port, tenant).map(Self::Native),
+            LoadProtocol::Loki => HttpConnection::connect(host, port, worker).map(Self::Loki),
+            LoadProtocol::Native => NativeConnection::connect(
+                host,
+                port,
+                tenant,
+                worker,
+                partitions,
+                partitions_per_request,
+                retryable,
+            )
+            .map(Self::Native),
         }
     }
 
@@ -360,15 +424,18 @@ impl Connection {
 
 struct HttpConnection {
     host: String,
+    prefix: String,
     stream: BufReader<TcpStream>,
 }
 
 impl HttpConnection {
-    fn connect(host: &str, port: u16) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    fn connect(host: &str, port: u16, worker: usize) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let socket = TcpStream::connect((host, port))?;
         socket.set_nodelay(true)?;
+        let source = worker_source(worker);
         Ok(Self {
             host: host.to_owned(),
+            prefix: format!(r#"{{"streams":[{{"stream":{{"source":"{source}"}},"values":["#),
             stream: BufReader::new(socket),
         })
     }
@@ -380,9 +447,8 @@ impl HttpConnection {
         next_request: &AtomicU64,
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
         let request_id = next_request.fetch_add(1, Ordering::Relaxed);
-        let prefix = r#"{"streams":[{"stream":{"source":"clickhouse-docker"},"values":["#;
         let suffix = "]}]}";
-        let content_length = prefix.len() + values.len() + suffix.len();
+        let content_length = self.prefix.len() + values.len() + suffix.len();
         write!(
             self.stream.get_mut(),
             "POST /loki/api/v1/push HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-Scope-OrgID: {}\r\nX-ShardTelemetry-Request-ID: {}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}{}{}",
@@ -390,7 +456,7 @@ impl HttpConnection {
             tenant,
             request_id,
             content_length,
-            prefix,
+            self.prefix,
             values,
             suffix
         )?;
@@ -430,23 +496,49 @@ impl HttpConnection {
 
 struct NativeConnection {
     stream: TcpStream,
-    topic_partition: TopicPartition,
+    topic_partitions: Vec<TopicPartition>,
+    opcode: NativeOpcode,
     pending_request_ids: Vec<u128>,
 }
 
 impl NativeConnection {
-    fn connect(host: &str, port: u16, tenant: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    fn connect(
+        host: &str,
+        port: u16,
+        tenant: &str,
+        worker: usize,
+        partitions: u16,
+        partitions_per_request: usize,
+        retryable: bool,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let stream = TcpStream::connect((host, port))?;
         stream.set_nodelay(true)?;
-        let mut route_identity = Vec::with_capacity(8 + 6 + 8 + 17);
-        route_identity.extend_from_slice(&6_u64.to_le_bytes());
-        route_identity.extend_from_slice(b"source");
-        route_identity.extend_from_slice(&17_u64.to_le_bytes());
-        route_identity.extend_from_slice(b"clickhouse-docker");
-        let router = TelemetryRouter::new(NonZeroU16::new(256).expect("constant is nonzero"));
+        let route_identity = worker_route_identity(worker);
+        let router = TelemetryRouter::new(
+            NonZeroU16::new(partitions).expect("validated partition count is nonzero"),
+        );
+        let topic_partitions = if partitions_per_request == 1 {
+            vec![router.log(tenant, None, &route_identity)]
+        } else {
+            (0..partitions_per_request)
+                .map(|partition| {
+                    TopicPartition::new(
+                        LOGS_TOPIC_ID,
+                        LogicalPartitionId::new(
+                            u32::try_from(partition).expect("partition count fits u32"),
+                        ),
+                    )
+                })
+                .collect()
+        };
         Ok(Self {
             stream,
-            topic_partition: router.log(tenant, None, &route_identity),
+            topic_partitions,
+            opcode: if retryable {
+                NativeOpcode::Append
+            } else {
+                NativeOpcode::AppendUntracked
+            },
             pending_request_ids: Vec::new(),
         })
     }
@@ -458,17 +550,30 @@ impl NativeConnection {
         next_request: &AtomicU64,
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
         let request_id = u128::from(next_request.fetch_add(1, Ordering::Relaxed));
-        let (envelope, transient_context) =
-            prepare_docker_log_envelope_with_context(tenant, entries)?;
-        let payload = NativeTelemetryBatch {
-            partitions: vec![NativePartitionAppend {
-                topic_partition: self.topic_partition,
+        let partition_count = self.topic_partitions.len();
+        let mut partition_entries = (0..partition_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<_>>>();
+        for (index, entry) in entries.into_iter().enumerate() {
+            partition_entries[index % partition_count].push(entry);
+        }
+        let mut partitions = Vec::with_capacity(partition_count);
+        for (topic_partition, entries) in
+            self.topic_partitions.iter().copied().zip(partition_entries)
+        {
+            if entries.is_empty() {
+                continue;
+            }
+            let (envelope, transient_context) =
+                prepare_docker_log_envelope_with_context(tenant, entries)?;
+            partitions.push(NativePartitionAppend {
+                topic_partition,
                 envelope,
                 transient_context: Some(transient_context),
-            }],
+            });
         }
-        .encode()?;
-        let request = NativeFrame::request(NativeOpcode::Append, request_id, payload)?;
+        let payload = NativeTelemetryBatch { partitions }.encode()?;
+        let request = NativeFrame::request(self.opcode, request_id, payload)?;
         self.stream.write_all(&request.header.encode())?;
         self.stream.write_all(&request.payload)?;
         self.pending_request_ids.push(request_id);
@@ -482,9 +587,7 @@ impl NativeConnection {
         let mut response = vec![0; header.payload_len as usize];
         self.stream.read_exact(&mut response)?;
         header.verify_payload(&response)?;
-        if !header.is_response
-            || header.opcode != NativeOpcode::Append
-            || header.status != NativeStatus::Ok
+        if !header.is_response || header.opcode != self.opcode || header.status != NativeStatus::Ok
         {
             return Err(format!(
                 "native push failed with status {:?}: {}",
@@ -506,7 +609,9 @@ impl NativeConnection {
         };
         self.pending_request_ids.swap_remove(pending_index);
         let acknowledgement = NativeTelemetryAppendAck::decode(&response)?;
-        if acknowledgement.partitions.len() != 1 {
+        if acknowledgement.partitions.is_empty()
+            || acknowledgement.partitions.len() > self.topic_partitions.len()
+        {
             return Err("native append returned an unexpected partition count".into());
         }
         Ok(())
@@ -515,6 +620,24 @@ impl NativeConnection {
     fn pending(&self) -> usize {
         self.pending_request_ids.len()
     }
+}
+
+fn worker_source(worker: usize) -> String {
+    format!("clickhouse-docker-{worker}")
+}
+
+fn worker_route_identity(worker: usize) -> Vec<u8> {
+    let source = worker_source(worker);
+    let mut route_identity = Vec::with_capacity(8 + 8 + source.len());
+    route_identity.extend_from_slice(&6_u64.to_le_bytes());
+    route_identity.extend_from_slice(b"source");
+    route_identity.extend_from_slice(
+        &u64::try_from(source.len())
+            .expect("benchmark worker route identity length fits u64")
+            .to_le_bytes(),
+    );
+    route_identity.extend_from_slice(source.as_bytes());
+    route_identity
 }
 
 fn docker_stream(stream: Cow<'_, str>) -> DockerLogStream {
@@ -592,4 +715,15 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{worker_route_identity, worker_source};
+
+    #[test]
+    fn workers_use_distinct_route_identities() {
+        assert_ne!(worker_source(0), worker_source(1));
+        assert_ne!(worker_route_identity(0), worker_route_identity(1));
+    }
 }

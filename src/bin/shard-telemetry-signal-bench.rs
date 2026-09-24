@@ -40,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut generate_only = false;
     let mut server_recovery_journal = false;
     let mut server_hold_seconds = 0u64;
+    let mut resource_cardinality = None::<usize>;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -86,6 +87,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("missing value for --server-hold-seconds")?
                     .parse()?;
             }
+            "--resource-cardinality" => {
+                resource_cardinality = Some(parse_usize(args.next(), "--resource-cardinality")?);
+            }
             _ => return Err(format!("unknown argument {argument}").into()),
         }
     }
@@ -96,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || server_partitions == 0
         || server_partitions > usize::from(u16::MAX)
         || server_shards > server_partitions
+        || resource_cardinality == Some(0)
     {
         return Err(
             "--records must be at least 128, --iterations must be nonzero, --server-shards must be in 1..=256, and --server-partitions must fit u16 and be at least the shard count"
@@ -202,6 +207,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("ShardTelemetry signal benchmark (v1)");
     println!("records_per_signal={records} lookup_iterations={iterations}");
 
+    if let Some(cardinality) = resource_cardinality {
+        benchmark_resource_selector(&corpus, cardinality, iterations)?;
+    }
+
     let log_result = benchmark_logs(&corpus, iterations)?;
     let trace_result = benchmark_traces(&corpus, iterations, durable_output_dir.as_deref())?;
     let metric_result = benchmark_metrics(&corpus, iterations, durable_output_dir.as_deref())?;
@@ -210,10 +219,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_result("traces", trace_result);
     print_result("metrics", metric_result);
     println!(
-        "correlation refs={} lookup_ops_s={:.2} p50_us={:.3} p99_us={:.3}",
+        "correlation refs={} lookup_ops_s={:.2} p50_us={:.3} p95_us={:.3} p99_us={:.3}",
         correlation_result.lookup_count,
         correlation_result.lookup_ops_per_second,
         correlation_result.lookup_p50.as_secs_f64() * 1e6,
+        correlation_result.lookup_p95.as_secs_f64() * 1e6,
         correlation_result.lookup_p99.as_secs_f64() * 1e6,
     );
     Ok(())
@@ -233,6 +243,12 @@ fn benchmark_server_scans(
     log.trace_id = Some(selected_trace);
     log.limit = Some(32);
     log.columns = vec![AnalyticsColumn::Timestamp, AnalyticsColumn::Message];
+    let mut filtered_log = AnalyticsScanRequest::for_relation(TENANT, AnalyticsRelation::Logs);
+    filtered_log
+        .resource_attributes
+        .push(MetadataField::new("service.name", "checkout-api"));
+    filtered_log.limit = Some(1_000);
+    filtered_log.columns = vec![AnalyticsColumn::Timestamp, AnalyticsColumn::Message];
     let mut trace = AnalyticsScanRequest::for_relation(TENANT, AnalyticsRelation::Spans);
     trace.trace_id = Some(selected_trace);
     trace.limit = Some(32);
@@ -252,11 +268,12 @@ fn benchmark_server_scans(
     resource.columns = vec![AnalyticsColumn::Timestamp, AnalyticsColumn::Name];
     for (name, request) in [
         ("log", log),
+        ("log_filtered", filtered_log),
         ("trace", trace),
         ("metric", metric),
         ("resource", resource),
     ] {
-        let (rows, ops, p50, p99) = measure_lookup(iterations, || {
+        let (rows, ops, p50, p95, p99) = measure_lookup(iterations, || {
             let mut count = 0;
             store
                 .scan_analytics(&request, &mut |batch| {
@@ -267,8 +284,9 @@ fn benchmark_server_scans(
             count
         });
         println!(
-            "server_scan signal={name} rows={rows} lookup_ops_s={ops:.2} p50_us={:.3} p99_us={:.3}",
+            "server_scan signal={name} rows={rows} lookup_ops_s={ops:.2} p50_us={:.3} p95_us={:.3} p99_us={:.3}",
             p50.as_secs_f64() * 1e6,
+            p95.as_secs_f64() * 1e6,
             p99.as_secs_f64() * 1e6,
         );
     }
@@ -996,6 +1014,7 @@ struct ResultRow {
     lookup_count: usize,
     lookup_ops_per_second: f64,
     lookup_p50: Duration,
+    lookup_p95: Duration,
     lookup_p99: Duration,
 }
 
@@ -1037,7 +1056,7 @@ fn benchmark_logs(
         .with_field("service.name", "checkout-api")
         .with_term("completed")
         .with_limit(100);
-    let (lookup_count, lookup_ops_per_second, lookup_p50, lookup_p99) =
+    let (lookup_count, lookup_ops_per_second, lookup_p50, lookup_p95, lookup_p99) =
         measure_lookup(iterations, || stripe.query(&query).len());
     Ok(ResultRow {
         source_bytes,
@@ -1049,6 +1068,7 @@ fn benchmark_logs(
         lookup_count,
         lookup_ops_per_second,
         lookup_p50,
+        lookup_p95,
         lookup_p99,
     })
 }
@@ -1090,7 +1110,7 @@ fn benchmark_traces(
 
     let mut stripe = TraceStripe::new(512 * 1024 * 1024)?;
     for span in &corpus.spans {
-        stripe.apply(span.clone(), span.start_time_unix_nanos)?;
+        stripe.apply_ref(span, span.start_time_unix_nanos)?;
     }
     let query = TraceQuery {
         tenant: Arc::from(TENANT),
@@ -1098,7 +1118,7 @@ fn benchmark_traces(
         limit: 32,
         ..TraceQuery::default()
     };
-    let (lookup_count, lookup_ops_per_second, lookup_p50, lookup_p99) =
+    let (lookup_count, lookup_ops_per_second, lookup_p50, lookup_p95, lookup_p99) =
         measure_lookup(iterations, || {
             stripe.query(&query).map_or(0, |value| value.len())
         });
@@ -1112,8 +1132,70 @@ fn benchmark_traces(
         lookup_count,
         lookup_ops_per_second,
         lookup_p50,
+        lookup_p95,
         lookup_p99,
     })
+}
+
+fn benchmark_resource_selector(
+    corpus: &Corpus,
+    cardinality: usize,
+    iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resources = (0..cardinality)
+        .map(|ordinal| {
+            Arc::new(ResourceContext {
+                attributes: Arc::new(vec![
+                    TelemetryAttribute::new(
+                        "service.name",
+                        TelemetryValue::String(Arc::from(format!("service-{ordinal}"))),
+                    ),
+                    TelemetryAttribute::new(
+                        "deployment.environment",
+                        TelemetryValue::String(Arc::from("production")),
+                    ),
+                ]),
+                schema_url: Arc::from("https://opentelemetry.io/schemas/1.37.0"),
+                ..ResourceContext::default()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut stripe = TraceStripe::new(512 * 1024 * 1024)?;
+    for (ordinal, source) in corpus.spans.iter().enumerate() {
+        let mut span = source.clone();
+        span.resource = Arc::clone(&resources[ordinal % cardinality]);
+        stripe.apply_ref(&span, source.start_time_unix_nanos)?;
+    }
+
+    let target = cardinality / 2;
+    let target_service = format!("service-{target}");
+    let query = TraceQuery {
+        tenant: Arc::from(TENANT),
+        exact_resource_attributes: Arc::new(vec![(
+            Arc::from("service.name"),
+            Arc::from(target_service.as_str()),
+        )]),
+        limit: 8,
+        ..TraceQuery::default()
+    };
+    let expected = corpus
+        .spans
+        .iter()
+        .enumerate()
+        .filter(|(ordinal, _)| ordinal % cardinality == target)
+        .count()
+        .min(query.limit);
+    let (rows, ops, p50, p95, p99) = measure_lookup(iterations, || {
+        stripe.query(&query).map_or(0, |value| value.len())
+    });
+    println!(
+        "resource_selector cardinality={cardinality} spans={} expected_rows={expected} rows={rows} lookup_ops_s={ops:.2} p50_us={:.3} p95_us={:.3} p99_us={:.3}",
+        corpus.spans.len(),
+        p50.as_secs_f64() * 1e6,
+        p95.as_secs_f64() * 1e6,
+        p99.as_secs_f64() * 1e6,
+    );
+    Ok(())
 }
 
 fn benchmark_metrics(
@@ -1159,7 +1241,7 @@ fn benchmark_metrics(
 
     let mut stripe = MetricStripe::new(512 * 1024 * 1024)?;
     for point in &corpus.points {
-        stripe.apply(point.clone(), MetricIngestProtocol::Otlp)?;
+        stripe.apply_ref(point, MetricIngestProtocol::Otlp)?;
     }
     let selected = &corpus.points[corpus.points.len() / 2];
     let query = MetricQuery {
@@ -1168,7 +1250,7 @@ fn benchmark_metrics(
         limit: 100,
         ..MetricQuery::default()
     };
-    let (lookup_count, lookup_ops_per_second, lookup_p50, lookup_p99) =
+    let (lookup_count, lookup_ops_per_second, lookup_p50, lookup_p95, lookup_p99) =
         measure_lookup(iterations, || {
             stripe.query(&query).map_or(0, |value| value.len())
         });
@@ -1182,6 +1264,7 @@ fn benchmark_metrics(
         lookup_count,
         lookup_ops_per_second,
         lookup_p50,
+        lookup_p95,
         lookup_p99,
     })
 }
@@ -1205,7 +1288,7 @@ fn benchmark_correlations(corpus: &Corpus, iterations: usize) -> ResultRow {
         .with_resource_id(corpus.resource.id())
         .with_attribute(&corpus.label)
         .with_limit(1_000);
-    let (lookup_count, lookup_ops_per_second, lookup_p50, lookup_p99) =
+    let (lookup_count, lookup_ops_per_second, lookup_p50, lookup_p95, lookup_p99) =
         measure_lookup(iterations, || index.query(&query).len());
     ResultRow {
         source_bytes: 0,
@@ -1217,6 +1300,7 @@ fn benchmark_correlations(corpus: &Corpus, iterations: usize) -> ResultRow {
         lookup_count,
         lookup_ops_per_second,
         lookup_p50,
+        lookup_p95,
         lookup_p99,
     }
 }
@@ -1247,7 +1331,7 @@ fn canonical_log_bytes(record: &DurableLog) -> Result<usize, rmp_serde::encode::
 fn measure_lookup(
     mut iterations: usize,
     mut lookup: impl FnMut() -> usize,
-) -> (usize, f64, Duration, Duration) {
+) -> (usize, f64, Duration, Duration, Duration) {
     let warm_count = black_box(lookup());
     let mut samples = Vec::with_capacity(iterations);
     let started = Instant::now();
@@ -1260,11 +1344,13 @@ fn measure_lookup(
     let elapsed = started.elapsed();
     samples.sort_unstable();
     let p50 = samples[samples.len() / 2];
+    let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
     let p99 = samples[(samples.len() * 99 / 100).min(samples.len() - 1)];
     (
         warm_count,
         samples.len() as f64 / elapsed.as_secs_f64(),
         p50,
+        p95,
         p99,
     )
 }
@@ -1272,7 +1358,7 @@ fn measure_lookup(
 fn print_result(signal: &str, result: ResultRow) {
     let stored_bytes = result.payload_bytes + result.auxiliary_bytes;
     println!(
-        "{signal} source_bytes={} payload_bytes={} auxiliary_bytes={} stored_bytes={} durable_bytes={} ratio={:.2}x encode_mib_s={:.2} decode_mib_s={:.2} lookup_results={} lookup_ops_s={:.2} p50_us={:.3} p99_us={:.3}",
+        "{signal} source_bytes={} payload_bytes={} auxiliary_bytes={} stored_bytes={} durable_bytes={} ratio={:.2}x encode_mib_s={:.2} decode_mib_s={:.2} lookup_results={} lookup_ops_s={:.2} p50_us={:.3} p95_us={:.3} p99_us={:.3}",
         result.source_bytes,
         result.payload_bytes,
         result.auxiliary_bytes,
@@ -1284,6 +1370,7 @@ fn print_result(signal: &str, result: ResultRow) {
         result.lookup_count,
         result.lookup_ops_per_second,
         result.lookup_p50.as_secs_f64() * 1e6,
+        result.lookup_p95.as_secs_f64() * 1e6,
         result.lookup_p99.as_secs_f64() * 1e6,
     );
 }

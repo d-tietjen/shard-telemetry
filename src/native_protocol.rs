@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
+use foldhash::{HashMap, HashMapExt};
 use shard_stream_core::{LogicalPartitionId, TopicId, TopicPartition};
 
 use crate::{LokiEntry, TelemetryEnvelope};
@@ -31,6 +33,17 @@ const MAX_LABELS_PER_STREAM: usize = 256;
 const MAX_METADATA_PER_ENTRY: usize = 256;
 const MAX_QUERY_TERMS: usize = 256;
 const MAX_QUERY_LIMIT: u32 = 1_000_000;
+const NATIVE_LABEL_PREFIX: &str = "resource.loki.label.";
+const NATIVE_METADATA_PREFIX: &str = "attr.loki.metadata.";
+
+type EnvelopeWireRange = (Range<usize>, Option<Range<usize>>);
+type EnvelopeWireRanges = Vec<EnvelopeWireRange>;
+type NativeAppendViewRanges<'a> = (
+    NativePartitionAppendView<'a>,
+    Range<usize>,
+    Option<Range<usize>>,
+);
+type NativeAppendViewsRanges<'a> = (Vec<NativePartitionAppendView<'a>>, EnvelopeWireRanges);
 
 /// Native operation carried by a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +63,11 @@ pub enum NativeOpcode {
     QueryTraces = 6,
     /// Returns negotiated protocol, signal, and query capabilities.
     Describe = 7,
+    /// Append one grouped log batch without a durable idempotency receipt.
+    ///
+    /// Callers must use [`NativeOpcode::Append`] when they need to replay an
+    /// indeterminate request safely after a connection failure.
+    AppendUntracked = 8,
 }
 
 impl NativeOpcode {
@@ -62,6 +80,7 @@ impl NativeOpcode {
             5 => Ok(Self::QueryMetrics),
             6 => Ok(Self::QueryTraces),
             7 => Ok(Self::Describe),
+            8 => Ok(Self::AppendUntracked),
             _ => Err(NativeProtocolError::new(format!(
                 "unsupported native opcode {value}"
             ))),
@@ -218,17 +237,30 @@ impl NativeFrameHeader {
 
     /// Verifies that `payload` has the declared length and BLAKE3 checksum.
     pub fn verify_payload(self, payload: &[u8]) -> Result<(), NativeProtocolError> {
+        self.verify_payload_and_hash(payload).map(|_| ())
+    }
+
+    /// Verifies `payload` and returns the full BLAKE3 hash computed for the
+    /// frame checksum. Callers that need a payload identity can reuse this
+    /// value instead of hashing the complete payload a second time.
+    pub fn verify_payload_and_hash(
+        self,
+        payload: &[u8],
+    ) -> Result<blake3::Hash, NativeProtocolError> {
         if payload.len() != self.payload_len as usize {
             return Err(NativeProtocolError::new(
                 "native frame payload length disagrees with its header",
             ));
         }
-        if payload_checksum(payload) != self.payload_checksum {
+        let hash = blake3::hash(payload);
+        if u32::from_le_bytes(hash.as_bytes()[0..4].try_into().expect("fixed range"))
+            != self.payload_checksum
+        {
             return Err(NativeProtocolError::new(
                 "native frame payload checksum mismatch",
             ));
         }
-        Ok(())
+        Ok(hash)
     }
 }
 
@@ -299,6 +331,35 @@ pub struct NativePartitionAppend {
     /// after the owner stripe publishes its index. Recovery reconstructs the
     /// same index from the durable envelope.
     pub transient_context: Option<Arc<[u8]>>,
+}
+
+/// Borrowed metadata for one validated wire append.
+///
+/// The native server uses this view when no partition-aware request gate is
+/// installed. Large envelope sections remain in the input `Bytes` allocation;
+/// only the small routing metadata needed to cross the blocking boundary is
+/// retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativePartitionAppendView<'a> {
+    pub(crate) topic_partition: TopicPartition,
+    pub(crate) signal: crate::TelemetrySignal,
+    pub(crate) tenant: &'a str,
+    pub(crate) item_count: u32,
+    pub(crate) transient_context: Option<&'a [u8]>,
+}
+
+/// Validated metadata and wire ranges for a multi-partition append.
+///
+/// The server keeps the large envelope and transient-context sections in the
+/// request `Bytes` allocation. Only routing metadata and the tenant identity
+/// cross into the blocking append worker.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeEncodedPartitionAppend {
+    pub(crate) topic_partition: TopicPartition,
+    pub(crate) tenant: Arc<str>,
+    pub(crate) item_count: u32,
+    pub(crate) envelope_range: Range<usize>,
+    pub(crate) transient_range: Option<Range<usize>>,
 }
 
 /// Native protocol v1 append containing one envelope per resulting partition.
@@ -384,6 +445,25 @@ impl NativeTelemetryBatch {
 
     /// Decodes and verifies every STEL envelope before returning any partition.
     pub fn decode(payload: &[u8]) -> Result<Self, NativeProtocolError> {
+        Self::decode_impl(payload, false).map(|(batch, _)| batch)
+    }
+
+    /// Decodes and validates a batch while retaining the exact wire ranges for
+    /// each envelope and optional transient context.
+    pub(crate) fn decode_with_envelope_ranges(
+        payload: &[u8],
+    ) -> Result<(Self, EnvelopeWireRanges), NativeProtocolError> {
+        let (batch, ranges) = Self::decode_impl(payload, true)?;
+        Ok((
+            batch,
+            ranges.expect("range capture was enabled for this decode"),
+        ))
+    }
+
+    fn decode_impl(
+        payload: &[u8],
+        capture_ranges: bool,
+    ) -> Result<(Self, Option<EnvelopeWireRanges>), NativeProtocolError> {
         if payload.len() < 8 || payload[..4] != TELEMETRY_BATCH_MAGIC {
             return Err(NativeProtocolError::new(
                 "invalid native telemetry batch header",
@@ -399,6 +479,7 @@ impl NativeTelemetryBatch {
         }
         let mut cursor = Cursor::at(payload, 8);
         let mut partitions = Vec::with_capacity(count);
+        let mut wire_ranges = capture_ranges.then(|| Vec::with_capacity(count));
         let mut seen = (count > 1).then(BTreeSet::new);
         for _ in 0..count {
             let topic_partition = TopicPartition::new(
@@ -406,10 +487,13 @@ impl NativeTelemetryBatch {
                 LogicalPartitionId::new(cursor.u32("telemetry partition ID")?),
             );
             let envelope_len = cursor.u32("telemetry envelope length")? as usize;
+            let envelope_start = cursor.offset;
             let envelope =
                 TelemetryEnvelope::decode(cursor.bytes(envelope_len, "telemetry envelope")?)
                     .map_err(|error| NativeProtocolError::new(error.to_string()))?;
+            let envelope_range = envelope_start..cursor.offset;
             let transient_len = cursor.u32("transient context length")? as usize;
+            let transient_start = cursor.offset;
             let transient_context = if transient_len == 0 {
                 None
             } else {
@@ -417,6 +501,7 @@ impl NativeTelemetryBatch {
                     cursor.bytes(transient_len, "transient context")?,
                 ))
             };
+            let transient_range = (transient_len != 0).then_some(transient_start..cursor.offset);
             if topic_partition.topic_id != envelope.signal.topic_id() {
                 return Err(NativeProtocolError::new(
                     "native telemetry partition topic disagrees with its signal",
@@ -429,6 +514,9 @@ impl NativeTelemetryBatch {
                     "native telemetry batch contains a duplicate partition",
                 ));
             }
+            if let Some(wire_ranges) = wire_ranges.as_mut() {
+                wire_ranges.push((envelope_range, transient_range));
+            }
             partitions.push(NativePartitionAppend {
                 topic_partition,
                 envelope,
@@ -436,7 +524,7 @@ impl NativeTelemetryBatch {
             });
         }
         cursor.finish()?;
-        Ok(Self { partitions })
+        Ok((Self { partitions }, wire_ranges))
     }
 
     /// Decodes a retryable native v1 append after enforcing its single
@@ -449,6 +537,149 @@ impl NativeTelemetryBatch {
             ));
         }
         Ok(batch)
+    }
+
+    /// Decodes one native append and returns the exact verified STEL byte
+    /// range from the wire payload. The native server forwards that range to
+    /// storage so it does not re-encode an already checksummed envelope.
+    pub(crate) fn decode_native_append_with_envelope_range(
+        payload: &[u8],
+    ) -> Result<(Self, std::ops::Range<usize>), NativeProtocolError> {
+        let (batch, mut ranges) = Self::decode_with_envelope_ranges(payload)?;
+        if batch.partitions.len() != 1 {
+            return Err(NativeProtocolError::new(
+                "retryable native v1 append requires exactly one partition",
+            ));
+        }
+        let (envelope_range, _) = ranges
+            .pop()
+            .expect("validated single append has one envelope range");
+        Ok((batch, envelope_range))
+    }
+
+    /// Decodes one native append while retaining the large envelope sections
+    /// as borrowed wire slices. The returned ranges can be converted to
+    /// `Bytes` without copying once the input buffer is owned by the caller.
+    pub(crate) fn decode_native_append_view_with_ranges(
+        payload: &[u8],
+    ) -> Result<NativeAppendViewRanges<'_>, NativeProtocolError> {
+        if payload.len() < 8 || payload[..4] != TELEMETRY_BATCH_MAGIC {
+            return Err(NativeProtocolError::new(
+                "invalid native telemetry batch header",
+            ));
+        }
+        let count = usize::from(u16::from_le_bytes(
+            payload[4..6].try_into().expect("fixed range"),
+        ));
+        if count != 1 || payload[6..8] != [0, 0] {
+            return Err(NativeProtocolError::new(
+                "retryable native v1 append requires exactly one partition",
+            ));
+        }
+        let mut cursor = Cursor::at(payload, 8);
+        let topic_partition = TopicPartition::new(
+            TopicId::new(cursor.u128("telemetry topic ID")?),
+            LogicalPartitionId::new(cursor.u32("telemetry partition ID")?),
+        );
+        let envelope_len = cursor.u32("telemetry envelope length")? as usize;
+        let envelope_start = cursor.offset;
+        let envelope_bytes = cursor.bytes(envelope_len, "telemetry envelope")?;
+        let envelope = crate::envelope::TelemetryEnvelope::decode_view(envelope_bytes)
+            .map_err(|error| NativeProtocolError::new(error.to_string()))?;
+        let transient_len = cursor.u32("transient context length")? as usize;
+        let transient_start = cursor.offset;
+        let transient_context = if transient_len == 0 {
+            None
+        } else {
+            Some(cursor.bytes(transient_len, "transient context")?)
+        };
+        let transient_range = (transient_len != 0).then_some(transient_start..cursor.offset);
+        if topic_partition.topic_id != envelope.signal.topic_id() {
+            return Err(NativeProtocolError::new(
+                "native telemetry partition topic disagrees with its signal",
+            ));
+        }
+        cursor.finish()?;
+        Ok((
+            NativePartitionAppendView {
+                topic_partition,
+                signal: envelope.signal,
+                tenant: envelope.tenant,
+                item_count: envelope.item_count,
+                transient_context,
+            },
+            envelope_start..envelope_start + envelope_bytes.len(),
+            transient_range,
+        ))
+    }
+
+    /// Decodes and validates every partition while retaining large sections as
+    /// borrowed wire slices. This is the untracked multi-partition fast path;
+    /// retryable appends continue to use the single-partition decoder above.
+    pub(crate) fn decode_native_append_views_with_ranges(
+        payload: &[u8],
+    ) -> Result<NativeAppendViewsRanges<'_>, NativeProtocolError> {
+        if payload.len() < 8 || payload[..4] != TELEMETRY_BATCH_MAGIC {
+            return Err(NativeProtocolError::new(
+                "invalid native telemetry batch header",
+            ));
+        }
+        let count = usize::from(u16::from_le_bytes(
+            payload[4..6].try_into().expect("fixed range"),
+        ));
+        if count == 0 || count > 256 || payload[6..8] != [0, 0] {
+            return Err(NativeProtocolError::new(
+                "invalid native telemetry partition count or flags",
+            ));
+        }
+        let mut cursor = Cursor::at(payload, 8);
+        let mut views = Vec::with_capacity(count);
+        let mut wire_ranges = Vec::with_capacity(count);
+        let mut seen = (count > 1).then(BTreeSet::new);
+        for _ in 0..count {
+            let topic_partition = TopicPartition::new(
+                TopicId::new(cursor.u128("telemetry topic ID")?),
+                LogicalPartitionId::new(cursor.u32("telemetry partition ID")?),
+            );
+            let envelope_len = cursor.u32("telemetry envelope length")? as usize;
+            let envelope_start = cursor.offset;
+            let envelope_bytes = cursor.bytes(envelope_len, "telemetry envelope")?;
+            let envelope = crate::envelope::TelemetryEnvelope::decode_view(envelope_bytes)
+                .map_err(|error| NativeProtocolError::new(error.to_string()))?;
+            let transient_len = cursor.u32("transient context length")? as usize;
+            let transient_start = cursor.offset;
+            let transient_context = if transient_len == 0 {
+                None
+            } else {
+                Some(cursor.bytes(transient_len, "transient context")?)
+            };
+            let transient_range = (transient_len != 0).then_some(transient_start..cursor.offset);
+            if topic_partition.topic_id != envelope.signal.topic_id() {
+                return Err(NativeProtocolError::new(
+                    "native telemetry partition topic disagrees with its signal",
+                ));
+            }
+            if let Some(seen) = &mut seen
+                && !seen.insert(topic_partition)
+            {
+                return Err(NativeProtocolError::new(
+                    "native telemetry batch contains a duplicate partition",
+                ));
+            }
+            views.push(NativePartitionAppendView {
+                topic_partition,
+                signal: envelope.signal,
+                tenant: envelope.tenant,
+                item_count: envelope.item_count,
+                transient_context,
+            });
+            wire_ranges.push((
+                envelope_start..envelope_start + envelope_bytes.len(),
+                transient_range,
+            ));
+        }
+        cursor.finish()?;
+        Ok((views, wire_ranges))
     }
 }
 
@@ -590,28 +821,85 @@ pub fn encode_native_log_query_result(
     validate_tenant(tenant)?;
     let record_count = u32::try_from(entries.len())
         .map_err(|_| NativeProtocolError::new("native batch contains more than u32 records"))?;
-    let mut streams = BTreeMap::<BTreeMap<String, String>, Vec<LokiEntry>>::new();
-    for entry in entries {
-        if entry.timestamp_unix_nanos < 0 {
-            return Err(NativeProtocolError::new(
-                "negative native log timestamps are unsupported",
-            ));
+    // Native indexed queries usually return one stream. Avoid hashing and
+    // comparing a BTreeMap for every record in that case; labels are still
+    // checked before taking ownership, so the fast path preserves exact
+    // stream grouping and the same negative-timestamp validation as the
+    // general path.
+    let single_stream = entries.first().is_some_and(|first| {
+        first.timestamp_unix_nanos >= 0
+            && entries[1..]
+                .iter()
+                .all(|entry| entry.timestamp_unix_nanos >= 0 && entry.labels == first.labels)
+    });
+    let streams = if single_stream {
+        let mut entries = entries.into_iter();
+        let mut first = entries.next().expect("single-stream result is nonempty");
+        let labels = std::mem::take(&mut first.labels);
+        let mut stream_entries = Vec::with_capacity(record_count as usize);
+        stream_entries.push(first);
+        for mut entry in entries {
+            drop(std::mem::take(&mut entry.labels));
+            stream_entries.push(entry);
         }
-        streams.entry(entry.labels.clone()).or_default().push(entry);
-    }
+        vec![(labels, stream_entries)]
+    } else {
+        let mut streams = HashMap::<BTreeMap<String, String>, Vec<LokiEntry>>::with_capacity(
+            entries.len().min(MAX_STREAMS),
+        );
+        for mut entry in entries {
+            if entry.timestamp_unix_nanos < 0 {
+                return Err(NativeProtocolError::new(
+                    "negative native log timestamps are unsupported",
+                ));
+            }
+            // Move the labels into the grouping key. The old implementation
+            // cloned every map before insertion, although only one copy per
+            // stream is emitted on the wire.
+            let labels = std::mem::take(&mut entry.labels);
+            streams.entry(labels).or_default().push(entry);
+        }
+        streams.into_iter().collect::<Vec<_>>()
+    };
     if streams.len() > MAX_STREAMS {
         return Err(NativeProtocolError::new(
             "native batch contains too many streams",
         ));
     }
+    let mut streams = streams.into_iter().collect::<Vec<_>>();
+    // Keep the wire representation deterministic while using hash lookup for
+    // the common case where many entries share one stream label map.
+    streams.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
-    let mut encoded = Vec::new();
+    let mut estimated_bytes = LOG_QUERY_RESULT_HEADER_BYTES.saturating_add(tenant.len());
+    for (labels, entries) in &streams {
+        estimated_bytes = estimated_bytes.saturating_add(8);
+        for (key, value) in labels {
+            estimated_bytes = estimated_bytes
+                .saturating_add(4)
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+        }
+        for entry in entries {
+            estimated_bytes = estimated_bytes
+                .saturating_add(16)
+                .saturating_add(entry.line.len());
+            for (key, value) in &entry.structured_metadata {
+                estimated_bytes = estimated_bytes
+                    .saturating_add(4)
+                    .saturating_add(key.len())
+                    .saturating_add(value.len());
+            }
+        }
+    }
+    let mut encoded = Vec::with_capacity(estimated_bytes.min(MAX_NATIVE_FRAME_BYTES));
     encoded.extend_from_slice(&LOG_QUERY_RESULT_MAGIC);
     put_u16(&mut encoded, tenant.len(), "tenant")?;
     put_u16(&mut encoded, streams.len(), "stream count")?;
     encoded.extend_from_slice(&record_count.to_le_bytes());
     encoded.extend_from_slice(&0_u32.to_le_bytes());
     encoded.extend_from_slice(tenant.as_bytes());
+
     for (labels, entries) in streams {
         if labels.len() > MAX_LABELS_PER_STREAM {
             return Err(NativeProtocolError::new(
@@ -623,9 +911,9 @@ pub fn encode_native_log_query_result(
         let entry_count = u32::try_from(entries.len())
             .map_err(|_| NativeProtocolError::new("native stream contains too many entries"))?;
         encoded.extend_from_slice(&entry_count.to_le_bytes());
-        for (key, value) in &labels {
-            put_string16(&mut encoded, key, "label key")?;
-            put_string16(&mut encoded, value, "label value")?;
+        for (key, value) in labels {
+            put_string16(&mut encoded, &key, "label key")?;
+            put_string16(&mut encoded, &value, "label value")?;
         }
         for entry in entries {
             encoded.extend_from_slice(&(entry.timestamp_unix_nanos as u64).to_le_bytes());
@@ -644,6 +932,159 @@ pub fn encode_native_log_query_result(
             encoded.extend_from_slice(entry.line.as_bytes());
             for (key, value) in entry.structured_metadata {
                 put_string16(&mut encoded, &key, "metadata key")?;
+                put_string16(&mut encoded, &value, "metadata value")?;
+            }
+        }
+    }
+    if encoded.len() > MAX_NATIVE_FRAME_BYTES {
+        return Err(NativeProtocolError::new(format!(
+            "native batch is {} bytes, exceeding {MAX_NATIVE_FRAME_BYTES}",
+            encoded.len()
+        )));
+    }
+    Ok(encoded)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct NativeStreamKey(Vec<(Arc<str>, Arc<str>)>);
+
+struct NativeProjectedLog {
+    timestamp_unix_nanos: u64,
+    message: Arc<str>,
+    metadata: Vec<(Arc<str>, Arc<str>)>,
+}
+
+fn normalize_projected_fields(
+    mut fields: Vec<(Arc<str>, Arc<str>, usize)>,
+) -> Vec<(Arc<str>, Arc<str>)> {
+    fields.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2)));
+    let mut normalized = Vec::with_capacity(fields.len());
+    for (key, value, _) in fields {
+        if let Some((existing_key, existing_value)) = normalized.last_mut()
+            && *existing_key == key
+        {
+            *existing_value = value;
+        } else {
+            normalized.push((key, value));
+        }
+    }
+    normalized
+}
+
+/// Encodes projected indexed records without materializing one Loki label and
+/// metadata map per result. The native server uses this for the common query
+/// path; delete-filtered queries continue through the public Loki entry path.
+pub(crate) fn encode_native_log_query_matches(
+    tenant: &str,
+    matches: Vec<crate::LogMatch>,
+) -> Result<Vec<u8>, NativeProtocolError> {
+    validate_tenant(tenant)?;
+    let record_count = u32::try_from(matches.len())
+        .map_err(|_| NativeProtocolError::new("native batch contains more than u32 records"))?;
+    let mut streams = HashMap::<NativeStreamKey, Vec<NativeProjectedLog>>::with_capacity(
+        matches.len().min(MAX_STREAMS),
+    );
+    for matched in matches {
+        let record = matched.record;
+        let mut labels = Vec::new();
+        let mut metadata = Vec::new();
+        for (index, field) in record.fields.iter().enumerate() {
+            if field.key.as_ref().starts_with(NATIVE_LABEL_PREFIX) {
+                labels.push((Arc::clone(&field.key), Arc::clone(&field.value), index));
+            } else if field.key.as_ref().starts_with(NATIVE_METADATA_PREFIX) {
+                metadata.push((Arc::clone(&field.key), Arc::clone(&field.value), index));
+            }
+        }
+        streams
+            .entry(NativeStreamKey(normalize_projected_fields(labels)))
+            .or_default()
+            .push(NativeProjectedLog {
+                timestamp_unix_nanos: record.timestamp_unix_nanos,
+                message: record.message,
+                metadata: normalize_projected_fields(metadata),
+            });
+    }
+    if streams.len() > MAX_STREAMS {
+        return Err(NativeProtocolError::new(
+            "native batch contains too many streams",
+        ));
+    }
+    let streams = streams.into_iter().collect::<Vec<_>>();
+
+    let mut estimated_bytes = LOG_QUERY_RESULT_HEADER_BYTES.saturating_add(tenant.len());
+    for (NativeStreamKey(labels), entries) in &streams {
+        estimated_bytes = estimated_bytes.saturating_add(8);
+        for (key, value) in labels {
+            let key = key
+                .as_ref()
+                .strip_prefix(NATIVE_LABEL_PREFIX)
+                .expect("native projected label prefix");
+            estimated_bytes = estimated_bytes
+                .saturating_add(4)
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+        }
+        for entry in entries {
+            estimated_bytes = estimated_bytes
+                .saturating_add(16)
+                .saturating_add(entry.message.len());
+            for (key, value) in &entry.metadata {
+                let key = key
+                    .as_ref()
+                    .strip_prefix(NATIVE_METADATA_PREFIX)
+                    .expect("native projected metadata prefix");
+                estimated_bytes = estimated_bytes
+                    .saturating_add(4)
+                    .saturating_add(key.len())
+                    .saturating_add(value.len());
+            }
+        }
+    }
+
+    let mut encoded = Vec::with_capacity(estimated_bytes.min(MAX_NATIVE_FRAME_BYTES));
+    encoded.extend_from_slice(&LOG_QUERY_RESULT_MAGIC);
+    put_u16(&mut encoded, tenant.len(), "tenant")?;
+    put_u16(&mut encoded, streams.len(), "stream count")?;
+    encoded.extend_from_slice(&record_count.to_le_bytes());
+    encoded.extend_from_slice(&0_u32.to_le_bytes());
+    encoded.extend_from_slice(tenant.as_bytes());
+
+    for (NativeStreamKey(labels), entries) in streams {
+        if labels.len() > MAX_LABELS_PER_STREAM {
+            return Err(NativeProtocolError::new(
+                "native stream contains too many labels",
+            ));
+        }
+        put_u16(&mut encoded, labels.len(), "label count")?;
+        encoded.extend_from_slice(&0_u16.to_le_bytes());
+        let entry_count = u32::try_from(entries.len())
+            .map_err(|_| NativeProtocolError::new("native stream contains too many entries"))?;
+        encoded.extend_from_slice(&entry_count.to_le_bytes());
+        for (key, value) in labels {
+            let key = key
+                .as_ref()
+                .strip_prefix(NATIVE_LABEL_PREFIX)
+                .expect("native projected label prefix");
+            put_string16(&mut encoded, key, "label key")?;
+            put_string16(&mut encoded, &value, "label value")?;
+        }
+        for entry in entries {
+            encoded.extend_from_slice(&entry.timestamp_unix_nanos.to_le_bytes());
+            put_u32(&mut encoded, entry.message.len(), "log line")?;
+            if entry.metadata.len() > MAX_METADATA_PER_ENTRY {
+                return Err(NativeProtocolError::new(
+                    "native entry contains too much structured metadata",
+                ));
+            }
+            encoded.extend_from_slice(&(entry.metadata.len() as u16).to_le_bytes());
+            encoded.extend_from_slice(&0_u16.to_le_bytes());
+            encoded.extend_from_slice(entry.message.as_bytes());
+            for (key, value) in entry.metadata {
+                let key = key
+                    .as_ref()
+                    .strip_prefix(NATIVE_METADATA_PREFIX)
+                    .expect("native projected metadata prefix");
+                put_string16(&mut encoded, key, "metadata key")?;
                 put_string16(&mut encoded, &value, "metadata value")?;
             }
         }
@@ -871,17 +1312,19 @@ fn encode_messagepack<T: serde::Serialize + ?Sized>(
     value: &T,
     kind: &str,
 ) -> Result<Vec<u8>, NativeProtocolError> {
-    let encoded = rmp_serde::to_vec(value).map_err(|error| {
+    // Write the discriminator and MessagePack value into one buffer. Using
+    // `to_vec` first would allocate a temporary payload and copy it again
+    // after prepending the native type tag on every query response.
+    let mut payload = Vec::with_capacity(magic.len() + 128);
+    payload.extend_from_slice(&magic);
+    rmp_serde::encode::write(&mut payload, value).map_err(|error| {
         NativeProtocolError::new(format!("native {kind} encoding failed: {error}"))
     })?;
-    if encoded.len().saturating_add(magic.len()) > MAX_NATIVE_FRAME_BYTES {
+    if payload.len() > MAX_NATIVE_FRAME_BYTES {
         return Err(NativeProtocolError::new(format!(
             "native {kind} exceeds the frame limit"
         )));
     }
-    let mut payload = Vec::with_capacity(magic.len() + encoded.len());
-    payload.extend_from_slice(&magic);
-    payload.extend_from_slice(&encoded);
     Ok(payload)
 }
 
@@ -1217,9 +1660,42 @@ mod tests {
                 transient_context: Some(Arc::<[u8]>::from(&b"context"[..])),
             }],
         };
+        let encoded = batch.encode().unwrap();
+        assert_eq!(NativeTelemetryBatch::decode(&encoded).unwrap(), batch);
+        let (ranged, wire_ranges) = NativeTelemetryBatch::decode_with_envelope_ranges(&encoded)
+            .expect("all append wire ranges");
+        assert_eq!(ranged, batch);
+        assert_eq!(wire_ranges.len(), 1);
         assert_eq!(
-            NativeTelemetryBatch::decode(&batch.encode().unwrap()).unwrap(),
-            batch
+            &encoded[wire_ranges[0].0.clone()],
+            batch.partitions[0].envelope.encode().unwrap()
+        );
+        assert_eq!(
+            wire_ranges[0]
+                .1
+                .as_ref()
+                .map(|range| &encoded[range.clone()]),
+            Some(&b"context"[..])
+        );
+        let (decoded, envelope_range) =
+            NativeTelemetryBatch::decode_native_append_with_envelope_range(&encoded)
+                .expect("single append range");
+        assert_eq!(decoded, batch);
+        assert_eq!(
+            &encoded[envelope_range.clone()],
+            batch.partitions[0].envelope.encode().unwrap().as_slice()
+        );
+        let (view, borrowed_envelope_range, transient_range) =
+            NativeTelemetryBatch::decode_native_append_view_with_ranges(&encoded)
+                .expect("borrowed single append view");
+        assert_eq!(view.topic_partition, topic_partition);
+        assert_eq!(view.signal, crate::TelemetrySignal::Traces);
+        assert_eq!(view.tenant, "tenant-a");
+        assert_eq!(view.item_count, 2);
+        assert_eq!(borrowed_envelope_range, envelope_range);
+        assert_eq!(
+            transient_range.map(|range| &encoded[range]),
+            Some(&b"context"[..])
         );
 
         let acknowledgement = NativeTelemetryAppendAck {
@@ -1259,6 +1735,30 @@ mod tests {
     }
 
     #[test]
+    fn log_query_result_sorts_streams_after_hash_grouping() {
+        let entries = vec![
+            LokiEntry {
+                timestamp_unix_nanos: 10,
+                labels: BTreeMap::from([("app".to_owned(), "worker".to_owned())]),
+                line: "worker".to_owned(),
+                structured_metadata: BTreeMap::new(),
+            },
+            LokiEntry {
+                timestamp_unix_nanos: 11,
+                labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                line: "api".to_owned(),
+                structured_metadata: BTreeMap::new(),
+            },
+        ];
+        let mut reversed = entries.clone();
+        reversed.reverse();
+        assert_eq!(
+            encode_native_log_query_result("tenant-a", entries).expect("entries encode"),
+            encode_native_log_query_result("tenant-a", reversed).expect("reversed entries encode")
+        );
+    }
+
+    #[test]
     fn log_query_result_round_trips_byte_exact_text_and_metadata() {
         let expected = entries();
         let encoded = encode_native_log_query_result("tenant-a", expected.clone())
@@ -1266,6 +1766,52 @@ mod tests {
         let decoded = decode_native_log_query_result(&encoded).expect("query result decodes");
         assert_eq!(decoded.tenant, "tenant-a");
         assert_eq!(decoded.entries, expected);
+    }
+
+    #[test]
+    fn projected_log_query_result_matches_materialized_wire_encoding() {
+        let topic_partition = TopicPartition::new(crate::LOGS_TOPIC_ID, LogicalPartitionId::new(0));
+        let labels = Arc::new(vec![
+            crate::MetadataField::new("resource.loki.label.app", "api"),
+            crate::MetadataField::new("resource.loki.label.region", "東京"),
+            crate::MetadataField::new("attr.loki.metadata.trace_id", "abc"),
+        ]);
+        let mut first = crate::DurableLog::new(
+            shard_stream_core::ShardId::new(0),
+            topic_partition,
+            shard_stream_core::LogicalOffset::new(0),
+            10,
+            "request café",
+            crate::CompressionCohortId::new(0),
+        );
+        first.fields = Arc::clone(&labels);
+        let mut second = crate::DurableLog::new(
+            shard_stream_core::ShardId::new(0),
+            topic_partition,
+            shard_stream_core::LogicalOffset::new(1),
+            11,
+            "request complete",
+            crate::CompressionCohortId::new(0),
+        );
+        second.fields = Arc::new(
+            labels
+                .iter()
+                .filter(|field| field.key.as_ref() != "attr.loki.metadata.trace_id")
+                .cloned()
+                .collect(),
+        );
+        let projected = encode_native_log_query_matches(
+            "tenant-a",
+            vec![
+                crate::LogMatch { record: first },
+                crate::LogMatch { record: second },
+            ],
+        )
+        .expect("projected result encodes");
+        assert_eq!(
+            projected,
+            encode_native_log_query_result("tenant-a", entries()).unwrap()
+        );
     }
 
     #[test]
@@ -1300,7 +1846,26 @@ mod tests {
         decoded
             .verify_payload(&encoded[NATIVE_FRAME_HEADER_BYTES..])
             .expect("checksum");
+        assert_eq!(
+            decoded
+                .verify_payload_and_hash(&encoded[NATIVE_FRAME_HEADER_BYTES..])
+                .expect("checksum hash"),
+            blake3::hash(&[1, 2, 3])
+        );
         assert!(decoded.verify_payload(&[1, 2, 4]).is_err());
+
+        let untracked =
+            NativeFrame::request(NativeOpcode::AppendUntracked, 43, vec![1, 2, 3]).expect("frame");
+        let untracked_header: [u8; NATIVE_FRAME_HEADER_BYTES] = untracked.encode()
+            [..NATIVE_FRAME_HEADER_BYTES]
+            .try_into()
+            .expect("header");
+        assert_eq!(
+            NativeFrameHeader::decode(&untracked_header)
+                .expect("decode")
+                .opcode,
+            NativeOpcode::AppendUntracked
+        );
 
         let mut invalid = header;
         invalid[4] = 3;
@@ -1332,6 +1897,12 @@ mod tests {
             limit: 10,
             ..crate::MetricQuery::default()
         };
+        let mut expected_metric = METRIC_QUERY_MAGIC.to_vec();
+        expected_metric.extend(rmp_serde::to_vec(&metric).expect("reference metric encoding"));
+        assert_eq!(
+            encode_native_metric_query(&metric).expect("encode"),
+            expected_metric
+        );
         assert_eq!(
             decode_native_metric_query(&encode_native_metric_query(&metric).expect("encode"))
                 .expect("decode"),

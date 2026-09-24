@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -153,6 +153,40 @@ impl DurableLog {
         }
     }
 
+    /// Constructs the reduced record used by queries that explicitly exclude
+    /// typed OTLP metadata. These fields are immutable in the projected query
+    /// path, so sharing the empty defaults avoids rebuilding the same Arcs for
+    /// every matching record.
+    pub(crate) fn new_projected(
+        stream_shard_id: ShardId,
+        topic_partition: TopicPartition,
+        offset: LogicalOffset,
+        timestamp_unix_nanos: u64,
+        message: impl Into<Arc<str>>,
+        compression_cohort: CompressionCohortId,
+    ) -> Self {
+        Self {
+            stream_shard_id,
+            record_ref: TelemetryRecordRef::new(topic_partition, offset),
+            timestamp_unix_nanos,
+            observed_timestamp_unix_nanos: 0,
+            body: None,
+            message: message.into(),
+            fields: empty_metadata_fields(),
+            attributes: empty_telemetry_attributes(),
+            resource: empty_resource_context(),
+            scope: empty_scope_context(),
+            severity_number: 0,
+            severity_text: empty_text(),
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: None,
+            span_id: None,
+            event_name: empty_text(),
+            compression_cohort,
+        }
+    }
+
     /// Adds a normalized metadata field.
     #[must_use]
     pub fn with_field(mut self, key: impl Into<Arc<str>>, value: impl Into<Arc<str>>) -> Self {
@@ -168,6 +202,31 @@ impl DurableLog {
     }
 }
 
+fn empty_metadata_fields() -> Arc<Vec<MetadataField>> {
+    static EMPTY: OnceLock<Arc<Vec<MetadataField>>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(Vec::new())))
+}
+
+fn empty_telemetry_attributes() -> Arc<Vec<TelemetryAttribute>> {
+    static EMPTY: OnceLock<Arc<Vec<TelemetryAttribute>>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(Vec::new())))
+}
+
+fn empty_resource_context() -> Arc<ResourceContext> {
+    static EMPTY: OnceLock<Arc<ResourceContext>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(ResourceContext::default())))
+}
+
+fn empty_scope_context() -> Arc<ScopeContext> {
+    static EMPTY: OnceLock<Arc<ScopeContext>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(ScopeContext::default())))
+}
+
+fn empty_text() -> Arc<str> {
+    static EMPTY: OnceLock<Arc<str>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from("")))
+}
+
 /// Ordering applied to matching log records.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QueryOrder {
@@ -179,7 +238,7 @@ pub enum QueryOrder {
 }
 
 /// Case handling for message and metadata text predicates.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum CaseSensitivity {
     /// Compare Unicode text exactly.
     Sensitive,
@@ -328,6 +387,33 @@ pub enum LogPredicate {
     Message(TextMatcher),
     /// Matches the complete message with a validated regular expression.
     MessageRegex(LogRegex),
+    /// Matches a validated regular expression against at least one complete
+    /// ClickHouse-compatible message token.
+    MessageTokenRegex(LogRegex),
+    /// Matches a token beginning with the requested prefix.
+    MessageTokenPrefix {
+        /// Token prefix to match.
+        value: Arc<str>,
+        /// Whether ASCII letter case is significant.
+        case_sensitivity: CaseSensitivity,
+    },
+    /// Matches a sequence of tokens, allowing the requested number of
+    /// intervening tokens between adjacent terms.
+    MessagePhrase {
+        /// Terms in the phrase, in order.
+        terms: Vec<Arc<str>>,
+        /// Maximum number of intervening tokens between adjacent terms.
+        max_gap: usize,
+        /// Whether ASCII letter case is significant.
+        case_sensitivity: CaseSensitivity,
+    },
+    /// Matches a token within a bounded Levenshtein distance.
+    MessageFuzzy {
+        /// Token to compare against.
+        value: Arc<str>,
+        /// Maximum edit distance.
+        max_distance: u8,
+    },
     /// Matches records containing at least one field with this key.
     FieldExists(Arc<str>),
     /// Matches a field key against one literal text matcher.
@@ -412,6 +498,53 @@ impl LogPredicate {
         )?))
     }
 
+    /// Creates a validated token-level regular-expression predicate.
+    pub fn message_token_regex(
+        pattern: impl Into<Arc<str>>,
+        case_sensitivity: CaseSensitivity,
+    ) -> TelemetryResult<Self> {
+        Ok(Self::MessageTokenRegex(LogRegex::new(
+            pattern,
+            case_sensitivity,
+        )?))
+    }
+
+    /// Creates a token-prefix predicate.
+    #[must_use]
+    pub fn message_token_prefix(
+        value: impl Into<Arc<str>>,
+        case_sensitivity: CaseSensitivity,
+    ) -> Self {
+        Self::MessageTokenPrefix {
+            value: value.into(),
+            case_sensitivity,
+        }
+    }
+
+    /// Creates a token phrase predicate. `max_gap` is the maximum number of
+    /// tokens allowed between adjacent phrase terms.
+    #[must_use]
+    pub fn message_phrase(
+        terms: impl IntoIterator<Item = impl Into<Arc<str>>>,
+        max_gap: usize,
+        case_sensitivity: CaseSensitivity,
+    ) -> Self {
+        Self::MessagePhrase {
+            terms: terms.into_iter().map(Into::into).collect(),
+            max_gap,
+            case_sensitivity,
+        }
+    }
+
+    /// Creates a bounded token fuzzy-match predicate.
+    #[must_use]
+    pub fn message_fuzzy(value: impl Into<Arc<str>>, max_distance: u8) -> Self {
+        Self::MessageFuzzy {
+            value: value.into(),
+            max_distance,
+        }
+    }
+
     /// Creates an exact metadata-key existence predicate.
     #[must_use]
     pub fn field_exists(key: impl Into<Arc<str>>) -> Self {
@@ -477,20 +610,20 @@ impl LogPredicate {
     /// Creates a conjunction. An empty conjunction matches every record.
     #[must_use]
     pub fn and(predicates: Vec<Self>) -> Self {
-        if predicates.is_empty() {
-            Self::MatchAll
-        } else {
-            Self::And(predicates)
+        match predicates.len() {
+            0 => Self::MatchAll,
+            1 => predicates.into_iter().next().expect("one predicate exists"),
+            _ => Self::And(predicates),
         }
     }
 
     /// Creates a disjunction. An empty disjunction matches no records.
     #[must_use]
     pub fn or(predicates: Vec<Self>) -> Self {
-        if predicates.is_empty() {
-            Self::MatchNone
-        } else {
-            Self::Or(predicates)
+        match predicates.len() {
+            0 => Self::MatchNone,
+            1 => predicates.into_iter().next().expect("one predicate exists"),
+            _ => Self::Or(predicates),
         }
     }
 

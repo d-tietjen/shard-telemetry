@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,8 +18,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
+use crate::analytics::AnalyticsGroupRow;
 use crate::deletion::DeleteCatalog;
-use crate::{AnalyticsRow, AnalyticsScanRequest, DeleteRequest};
+use crate::{
+    AnalyticsRow, AnalyticsScanRequest, CaseSensitivity, DeleteRequest, LogPredicate,
+    TextMatchKind, TextMatcher,
+};
 use crate::{ProductionRuntime, ServiceState};
 
 const DEFAULT_TENANT: &str = "fake";
@@ -121,6 +125,18 @@ struct TenantStore {
     entries: Vec<LokiEntry>,
 }
 
+/// Result of one Loki range query, including the work counters reported by
+/// the protocol response.
+#[derive(Debug, Default)]
+pub struct LokiQueryResult {
+    /// Entries that survived storage pruning, selector stages, and deletes.
+    pub entries: Vec<LokiEntry>,
+    /// Candidate lines inspected by the storage implementation.
+    pub lines_processed: usize,
+    /// Candidate line bytes inspected by the storage implementation.
+    pub bytes_processed: usize,
+}
+
 /// Storage contract used by the Loki-compatible protocol boundary.
 pub trait LokiStore: Send + Sync + std::fmt::Debug {
     /// Atomically accepts one normalized push for a tenant.
@@ -129,6 +145,42 @@ pub trait LokiStore: Send + Sync + std::fmt::Debug {
     /// Returns entries for a tenant. Exact query filtering is performed by the
     /// protocol evaluator after storage-level pruning.
     fn entries(&self, tenant: &str) -> Result<Vec<LokiEntry>, LokiApiError>;
+
+    /// Executes a bounded LogQL range query with storage-level pruning when
+    /// the backend supports it. The default reference implementation retains
+    /// exact behavior by filtering a tenant snapshot.
+    fn query_range(
+        &self,
+        tenant: &str,
+        expression: &str,
+        start_timestamp_unix_nanos: i64,
+        end_timestamp_unix_nanos: i64,
+        limit: usize,
+        newest_first: bool,
+    ) -> Result<LokiQueryResult, LokiApiError> {
+        let selector = parse_log_query(expression)?;
+        let mut entries = self.entries(tenant)?;
+        let lines_processed = entries.len();
+        let bytes_processed = entries.iter().map(|entry| entry.line.len()).sum();
+        entries.retain(|entry| {
+            entry.timestamp_unix_nanos >= start_timestamp_unix_nanos
+                && entry.timestamp_unix_nanos <= end_timestamp_unix_nanos
+        });
+        let mut entries = entries
+            .into_iter()
+            .filter_map(|entry| selector.process(entry))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|entry| entry.timestamp_unix_nanos);
+        if newest_first {
+            entries.reverse();
+        }
+        entries.truncate(limit);
+        Ok(LokiQueryResult {
+            entries,
+            lines_processed,
+            bytes_processed,
+        })
+    }
 
     /// Streams bounded batches through the analytical columnar boundary.
     ///
@@ -141,6 +193,26 @@ pub trait LokiStore: Send + Sync + std::fmt::Debug {
         emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
     ) -> Result<(), LokiApiError> {
         crate::analytics::scan_entries(self.entries(&request.tenant)?, request, emit)
+    }
+
+    /// Streams a relevance-ordered bounded log scan. Durable stores may
+    /// override this to rank indexed candidates before row materialization.
+    fn scan_analytics_relevance(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        self.scan_analytics(request, emit)
+    }
+
+    /// Counts distinct non-empty log trace IDs, optionally requiring that a
+    /// second service has a record for each trace.
+    fn scan_analytics_distinct_trace_cardinality(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(u64) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        scan_distinct_trace_cardinality_by_rows(self, request, emit)
     }
 
     /// Emits an already-columnar Arrow batch when the storage engine can
@@ -178,6 +250,17 @@ pub trait LokiStore: Send + Sync + std::fmt::Debug {
         self.scan_analytics(request, &mut |rows| {
             emit(u64::try_from(rows.len()).unwrap_or(u64::MAX))
         })
+    }
+
+    /// Emits grouped analytical results. Reference stores use the exact row
+    /// scan implementation; durable stores may replace it with indexed
+    /// aggregation while preserving the same result contract.
+    fn scan_analytics_grouped(
+        &self,
+        request: &AnalyticsScanRequest,
+        emit: &mut dyn FnMut(&[AnalyticsGroupRow]) -> Result<(), LokiApiError>,
+    ) -> Result<(), LokiApiError> {
+        crate::analytics::group_analytics_rows(self, request, emit)
     }
 
     /// Returns a bounded health snapshot without scanning stored records.
@@ -218,6 +301,47 @@ pub trait LokiStore: Send + Sync + std::fmt::Debug {
     fn cancel_delete(&self, _tenant: &str, _request_id: &str) -> Result<bool, LokiApiError> {
         Ok(false)
     }
+}
+
+pub(crate) fn scan_distinct_trace_cardinality_by_rows<S: LokiStore + ?Sized>(
+    store: &S,
+    request: &AnalyticsScanRequest,
+    emit: &mut dyn FnMut(u64) -> Result<(), LokiApiError>,
+) -> Result<(), LokiApiError> {
+    let mut rows_request = request.clone();
+    let join_service = rows_request.trace_join_service.take();
+    rows_request.cardinality_only = false;
+    rows_request.distinct_trace_id = false;
+    rows_request.columns = vec![crate::AnalyticsColumn::TraceId];
+    let mut outer = HashSet::<Arc<str>>::new();
+    store.scan_analytics(&rows_request, &mut |rows| {
+        for row in rows {
+            if let Some(trace_id) = row.trace_id.as_ref().filter(|value| !value.is_empty()) {
+                outer.insert(Arc::clone(trace_id));
+            }
+        }
+        Ok(())
+    })?;
+    if let Some(service) = join_service {
+        let mut inner_request = rows_request;
+        inner_request.predicate = crate::LogPredicate::MatchAll;
+        inner_request.predicate_any = false;
+        inner_request.terms.clear();
+        inner_request.message_tokens.clear();
+        inner_request.case_insensitive_message_tokens.clear();
+        inner_request.labels = vec![crate::MetadataField::new("service_name", service)];
+        let mut inner = HashSet::<Arc<str>>::new();
+        store.scan_analytics(&inner_request, &mut |rows| {
+            for row in rows {
+                if let Some(trace_id) = row.trace_id.as_ref().filter(|value| !value.is_empty()) {
+                    inner.insert(Arc::clone(trace_id));
+                }
+            }
+            Ok(())
+        })?;
+        outer.retain(|trace_id| inner.contains(trace_id));
+    }
+    emit(u64::try_from(outer.len()).unwrap_or(u64::MAX))
 }
 
 /// Thread-safe in-memory reference backend used by differential API tests.
@@ -1068,7 +1192,6 @@ async fn execute_stream_query(
         .query
         .as_deref()
         .ok_or_else(|| LokiApiError::bad_request("query parameter is required"))?;
-    let selector = parse_log_query(expression)?;
     let tenant = tenant(&headers, &state.config);
     let (start, end) = query_range_bounds(&params)?;
     let limit = params
@@ -1076,22 +1199,17 @@ async fn execute_stream_query(
         .unwrap_or(DEFAULT_QUERY_LIMIT)
         .min(state.config.max_query_limit);
     let backward = params.direction.as_deref().unwrap_or("backward") != "forward";
-    let scanned = entries_for(&state, &tenant).await?;
-    let total_lines_processed = scanned.len();
-    let total_bytes_processed = scanned.iter().map(|entry| entry.line.len()).sum::<usize>();
-    let mut entries = scanned
-        .into_iter()
-        .filter_map(|entry| {
-            (entry.timestamp_unix_nanos >= start && entry.timestamp_unix_nanos <= end)
-                .then(|| selector.process(entry))
-                .flatten()
-        })
-        .collect::<Vec<_>>();
-    entries.sort_unstable_by_key(|entry| entry.timestamp_unix_nanos);
-    if backward {
-        entries.reverse();
-    }
-    entries.truncate(limit);
+    let store = Arc::clone(&state.store);
+    let tenant_for_query = tenant.clone();
+    let expression = expression.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        store.query_range(&tenant_for_query, &expression, start, end, limit, backward)
+    })
+    .await
+    .map_err(|error| LokiApiError::internal(format!("query worker failed: {error}")))??;
+    let total_lines_processed = result.lines_processed;
+    let total_bytes_processed = result.bytes_processed;
+    let entries = result.entries;
     let total_entries_returned = entries.len();
 
     let mut streams: BTreeMap<BTreeMap<String, String>, Vec<Value>> = BTreeMap::new();
@@ -2389,7 +2507,7 @@ fn detected_level(labels: &BTreeMap<String, String>, line: &str) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct LogSelector {
+pub(crate) struct LogSelector {
     matchers: Vec<LabelMatcher>,
     stages: Vec<PipelineStage>,
 }
@@ -2399,7 +2517,7 @@ impl LogSelector {
         self.process(entry.clone()).is_some()
     }
 
-    fn process(&self, mut entry: LokiEntry) -> Option<LokiEntry> {
+    pub(crate) fn process(&self, mut entry: LokiEntry) -> Option<LokiEntry> {
         if !self
             .matchers
             .iter()
@@ -2413,6 +2531,41 @@ impl LogSelector {
             }
         }
         Some(entry)
+    }
+
+    pub(crate) fn exact_label_matchers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.matchers.iter().filter_map(|matcher| {
+            matches!(matcher.operation, MatchOperation::Equal)
+                .then_some((matcher.name.as_str(), matcher.value.as_str()))
+        })
+    }
+
+    pub(crate) fn is_exact_label_only(&self) -> bool {
+        self.stages.is_empty()
+            && self
+                .matchers
+                .iter()
+                .all(|matcher| matcher.operation == MatchOperation::Equal)
+    }
+
+    pub(crate) fn indexed_line_predicate(&self) -> Option<LogPredicate> {
+        let predicates = self
+            .stages
+            .iter()
+            .filter_map(|stage| match stage {
+                PipelineStage::Line(filter)
+                    if filter.operation == MatchOperation::Equal && !filter.value.is_empty() =>
+                {
+                    Some(LogPredicate::message(TextMatcher::new(
+                        filter.value.clone(),
+                        TextMatchKind::Contains,
+                        CaseSensitivity::Sensitive,
+                    )))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (!predicates.is_empty()).then(|| LogPredicate::and(predicates))
     }
 }
 
@@ -2466,7 +2619,7 @@ struct LabelMatcher {
     regex: Option<Regex>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchOperation {
     Equal,
     NotEqual,
@@ -2701,7 +2854,7 @@ impl LabelFilter {
     }
 }
 
-fn parse_log_query(expression: &str) -> Result<LogSelector, LokiApiError> {
+pub(crate) fn parse_log_query(expression: &str) -> Result<LogSelector, LokiApiError> {
     let end = matching_brace(expression)
         .ok_or_else(|| LokiApiError::bad_request("LogQL query requires a stream selector"))?;
     let matchers = parse_selector_matchers(&expression[..=end])?;
