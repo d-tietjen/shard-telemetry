@@ -157,7 +157,21 @@ impl CachedMessageTokenStats {
             .map(|term| self.postings.get(term).map(Arc::as_ref))
             .collect::<Vec<_>>();
         let mut posting_positions = vec![0usize; postings.len()];
+        let mut previous_ordinal = None;
         for ordinal in ordinals {
+            // Frame scans yield ascending ordinals, but owner-local top-k
+            // heaps are returned in arbitrary order before the coordinator
+            // scores them. Reset the posting cursors after a backward jump.
+            if previous_ordinal.is_some_and(|previous| ordinal < previous) {
+                for (position, posting) in posting_positions.iter_mut().zip(&postings) {
+                    *position = posting.map_or(0, |posting| {
+                        posting
+                            .ordinals
+                            .partition_point(|candidate| *candidate < ordinal)
+                    });
+                }
+            }
+            previous_ordinal = Some(ordinal);
             let document_length = self
                 .document_lengths
                 .get(ordinal as usize)

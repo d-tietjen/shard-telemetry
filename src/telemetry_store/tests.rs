@@ -1522,3 +1522,107 @@ fn durable_analytics_scan_pushes_indexable_constraints_into_stripes() {
     drop(store);
     fs::remove_dir_all(directory).expect("remove test store");
 }
+
+#[test]
+fn durable_analytics_ordered_scan_with_resource_filter_ranks_across_partitions() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "shard-telemetry-ordered-resource-scan-{}-{nonce}",
+        std::process::id()
+    ));
+    let store = DurableTelemetryStore::open(DurableTelemetryConfig {
+        data_directory: directory.clone(),
+        object_store_directory: None,
+        s3_object_store: None,
+        recovery_journal: false,
+        retention: None,
+        shard_count: 2,
+        tenant_partitions: 2,
+        append_linger: Duration::ZERO,
+        stripe: StripeConfig::default(),
+        indexed_ack_timeout: Duration::from_secs(30),
+    })
+    .expect("store opens");
+    let resource = Arc::new(crate::ResourceContext {
+        attributes: Arc::new(vec![crate::TelemetryAttribute::new(
+            "service.name",
+            crate::TelemetryValue::String(Arc::from("checkout")),
+        )]),
+        ..crate::ResourceContext::default()
+    });
+    let partitions = [
+        TopicPartition::new(LOKI_TOPIC_ID, LogicalPartitionId::new(0)),
+        TopicPartition::new(LOKI_TOPIC_ID, LogicalPartitionId::new(1)),
+    ];
+    let events = [(100, "early"), (300, "late")]
+        .into_iter()
+        .map(|(timestamp, message)| crate::OtlpLogEvent {
+            timestamp_unix_nanos: timestamp,
+            body: Some(crate::TelemetryValue::String(Arc::from(message))),
+            message: Arc::from(message),
+            fields: Arc::new(vec![crate::MetadataField::new(
+                "resource.service.name",
+                "checkout",
+            )]),
+            resource: Arc::clone(&resource),
+            ..crate::OtlpLogEvent::default()
+        })
+        .collect::<Vec<_>>();
+    let batch = crate::NativeTelemetryBatch {
+        partitions: partitions
+            .into_iter()
+            .zip(events)
+            .map(|(topic_partition, event)| crate::NativePartitionAppend {
+                topic_partition,
+                envelope: crate::prepare_log_envelope("tenant-a", &[event]).expect("envelope"),
+                transient_context: None,
+            })
+            .collect(),
+    };
+    store.append_telemetry_batch(&batch, true).expect("append");
+
+    let mut request = AnalyticsScanRequest::new("tenant-a");
+    request
+        .resource_attributes
+        .push(crate::MetadataField::new("service.name", "checkout"));
+    request.columns = vec![
+        crate::AnalyticsColumn::Timestamp,
+        crate::AnalyticsColumn::Message,
+    ];
+    request.limit = Some(1);
+    for (order, expected) in [
+        (AnalyticsScanOrder::TimestampDescending, "late"),
+        (AnalyticsScanOrder::TimestampAscending, "early"),
+    ] {
+        request.order = Some(order);
+        let mut rows = Vec::new();
+        store
+            .scan_analytics(&request, &mut |batch| {
+                rows.extend_from_slice(batch);
+                Ok(())
+            })
+            .expect("ordered scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message.as_deref(), Some(expected));
+    }
+    request.limit = Some(2);
+    request.order = Some(AnalyticsScanOrder::TimestampDescending);
+    let mut rows = Vec::new();
+    store
+        .scan_analytics(&request, &mut |batch| {
+            rows.extend_from_slice(batch);
+            Ok(())
+        })
+        .expect("ordered scan below limit");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.message.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("late"), Some("early")]
+    );
+    drop(store);
+    fs::remove_dir_all(directory).expect("cleanup");
+}

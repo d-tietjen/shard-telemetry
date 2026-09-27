@@ -48,7 +48,7 @@ fn record_on(stream_shard_id: ShardId, offset: u64, message: &str) -> DurableLog
 }
 
 #[test]
-fn batched_message_scores_match_indexed_scores_for_sorted_candidates() {
+fn batched_message_scores_match_indexed_scores_for_any_candidate_order() {
     let mut request = crate::AnalyticsScanRequest::for_relation(
         Arc::from("tenant"),
         crate::AnalyticsRelation::Logs,
@@ -72,32 +72,33 @@ fn batched_message_scores_match_indexed_scores_for_sorted_candidates() {
         token_sequence: Arc::from(Vec::<u32>::new()),
         token_offsets: Arc::from(vec![0, 0, 0, 0]),
     };
-    let ordinals = [0, 1, 2];
-    let mut batched = Vec::new();
-    stats
-        .score_batch(&scorer, ordinals.into_iter(), |score| {
-            batched.push(score);
-            Ok::<_, ()>(())
-        })
-        .expect("batched score emission succeeds");
-    let expected = ordinals
-        .iter()
-        .map(|ordinal| {
-            scorer.score_indexed_by_index(stats.document_lengths[*ordinal as usize], |index| {
-                let term = scorer.terms()[index].as_ref();
-                let Some(posting) = stats.postings.get(term) else {
-                    return 0;
-                };
-                posting
-                    .ordinals
-                    .binary_search(ordinal)
-                    .ok()
-                    .and_then(|position| posting.frequencies.get(position).copied())
-                    .unwrap_or_default()
+    for ordinals in [[0, 1, 2], [2, 0, 1], [2, 1, 0]] {
+        let mut batched = Vec::new();
+        stats
+            .score_batch(&scorer, ordinals.into_iter(), |score| {
+                batched.push(score);
+                Ok::<_, ()>(())
             })
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(batched, expected);
+            .expect("batched score emission succeeds");
+        let expected = ordinals
+            .iter()
+            .map(|ordinal| {
+                scorer.score_indexed_by_index(stats.document_lengths[*ordinal as usize], |index| {
+                    let term = scorer.terms()[index].as_ref();
+                    let Some(posting) = stats.postings.get(term) else {
+                        return 0;
+                    };
+                    posting
+                        .ordinals
+                        .binary_search(ordinal)
+                        .ok()
+                        .and_then(|position| posting.frequencies.get(position).copied())
+                        .unwrap_or_default()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batched, expected, "candidate ordinals: {ordinals:?}");
+    }
 }
 
 fn string_attribute(key: &str, value: &str) -> KeyValue {

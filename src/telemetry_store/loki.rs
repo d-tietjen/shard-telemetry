@@ -669,6 +669,7 @@ impl LokiStore for DurableTelemetryStore {
         let post_filter_include_fields =
             include_fields || !request.labels.is_empty() || !request.metadata.is_empty();
         let mut emitted = 0usize;
+        let mut ordered_rows = Vec::new();
         let partitions = if let Some(trace_id) = request.trace_id {
             let router = crate::TelemetryRouter::new(
                 NonZeroU16::new(u16::try_from(self.tenant_partitions).map_err(|_| {
@@ -683,7 +684,11 @@ impl LokiStore for DurableTelemetryStore {
         for partition in partitions {
             let mut next_offset = None;
             loop {
-                let page_limit = 8_192usize.min(limit.saturating_sub(emitted));
+                let page_limit = if request.order.is_some() {
+                    8_192
+                } else {
+                    8_192usize.min(limit.saturating_sub(emitted))
+                };
                 if page_limit == 0 {
                     return Ok(());
                 }
@@ -745,11 +750,29 @@ impl LokiStore for DurableTelemetryStore {
                         })
                         .collect::<Vec<_>>()
                 };
-                if !rows.is_empty() {
-                    emit(&rows)?;
+                if let Some(order) = request.order {
+                    ordered_rows.extend(rows);
+                    ordered_rows.sort_unstable_by(|left: &AnalyticsRow, right| {
+                        let order_by_timestamp =
+                            (left.timestamp_unix_nanos, left.partition, left.offset).cmp(&(
+                                right.timestamp_unix_nanos,
+                                right.partition,
+                                right.offset,
+                            ));
+                        if order == AnalyticsScanOrder::TimestampDescending {
+                            order_by_timestamp.reverse()
+                        } else {
+                            order_by_timestamp
+                        }
+                    });
+                    ordered_rows.truncate(limit);
+                } else {
+                    if !rows.is_empty() {
+                        emit(&rows)?;
+                    }
+                    emitted = emitted.saturating_add(rows.len());
                 }
-                emitted = emitted.saturating_add(rows.len());
-                if emitted == limit || returned < page_limit {
+                if (request.order.is_none() && emitted == limit) || returned < page_limit {
                     break;
                 }
                 let Some(start) = final_offset.checked_add(1) else {
@@ -757,6 +780,9 @@ impl LokiStore for DurableTelemetryStore {
                 };
                 next_offset = Some(start);
             }
+        }
+        if !ordered_rows.is_empty() {
+            emit(&ordered_rows)?;
         }
         Ok(())
     }
