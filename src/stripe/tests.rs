@@ -238,7 +238,7 @@ fn cold_boolean_relevance_cache_excludes_negated_tokens() {
     request.predicate = predicate;
     let scorer = crate::analytics::RelevanceScorer::from_request(&request);
     let matches = stripe
-        .query_partitions_checked_messages_top_k(&[query.clone()], &scorer, 10)
+        .query_partitions_checked_messages_top_k(std::slice::from_ref(&query), &scorer, 10)
         .expect("cold relevance query");
     assert_eq!(matches.len(), 10);
     assert!(
