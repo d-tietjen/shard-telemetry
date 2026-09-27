@@ -295,7 +295,11 @@ impl LogStripe {
         if candidates.is_empty() {
             return Ok(());
         }
-        if !cached_message_predicate_is_exact(&query.predicate) {
+        if !cached_message_predicate_is_exact(&query.predicate)
+            || keys
+                .iter()
+                .any(|key| !matches!(key, AnalyticsGroupKey::Minute))
+        {
             for decoded in decode_structural_records_with_cached_frame_data(
                 &cached.structural,
                 &candidates,

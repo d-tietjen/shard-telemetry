@@ -97,7 +97,8 @@ pub(crate) fn durable_group_value(record: &DurableLog, key: AnalyticsGroupKey) -
             .fields
             .iter()
             .find(|field| field.key.as_ref() == "attr.loki.metadata.scope_name")
-            .map(|field| Arc::clone(&field.value)),
+            .map(|field| Arc::clone(&field.value))
+            .or_else(|| (!record.scope.name.is_empty()).then(|| Arc::clone(&record.scope.name))),
         AnalyticsGroupKey::Minute => Some(Arc::from(
             (record.timestamp_unix_nanos / 60_000_000_000).to_string(),
         )),
@@ -121,7 +122,8 @@ pub(crate) fn decoded_group_value(
             .fields
             .iter()
             .find(|field| field.key.as_ref() == "attr.loki.metadata.scope_name")
-            .map(|field| Arc::clone(&field.value)),
+            .map(|field| Arc::clone(&field.value))
+            .or_else(|| (!record.scope.name.is_empty()).then(|| Arc::clone(&record.scope.name))),
         AnalyticsGroupKey::Minute => Some(Arc::from(
             (record.timestamp_unix_nanos / 60_000_000_000).to_string(),
         )),

@@ -1030,9 +1030,32 @@ impl LogStripe {
                 );
             return Ok(Some(candidates));
         }
-        if let Some(candidates) =
+        if let Some(mut candidates) =
             embedded_message_predicate_candidates(&query.predicate, &cached.embedded_index)
         {
+            if cached_message_predicate_is_exact(&query.predicate)
+                && message_predicate_is_message_only(&query.predicate)
+            {
+                // AND may combine an indexed token with a phrase or NOT
+                // clause. The embedded result then narrows the scan but does
+                // not prove the full predicate, so verify before caching it
+                // under a key consumed by exact count and relevance paths.
+                let messages = decode_structural_messages_with_embedded_index_and_templates(
+                    &cached.structural,
+                    &candidates,
+                    &cached.embedded_index,
+                    &cached.templates,
+                )?;
+                candidates = candidates
+                    .into_iter()
+                    .zip(messages)
+                    .filter_map(|(ordinal, message)| {
+                        query
+                            .message_candidate_matches(&message)?
+                            .then_some(ordinal)
+                    })
+                    .collect();
+            }
             cached
                 .message_predicate_candidates
                 .lock()

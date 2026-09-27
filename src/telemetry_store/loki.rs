@@ -1013,19 +1013,37 @@ impl LokiStore for DurableTelemetryStore {
 
         let outer_queries = queries_for(&outer_request)?;
         if let Some(service) = join_service {
-            let mut inner_request = outer_request;
-            inner_request.predicate = LogPredicate::MatchAll;
-            inner_request.predicate_any = false;
-            inner_request.terms.clear();
-            inner_request.message_tokens.clear();
-            inner_request.case_insensitive_message_tokens.clear();
-            inner_request.labels = vec![crate::MetadataField::new("service_name", service)];
-            let inner_queries = queries_for(&inner_request)?;
-            let trace_ids = self
+            // The joined service is an independent log set in the same
+            // tenant and time range. It may be stored as a Loki label or as
+            // the native OTLP resource service name.
+            let mut inner_request = AnalyticsScanRequest::new(Arc::clone(&request.tenant));
+            inner_request.start_timestamp_unix_nanos = outer_request.start_timestamp_unix_nanos;
+            inner_request.end_timestamp_unix_nanos = outer_request.end_timestamp_unix_nanos;
+            inner_request.labels = vec![crate::MetadataField::new(
+                "service_name",
+                Arc::clone(&service),
+            )];
+            let loki_queries = queries_for(&inner_request)?;
+            inner_request.labels.clear();
+            inner_request.resource_attributes =
+                vec![crate::MetadataField::new("service.name", service)];
+            let otlp_queries = queries_for(&inner_request)?;
+            let mut trace_ids = self
                 .service
-                .query_partitions_trace_ids_intersection_unordered(&outer_queries, &inner_queries)
+                .query_partitions_trace_ids_intersection_unordered(&outer_queries, &loki_queries)
                 .map_err(|error| LokiApiError::internal(error.to_string()))?;
-            emit(u64::try_from(trace_ids.len()).unwrap_or(u64::MAX))
+            trace_ids.extend(
+                self.service
+                    .query_partitions_trace_ids_intersection_unordered(
+                        &outer_queries,
+                        &otlp_queries,
+                    )
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?,
+            );
+            emit(
+                u64::try_from(trace_ids.into_iter().collect::<HashSet<_>>().len())
+                    .unwrap_or(u64::MAX),
+            )
         } else {
             let trace_ids = self
                 .service

@@ -249,6 +249,100 @@ fn cold_boolean_relevance_cache_excludes_negated_tokens() {
     assert_eq!(stripe.count_query_checked(&query).expect("count"), 32);
 }
 
+#[test]
+fn mixed_phrase_and_token_count_verifies_embedded_candidates() {
+    let events = (0..96)
+        .map(|index| {
+            let message = match index % 3 {
+                0 => "Failed to place order: charge card",
+                1 => "Failed to place order",
+                _ => "charge card",
+            };
+            OtlpLogEvent {
+                timestamp_unix_nanos: 1_000 + index,
+                body: Some(TelemetryValue::String(Arc::from(message))),
+                message: Arc::from(message),
+                ..OtlpLogEvent::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    let prepared = prepare_ingest_pack(&events).expect("pack prepares");
+    let mut stripe = LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe");
+    stripe
+        .apply_indexed_ingest_pack(
+            partition(),
+            LogicalOffset::new(0),
+            events.len() as u32,
+            Bytes::from(prepared.payload),
+        )
+        .expect("frame append indexes");
+    let query = LogQuery::new(partition()).where_predicate(LogPredicate::and(vec![
+        LogPredicate::message_token("charge", CaseSensitivity::Insensitive),
+        LogPredicate::message_phrase(
+            ["failed", "to", "place", "order"],
+            0,
+            CaseSensitivity::Insensitive,
+        ),
+    ]));
+    assert_eq!(stripe.count_query_checked(&query).expect("count"), 32);
+    assert_eq!(stripe.query_checked(&query).expect("query").len(), 32);
+}
+
+#[test]
+fn indexed_grouping_reads_native_severity_and_scope() {
+    let events = (0..64)
+        .map(|index| {
+            let (severity, scope_name) = if index % 2 == 0 {
+                ("error", "node-logger")
+            } else {
+                ("info", "checkout")
+            };
+            OtlpLogEvent {
+                timestamp_unix_nanos: 1_000 + index,
+                body: Some(TelemetryValue::String(Arc::from("failed request"))),
+                message: Arc::from("failed request"),
+                severity_text: Arc::from(severity),
+                scope: Arc::new(crate::ScopeContext {
+                    name: Arc::from(scope_name),
+                    ..crate::ScopeContext::default()
+                }),
+                ..OtlpLogEvent::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    let prepared = prepare_ingest_pack(&events).expect("pack prepares");
+    let mut stripe = LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe");
+    stripe
+        .apply_indexed_ingest_pack(
+            partition(),
+            LogicalOffset::new(0),
+            events.len() as u32,
+            Bytes::from(prepared.payload),
+        )
+        .expect("frame append indexes");
+    let groups = stripe
+        .group_query_partitions_checked(
+            &[LogQuery::new(partition())],
+            &[
+                crate::AnalyticsGroupKey::SeverityText,
+                crate::AnalyticsGroupKey::ScopeName,
+            ],
+        )
+        .expect("group native metadata");
+    assert_eq!(groups.len(), 2);
+    assert_eq!(
+        groups.get(&vec![
+            Some(Arc::from("error")),
+            Some(Arc::from("node-logger"))
+        ]),
+        Some(&32)
+    );
+    assert_eq!(
+        groups.get(&vec![Some(Arc::from("info")), Some(Arc::from("checkout"))]),
+        Some(&32)
+    );
+}
+
 fn string_attribute(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.into(),
