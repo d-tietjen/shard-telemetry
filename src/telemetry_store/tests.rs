@@ -426,6 +426,18 @@ fn shared_durable_sink_indexes_trace_and_metric_partition_envelopes() {
         })
         .unwrap();
     assert_eq!(joined_count, 1);
+    joined_trace_count.labels.clear();
+    joined_trace_count
+        .resource_attributes
+        .push(crate::MetadataField::new("service.name", "checkout-api"));
+    joined_count = 0;
+    store
+        .scan_analytics_cardinality(&joined_trace_count, &mut |batch| {
+            joined_count += batch;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(joined_count, 1);
     let spans = store
         .query_traces(&crate::TraceQuery {
             tenant: Arc::from("tenant-a"),

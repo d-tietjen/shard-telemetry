@@ -349,14 +349,29 @@ pub(crate) fn scan_distinct_trace_cardinality_by_rows<S: LokiStore + ?Sized>(
         Ok(())
     })?;
     if let Some(service) = join_service {
-        let mut inner_request = rows_request;
-        inner_request.predicate = crate::LogPredicate::MatchAll;
-        inner_request.predicate_any = false;
-        inner_request.terms.clear();
-        inner_request.message_tokens.clear();
-        inner_request.case_insensitive_message_tokens.clear();
-        inner_request.labels = vec![crate::MetadataField::new("service_name", service)];
+        // The joined side is an independent set of logs for the same tenant
+        // and time range. It must not inherit the outer message or resource
+        // filters, and the service may be a Loki label or an OTLP attribute.
+        let mut inner_request = AnalyticsScanRequest::new(Arc::clone(&request.tenant));
+        inner_request.start_timestamp_unix_nanos = request.start_timestamp_unix_nanos;
+        inner_request.end_timestamp_unix_nanos = request.end_timestamp_unix_nanos;
+        inner_request.columns = vec![crate::AnalyticsColumn::TraceId];
+        inner_request.labels = vec![crate::MetadataField::new(
+            "service_name",
+            Arc::clone(&service),
+        )];
         let mut inner = HashSet::<Arc<str>>::new();
+        store.scan_analytics(&inner_request, &mut |rows| {
+            for row in rows {
+                if let Some(trace_id) = row.trace_id.as_ref().filter(|value| !value.is_empty()) {
+                    inner.insert(Arc::clone(trace_id));
+                }
+            }
+            Ok(())
+        })?;
+        inner_request.labels.clear();
+        inner_request.resource_attributes =
+            vec![crate::MetadataField::new("service.name", service)];
         store.scan_analytics(&inner_request, &mut |rows| {
             for row in rows {
                 if let Some(trace_id) = row.trace_id.as_ref().filter(|value| !value.is_empty()) {
