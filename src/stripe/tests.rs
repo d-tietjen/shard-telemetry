@@ -11,8 +11,8 @@ use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, Top
 
 use super::*;
 use crate::{
-    CaseSensitivity, LocalityGranularity, LogPredicate, MetadataField, TextMatchKind, TextMatcher,
-    ingest_pack::prepare_ingest_pack,
+    CaseSensitivity, LocalityGranularity, LogPredicate, MetadataField, TelemetryValue,
+    TextMatchKind, TextMatcher, ingest_pack::prepare_ingest_pack,
 };
 
 fn partition() -> TopicPartition {
@@ -99,6 +99,89 @@ fn batched_message_scores_match_indexed_scores_for_any_candidate_order() {
             .collect::<Vec<_>>();
         assert_eq!(batched, expected, "candidate ordinals: {ordinals:?}");
     }
+}
+
+#[test]
+fn compressed_frame_preserves_multi_token_and_bounded_phrase_matches() {
+    let events = (0..1_024)
+        .map(|index| {
+            let message = if index % 2 == 0 {
+                format!(
+                    "failed to send order confirmation to user{index}@example.com: failed POST to email service: expected 200, got 500"
+                )
+            } else {
+                "Failed to place order".to_owned()
+            };
+            OtlpLogEvent {
+                timestamp_unix_nanos: 1_000 + index,
+                body: Some(TelemetryValue::String(Arc::from(message.as_str()))),
+                message: Arc::from(message),
+                ..OtlpLogEvent::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    let prepared = prepare_ingest_pack(&events).expect("pack prepares");
+    let mut stripe = LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe");
+    stripe
+        .apply_indexed_ingest_pack(
+            partition(),
+            LogicalOffset::new(0),
+            events.len() as u32,
+            Bytes::from(prepared.payload),
+        )
+        .expect("frame append indexes");
+
+    let terms = [
+        "failed",
+        "send",
+        "order",
+        "confirmation",
+        "email",
+        "service",
+        "expected",
+        "post",
+    ];
+    let conjunction = LogQuery::new(partition()).where_predicate(LogPredicate::and(
+        terms
+            .into_iter()
+            .map(|term| LogPredicate::message_token(term, CaseSensitivity::Insensitive))
+            .collect::<Vec<_>>(),
+    ));
+    assert_eq!(
+        stripe.count_query_checked(&conjunction).expect("count"),
+        512
+    );
+    assert_eq!(
+        stripe.query_checked(&conjunction).expect("query").len(),
+        512
+    );
+
+    let phrase = LogQuery::new(partition())
+        .where_predicate(LogPredicate::message_phrase(
+            ["failed", "to", "place", "order"],
+            0,
+            CaseSensitivity::Insensitive,
+        ))
+        .sort_by_timestamp()
+        .newest_first()
+        .with_timestamp_range(1_000, 2_024)
+        .with_limit(10);
+    assert_eq!(
+        stripe
+            .query_checked(&phrase)
+            .expect("bounded phrase query")
+            .into_iter()
+            .map(|matched| matched.record.timestamp_unix_nanos)
+            .collect::<Vec<_>>(),
+        (0..10).map(|index| 2_023 - index * 2).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        stripe
+            .query_checked_with_typed_metadata(&phrase, false, false)
+            .expect("projected bounded phrase query")
+            .len(),
+        10
+    );
 }
 
 fn string_attribute(key: &str, value: &str) -> KeyValue {

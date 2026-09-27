@@ -143,7 +143,16 @@ fn normalize_analytics_predicate(predicate: &LogPredicate) -> LogPredicate {
             comparison,
             value,
         } if key.as_ref() == "otel.severity_number" => {
-            LogPredicate::field_numeric("attr.loki.metadata.severity_number", *comparison, *value)
+            // OTLP records store their severity in the native field, while
+            // Loki pushes expose the equivalent numeric metadata field.
+            LogPredicate::or(vec![
+                LogPredicate::field_numeric("otel.severity_number", *comparison, *value),
+                LogPredicate::field_numeric(
+                    "attr.loki.metadata.severity_number",
+                    *comparison,
+                    *value,
+                ),
+            ])
         }
         LogPredicate::And(predicates) => LogPredicate::and(
             predicates

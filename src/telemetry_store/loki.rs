@@ -812,7 +812,12 @@ impl LokiStore for DurableTelemetryStore {
             })
             .collect::<Vec<_>>();
         let include_typed_metadata =
-            crate::analytics::log_columns_need_typed_metadata(&request.columns);
+            crate::analytics::log_columns_need_typed_metadata(&request.columns)
+                || !request.attributes.is_empty()
+                || !request.resource_attributes.is_empty()
+                || !request.scope_attributes.is_empty()
+                || request.trace_id.is_some()
+                || request.span_id.is_some();
         let include_fields = crate::analytics::log_columns_need_structural_fields(&request.columns)
             || analytics_predicate_needs_structural_fields(&request.predicate)
             || !request.attributes.is_empty()

@@ -339,6 +339,7 @@ fn shared_durable_sink_indexes_trace_and_metric_partition_envelopes() {
         message: Arc::from("checkout request complete"),
         fields: Arc::new(vec![
             crate::MetadataField::new("otel.trace_id", trace_id.to_string()),
+            crate::MetadataField::new("otel.severity_number", "17"),
             crate::MetadataField::new("service.version", "v1"),
             crate::MetadataField::new("resource.loki.label.service", "checkout"),
             crate::MetadataField::new("resource.service.name", "checkout-api"),
@@ -347,6 +348,7 @@ fn shared_durable_sink_indexes_trace_and_metric_partition_envelopes() {
             "service.version",
             crate::TelemetryValue::String(Arc::from("v1")),
         )]),
+        severity_number: 17,
         trace_id: Some(trace_id),
         span_id: Some(crate::SpanId::from_bytes([2; 8]).unwrap()),
         resource: Arc::clone(&log_resource),
@@ -548,7 +550,42 @@ fn shared_durable_sink_indexes_trace_and_metric_partition_envelopes() {
         resource_filtered_log_rows[0].message.as_deref(),
         Some("checkout request complete")
     );
+    resource_filtered_log.limit = Some(1);
+    resource_filtered_log.order = Some(AnalyticsScanOrder::RelevanceDescending);
+    resource_filtered_log_rows.clear();
+    store
+        .scan_analytics(&resource_filtered_log, &mut |batch| {
+            resource_filtered_log_rows.extend_from_slice(batch);
+            Ok(())
+        })
+        .expect("relevance scan with resource filter");
+    assert_eq!(resource_filtered_log_rows.len(), 1);
+    assert_eq!(
+        resource_filtered_log_rows[0].message.as_deref(),
+        Some("checkout request complete")
+    );
+    let mut severity_scan = AnalyticsScanRequest::new("tenant-a");
+    severity_scan.predicate = LogPredicate::field_numeric(
+        "otel.severity_number",
+        crate::NumericComparison::GreaterThanOrEqual,
+        13,
+    );
+    severity_scan.limit = Some(1);
+    severity_scan.order = Some(AnalyticsScanOrder::TimestampDescending);
+    let mut severity_rows = Vec::new();
+    store
+        .scan_analytics(&severity_scan, &mut |batch| {
+            severity_rows.extend_from_slice(batch);
+            Ok(())
+        })
+        .expect("numeric severity scan");
+    assert_eq!(severity_rows.len(), 1);
+    assert_eq!(
+        severity_rows[0].message.as_deref(),
+        Some("checkout request complete")
+    );
     resource_filtered_log.limit = None;
+    resource_filtered_log.order = None;
     resource_filtered_log_rows.clear();
     store
         .scan_analytics(&resource_filtered_log, &mut |batch| {

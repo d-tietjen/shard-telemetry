@@ -529,20 +529,26 @@ impl LogStripe {
             for (ordinal, message) in verify_ordinals.into_iter().zip(messages) {
                 let mut seen = Vec::<usize>::new();
                 scan_clickhouse_tokens(&message, |token| {
-                    let Some(index) = missing.iter().position(|expected| match expected.1 {
-                        CaseSensitivity::Sensitive => token == expected.0.as_ref(),
-                        CaseSensitivity::Insensitive => {
-                            token.eq_ignore_ascii_case(expected.0.as_ref())
+                    for (index, expected) in missing.iter().enumerate() {
+                        if seen.contains(&index) {
+                            continue;
                         }
-                    }) else {
-                        return;
-                    };
-                    if seen.contains(&index) {
-                        return;
+                        let matched = match expected.1 {
+                            CaseSensitivity::Sensitive => token == expected.0.as_ref(),
+                            CaseSensitivity::Insensitive => {
+                                token.eq_ignore_ascii_case(expected.0.as_ref())
+                            }
+                        };
+                        if matched {
+                            seen.push(index);
+                            postings[index].1.push(ordinal);
+                        }
                     }
-                    seen.push(index);
-                    postings[index].1.push(ordinal);
                 });
+            }
+            for (_, ordinals) in &mut postings {
+                ordinals.sort_unstable();
+                ordinals.dedup();
             }
             let computed = postings
                 .into_iter()
@@ -932,8 +938,6 @@ impl LogStripe {
             max_gap,
             case_sensitivity,
         } = &query.predicate
-            && allow_structural_message_fast_path
-            && query.limit.is_none()
             && !terms.is_empty()
         {
             let requested = terms
