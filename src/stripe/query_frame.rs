@@ -280,6 +280,7 @@ impl LogStripe {
     ) -> TelemetryResult<Vec<LogMatch>> {
         let mut candidates =
             self.indexed_frame_field_predicate_candidates_owned(query, frame, candidates)?;
+        let mut exact_message_candidates = false;
         if !matches!(query.predicate, LogPredicate::MatchAll)
             && let Some(message_candidates) =
                 self.cached_message_predicate_candidates(query, frame)?
@@ -287,6 +288,7 @@ impl LogStripe {
             let mut current = Some(candidates);
             intersect_frame_candidate_slice(&mut current, &message_candidates);
             candidates = current.unwrap_or_default();
+            exact_message_candidates = cached_message_predicate_is_exact(&query.predicate);
         }
         // Structural projection decoders consume record ordinals in ascending
         // order. Some bounded timestamp paths select candidates in query order
@@ -306,6 +308,7 @@ impl LogStripe {
                 .exact_fields
                 .iter()
                 .all(|field| field.key.as_ref() == "resource.loki.tenant");
+        let message_predicate_checked = message_only_query && exact_message_candidates;
         let tenant_only_without_residual = query
             .exact_fields
             .iter()
@@ -313,9 +316,7 @@ impl LogStripe {
             && !query.has_residual_predicate();
         let decode_fields = include_typed_metadata
             || include_fields
-            || !(query.has_residual_predicate() && message_filterable && message_only_query
-                || tenant_only_without_residual
-                || candidates_are_exact);
+            || !(message_predicate_checked || tenant_only_without_residual || candidates_are_exact);
         if query.sort == crate::QuerySort::Timestamp
             && (!query.has_residual_predicate() || message_filterable)
             && let Some(limit) = query.limit
@@ -578,7 +579,7 @@ impl LogStripe {
                 decoded,
                 &mut matches,
                 candidates_are_exact,
-                false,
+                message_predicate_checked,
             )?;
         }
         Ok(matches)

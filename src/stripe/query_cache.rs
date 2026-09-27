@@ -925,6 +925,16 @@ impl LogStripe {
             }
             return Ok(Some(candidates));
         }
+        // A Boolean token predicate can include NOT. The embedded index can
+        // narrow its positive terms, but that is only a superset; caching it
+        // under an exact predicate key lets later relevance scans admit rows
+        // that the negated term excludes.
+        if cached_message_predicate_is_exact(&query.predicate)
+            && let Some(candidates) =
+                self.exact_boolean_message_candidates(query, frame, cache_key)?
+        {
+            return Ok(Some(candidates));
+        }
         // A field-only predicate has no message candidate source. Returning
         // early avoids constructing the full token-statistics cache just to
         // discover that it cannot narrow the frame. For a mixed AND, the

@@ -182,6 +182,71 @@ fn compressed_frame_preserves_multi_token_and_bounded_phrase_matches() {
             .len(),
         10
     );
+    // A larger limit keeps this frame on the normal projection path rather
+    // than the batched timestamp shortcut. The tenant is append metadata and
+    // must still be honored when structural fields are omitted from rows.
+    let projected = phrase.with_limit(300);
+    assert_eq!(
+        stripe
+            .query_checked_with_typed_metadata(&projected, false, false)
+            .expect("projected phrase query")
+            .len(),
+        300
+    );
+}
+
+#[test]
+fn cold_boolean_relevance_cache_excludes_negated_tokens() {
+    let events = (0..64)
+        .map(|index| {
+            let message = if index % 2 == 0 {
+                "error cache"
+            } else {
+                "error payment"
+            };
+            OtlpLogEvent {
+                timestamp_unix_nanos: 1_000 + index,
+                body: Some(TelemetryValue::String(Arc::from(message))),
+                message: Arc::from(message),
+                ..OtlpLogEvent::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    let prepared = prepare_ingest_pack(&events).expect("pack prepares");
+    let mut stripe = LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe");
+    stripe
+        .apply_indexed_ingest_pack(
+            partition(),
+            LogicalOffset::new(0),
+            events.len() as u32,
+            Bytes::from(prepared.payload),
+        )
+        .expect("frame append indexes");
+
+    let predicate = LogPredicate::and(vec![
+        LogPredicate::message_token("error", CaseSensitivity::Insensitive),
+        LogPredicate::negate(LogPredicate::message_token(
+            "cache",
+            CaseSensitivity::Insensitive,
+        )),
+    ]);
+    let query = LogQuery::new(partition()).where_predicate(predicate.clone());
+    let mut request = crate::AnalyticsScanRequest::for_relation(
+        Arc::from("tenant"),
+        crate::AnalyticsRelation::Logs,
+    );
+    request.predicate = predicate;
+    let scorer = crate::analytics::RelevanceScorer::from_request(&request);
+    let matches = stripe
+        .query_partitions_checked_messages_top_k(&[query.clone()], &scorer, 10)
+        .expect("cold relevance query");
+    assert_eq!(matches.len(), 10);
+    assert!(
+        matches
+            .iter()
+            .all(|matched| matched.message_arc().as_ref() == "error payment")
+    );
+    assert_eq!(stripe.count_query_checked(&query).expect("count"), 32);
 }
 
 fn string_attribute(key: &str, value: &str) -> KeyValue {
