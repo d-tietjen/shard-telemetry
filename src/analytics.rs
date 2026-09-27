@@ -7,8 +7,8 @@ use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::builder::{
-    BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, MapBuilder, StringBuilder,
-    TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
+    BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, MapBuilder, MapFieldNames,
+    StringBuilder, TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_ipc::writer::StreamWriter;

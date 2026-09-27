@@ -600,7 +600,15 @@ pub(super) fn string_map_data_type() -> DataType {
 pub(super) fn string_map_array<'a>(
     rows: impl Iterator<Item = &'a BTreeMap<String, String>>,
 ) -> Result<arrow_array::MapArray, LokiApiError> {
-    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    let mut builder = MapBuilder::new(
+        Some(MapFieldNames {
+            entry: "entries".into(),
+            key: "keys".into(),
+            value: "values".into(),
+        }),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    );
     for values in rows {
         for (key, value) in values {
             builder.keys().append_value(key);
