@@ -259,11 +259,11 @@ fn tier_page_head_generates_candidates_only_through_equal_timestamp_boundary() {
     let store =
         crate::LocalObjectStore::open(directory.join("objects")).expect("local object store");
     let control = Arc::new(
-        SsdObjectCache::open(&directory.join("control"), crate::SsdCacheConfig::default())
+        SsdObjectCache::open(directory.join("control"), crate::SsdCacheConfig::default())
             .expect("control cache"),
     );
     let payload = Arc::new(
-        SsdObjectCache::open(&directory.join("payload"), crate::SsdCacheConfig::default())
+        SsdObjectCache::open(directory.join("payload"), crate::SsdCacheConfig::default())
             .expect("payload cache"),
     );
     let mut stripe = LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe");
