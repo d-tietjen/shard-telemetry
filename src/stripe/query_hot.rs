@@ -270,7 +270,7 @@ impl LogStripe {
         if constraints.impossible {
             return Ok(Vec::new());
         }
-        let mut matches = Vec::new();
+        let mut matches: Vec<LogMatch> = Vec::new();
         let page_head = query.sort == crate::QuerySort::Timestamp && query.limit == Some(1);
         for append in &partition.appends {
             if !append_matches_query_bounds(query, append) {
