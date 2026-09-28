@@ -60,7 +60,7 @@ pub(crate) fn validate_page_query(request: &NativeLogPageQuery) -> Result<Vec<u8
 
 pub(crate) fn decode_page_cursor(query: &[u8], cursor: &str) -> Result<PagePosition, NativeProtocolError> {
     let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| page_error("invalid native log page cursor"))?;
-    if bytes.len() != CURSOR_BYTES || bytes[..32] != *blake3::hash(query).as_bytes() {
+    if bytes.len() != CURSOR_BYTES || &bytes[..32] != blake3::hash(query).as_bytes() {
         return Err(page_error("native log page cursor does not match its query"));
     }
     Ok(PagePosition {

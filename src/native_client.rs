@@ -335,7 +335,7 @@ impl ShardTelemetryClient {
         let page = crate::decode_native_log_query_page(&response)?;
         if page.tenant != query.query.tenant
             || page.entries.len() > query.query.limit as usize
-            || page.entries.iter().map(crate::native_log_entry_bytes).fold(0_usize, usize::saturating_add) > query.max_bytes as usize
+            || page.entries.iter().map(crate::native_log_entry_bytes).fold(0_usize, |total, bytes| total.saturating_add(bytes)) > query.max_bytes as usize
         {
             return Err(NativeClientError::new("native log page violates its tenant or result bounds"));
         }
