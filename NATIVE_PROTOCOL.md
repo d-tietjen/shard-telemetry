@@ -67,11 +67,13 @@ Log query responses use the response-only `STR1` format. Labels are grouped once
 
 Native opcode `9` accepts an `STQ4` page request containing the existing `STQ1`
 query, a nonzero `max_bytes` no greater than 32 MiB, and an optional opaque
-cursor. The server holds at most one projected candidate per active tenant
-partition and requests the next candidate only while the page has room. It
-consumes at most 256 candidate records per page and counts each returned log
-line, label key/value, and structured metadata key/value in UTF-8 bytes before
-copying the entry into the result.
+cursor. The initial lookup holds at most one projected candidate per active
+tenant partition, so its candidate count can exceed 256 when more than 256
+partitions are active. The merge examines at most 256 candidates per page in
+result order. It refills a partition head only after advancing that partition,
+within the same 256-candidate merge budget.
+It counts each returned log line, label key/value, and structured metadata
+key/value in UTF-8 bytes before copying the entry into the result.
 One entry that exceeds `max_bytes` fails the request explicitly; it is never
 silently skipped. A page can contain fewer records than the requested record
 limit when its byte budget is reached.
