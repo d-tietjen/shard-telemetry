@@ -20,25 +20,41 @@ impl DurableTelemetryStore {
     /// Returns a byte-bounded native log page. Candidate lookup retains at
     /// most one small projected batch per partition; Loki entries are copied
     /// only after their size fits the caller's remaining byte budget.
-    pub fn query_native_page(&self, request: &NativeLogPageQuery) -> Result<NativeLogQueryPage, LokiApiError> {
-        let query_bytes = validate_page_query(request).map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+    pub fn query_native_page(
+        &self,
+        request: &NativeLogPageQuery,
+    ) -> Result<NativeLogQueryPage, LokiApiError> {
+        let query_bytes = validate_page_query(request)
+            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
         let cursor = request
             .cursor
             .as_deref()
-            .map(|cursor| decode_page_cursor(&query_bytes, cursor).map_err(|error| LokiApiError::bad_request(error.to_string())))
+            .map(|cursor| {
+                decode_page_cursor(&query_bytes, cursor)
+                    .map_err(|error| LokiApiError::bad_request(error.to_string()))
+            })
             .transpose()?;
         let partitions = self.tenant_partitions(&request.query.tenant)?;
-        if cursor.is_some_and(|cursor| !partitions.iter().any(|partition| partition.partition_id.get() == cursor.partition)) {
-            return Err(LokiApiError::bad_request("native log page cursor partition is invalid"));
+        if cursor.is_some_and(|cursor| {
+            !partitions
+                .iter()
+                .any(|partition| partition.partition_id.get() == cursor.partition)
+        }) {
+            return Err(LokiApiError::bad_request(
+                "native log page cursor partition is invalid",
+            ));
         }
-        let batch_limit = (request.query.limit as usize).min(PAGE_RECORD_BATCH).min(request.max_bytes as usize);
+        let batch_limit = (request.query.limit as usize)
+            .min(PAGE_RECORD_BATCH)
+            .min(request.max_bytes as usize);
         let mut queries = Vec::with_capacity(partitions.len());
         for partition in partitions {
             let mut query = LogQuery::new(partition)
                 .sort_by_timestamp()
                 .with_limit(batch_limit)
                 .with_field(TENANT_FIELD, request.query.tenant.as_str());
-            query.start_timestamp_unix_nanos = self.retained_query_start(request.query.start_timestamp_unix_nanos);
+            query.start_timestamp_unix_nanos =
+                self.retained_query_start(request.query.start_timestamp_unix_nanos);
             query.end_timestamp_unix_nanos = request.query.end_timestamp_unix_nanos;
             if request.query.direction == NativeQueryDirection::NewestFirst {
                 query = query.newest_first();
@@ -54,19 +70,33 @@ impl DurableTelemetryStore {
                 match request.query.direction {
                     NativeQueryDirection::OldestFirst if partition_id < cursor.partition => {
                         let next = cursor.timestamp.saturating_add(1);
-                        query.start_timestamp_unix_nanos = Some(query.start_timestamp_unix_nanos.map_or(next, |start| start.max(next)));
+                        query.start_timestamp_unix_nanos = Some(
+                            query
+                                .start_timestamp_unix_nanos
+                                .map_or(next, |start| start.max(next)),
+                        );
                     }
                     NativeQueryDirection::OldestFirst if partition_id > cursor.partition => {
-                        query.start_timestamp_unix_nanos =
-                            Some(query.start_timestamp_unix_nanos.map_or(cursor.timestamp, |start| start.max(cursor.timestamp)));
+                        query.start_timestamp_unix_nanos = Some(
+                            query
+                                .start_timestamp_unix_nanos
+                                .map_or(cursor.timestamp, |start| start.max(cursor.timestamp)),
+                        );
                     }
                     NativeQueryDirection::NewestFirst if partition_id > cursor.partition => {
-                        query.end_timestamp_unix_nanos =
-                            Some(query.end_timestamp_unix_nanos.map_or(cursor.timestamp, |end| end.min(cursor.timestamp)));
+                        query.end_timestamp_unix_nanos = Some(
+                            query
+                                .end_timestamp_unix_nanos
+                                .map_or(cursor.timestamp, |end| end.min(cursor.timestamp)),
+                        );
                     }
                     NativeQueryDirection::NewestFirst if partition_id < cursor.partition => {
                         let next = cursor.timestamp.saturating_add(1);
-                        query.end_timestamp_unix_nanos = Some(query.end_timestamp_unix_nanos.map_or(next, |end| end.min(next)));
+                        query.end_timestamp_unix_nanos = Some(
+                            query
+                                .end_timestamp_unix_nanos
+                                .map_or(next, |end| end.min(next)),
+                        );
                     }
                     _ => {
                         query.after = Some(QueryCursor::new(cursor.timestamp, cursor.offset));
@@ -79,7 +109,9 @@ impl DurableTelemetryStore {
             .service
             .query_partitions_projected_each_with_fields(&queries, false, true)
             .map_err(|error| LokiApiError::internal(error.to_string()))?;
-        let potentially_more = partition_matches.iter().any(|matches| matches.len() == batch_limit);
+        let potentially_more = partition_matches
+            .iter()
+            .any(|matches| matches.len() == batch_limit);
         let mut matches = partition_matches.into_iter().flatten().collect::<Vec<_>>();
         matches.sort_unstable_by(|left, right| {
             let left_key = (
@@ -97,7 +129,8 @@ impl DurableTelemetryStore {
                 NativeQueryDirection::NewestFirst => right_key.cmp(&left_key),
             }
         });
-        let delete_filter = LogicalDeleteFilter::compile(&self.deletes.list(&request.query.tenant)?)?;
+        let delete_filter =
+            LogicalDeleteFilter::compile(&self.deletes.list(&request.query.tenant)?)?;
         let mut entries = Vec::new();
         let mut bytes = 0_usize;
         let mut last_scanned = None;
@@ -114,9 +147,13 @@ impl DurableTelemetryStore {
             // time for their selector, never an unbounded result vector.
             let entry_bytes = native_log_match_bytes(matched);
             if delete_filter.is_empty() && entry_bytes > request.max_bytes as usize {
-                return Err(LokiApiError::bad_request("one native log entry exceeds the page byte limit"));
+                return Err(LokiApiError::bad_request(
+                    "one native log entry exceeds the page byte limit",
+                ));
             }
-            if delete_filter.is_empty() && bytes.saturating_add(entry_bytes) > request.max_bytes as usize {
+            if delete_filter.is_empty()
+                && bytes.saturating_add(entry_bytes) > request.max_bytes as usize
+            {
                 break;
             }
             let entry = log_match_to_entry(matched.clone())?;
@@ -126,7 +163,9 @@ impl DurableTelemetryStore {
                 continue;
             }
             if entry_bytes > request.max_bytes as usize {
-                return Err(LokiApiError::bad_request("one native log entry exceeds the page byte limit"));
+                return Err(LokiApiError::bad_request(
+                    "one native log entry exceeds the page byte limit",
+                ));
             }
             if bytes.saturating_add(entry_bytes) > request.max_bytes as usize {
                 break;
@@ -142,7 +181,11 @@ impl DurableTelemetryStore {
         let next_cursor = last_scanned
             .filter(|_| examined < matches.len() || potentially_more)
             .map(|position| encode_page_cursor(&query_bytes, position));
-        Ok(NativeLogQueryPage { tenant: request.query.tenant.clone(), entries, next_cursor })
+        Ok(NativeLogQueryPage {
+            tenant: request.query.tenant.clone(),
+            entries,
+            next_cursor,
+        })
     }
 
     /// Returns projected native-query matches when the query needs no

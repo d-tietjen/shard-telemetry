@@ -1190,7 +1190,6 @@ fn logical_deletes_survive_restart_and_filter_native_and_analytical_reads() {
         .expect("bounded native query respects deletes");
     assert_eq!(bounded.entries, native);
 
-
     let mut rows = Vec::new();
     store
         .scan_analytics(&AnalyticsScanRequest::new("tenant-a"), &mut |batch| {
@@ -1217,8 +1216,14 @@ fn logical_deletes_survive_restart_and_filter_native_and_analytical_reads() {
 
 #[test]
 fn native_log_pages_bound_bytes_and_keep_equal_timestamp_cursor_order() {
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-    let directory = std::env::temp_dir().join(format!("shard-telemetry-native-pages-{}-{nonce}", std::process::id()));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "shard-telemetry-native-pages-{}-{nonce}",
+        std::process::id()
+    ));
     let store = DurableTelemetryStore::open(DurableTelemetryConfig {
         data_directory: directory.clone(),
         object_store_directory: None,
@@ -1258,7 +1263,13 @@ fn native_log_pages_bound_bytes_and_keep_equal_timestamp_cursor_order() {
         max_bytes: 128,
         cursor: None,
     };
-    assert_eq!(store.tenant_partitions("tenant-a").expect("partitions").len(), 2);
+    assert_eq!(
+        store
+            .tenant_partitions("tenant-a")
+            .expect("partitions")
+            .len(),
+        2
+    );
     let full = store.query_native_page(&request).expect("complete page");
     assert_eq!(full.entries.len(), 3);
     request.max_bytes = 12;
@@ -1266,7 +1277,13 @@ fn native_log_pages_bound_bytes_and_keep_equal_timestamp_cursor_order() {
     let mut first_cursor = None;
     for _ in 0..4 {
         let page = store.query_native_page(&request).expect("bounded page");
-        assert!(page.entries.iter().map(crate::native_log_entry_bytes).sum::<usize>() <= 12);
+        assert!(
+            page.entries
+                .iter()
+                .map(crate::native_log_entry_bytes)
+                .sum::<usize>()
+                <= 12
+        );
         paged.extend(page.entries);
         match page.next_cursor {
             Some(cursor) => {
@@ -1278,26 +1295,47 @@ fn native_log_pages_bound_bytes_and_keep_equal_timestamp_cursor_order() {
             None => break,
         }
     }
-    assert_eq!(paged, full.entries, "equal timestamps cross partitions without gaps or duplicates");
+    assert_eq!(
+        paged, full.entries,
+        "equal timestamps cross partitions without gaps or duplicates"
+    );
     let cursor = first_cursor.expect("first continuation");
 
     request.cursor = None;
     request.query.direction = NativeQueryDirection::NewestFirst;
     request.max_bytes = 128;
     let newest = store.query_native_page(&request).expect("newest page");
-    assert_eq!(newest.entries.iter().rev().collect::<Vec<_>>(), full.entries.iter().collect::<Vec<_>>());
+    assert_eq!(
+        newest.entries.iter().rev().collect::<Vec<_>>(),
+        full.entries.iter().collect::<Vec<_>>()
+    );
     request.query.direction = NativeQueryDirection::OldestFirst;
 
     request.cursor = Some(cursor);
     request.query.tenant = "tenant-b".to_owned();
-    assert!(store.query_native_page(&request).is_err(), "cursor cannot cross tenants");
+    assert!(
+        store.query_native_page(&request).is_err(),
+        "cursor cannot cross tenants"
+    );
     request.query.tenant = "tenant-a".to_owned();
-    request.query.labels.insert("app".to_owned(), "other".to_owned());
-    assert!(store.query_native_page(&request).is_err(), "cursor cannot cross filters");
+    request
+        .query
+        .labels
+        .insert("app".to_owned(), "other".to_owned());
+    assert!(
+        store.query_native_page(&request).is_err(),
+        "cursor cannot cross filters"
+    );
     request.cursor = None;
-    request.query.labels.insert("app".to_owned(), "api".to_owned());
+    request
+        .query
+        .labels
+        .insert("app".to_owned(), "api".to_owned());
     request.max_bytes = 1;
-    assert!(store.query_native_page(&request).is_err(), "oversized first row fails explicitly");
+    assert!(
+        store.query_native_page(&request).is_err(),
+        "oversized first row fails explicitly"
+    );
     drop(store);
     fs::remove_dir_all(directory).expect("cleanup");
 }

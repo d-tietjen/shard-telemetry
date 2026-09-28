@@ -329,15 +329,27 @@ impl ShardTelemetryClient {
 
     /// Executes a byte-bounded log page. An older server returns Unsupported;
     /// callers should deploy the page-capable server before switching clients.
-    pub async fn query_logs_page(&self, query: &crate::NativeLogPageQuery) -> Result<crate::NativeLogQueryPage, NativeClientError> {
+    pub async fn query_logs_page(
+        &self,
+        query: &crate::NativeLogPageQuery,
+    ) -> Result<crate::NativeLogQueryPage, NativeClientError> {
         let payload = crate::encode_native_log_page_query(query)?;
-        let response = self.request(NativeOpcode::QueryLogsPage, self.next_request_id(), payload).await?;
+        let response = self
+            .request(NativeOpcode::QueryLogsPage, self.next_request_id(), payload)
+            .await?;
         let page = crate::decode_native_log_query_page(&response)?;
         if page.tenant != query.query.tenant
             || page.entries.len() > query.query.limit as usize
-            || page.entries.iter().map(crate::native_log_entry_bytes).fold(0_usize, |total, bytes| total.saturating_add(bytes)) > query.max_bytes as usize
+            || page
+                .entries
+                .iter()
+                .map(crate::native_log_entry_bytes)
+                .fold(0_usize, |total, bytes| total.saturating_add(bytes))
+                > query.max_bytes as usize
         {
-            return Err(NativeClientError::new("native log page violates its tenant or result bounds"));
+            return Err(NativeClientError::new(
+                "native log page violates its tenant or result bounds",
+            ));
         }
         if let Some(cursor) = &page.next_cursor {
             let encoded_query = encode_native_query(&query.query)?;

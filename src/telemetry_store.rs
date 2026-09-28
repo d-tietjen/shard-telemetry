@@ -29,20 +29,19 @@ use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest};
 use crate::analytics::{AnalyticsGroupOrder, AnalyticsGroupRow};
 use crate::deletion::DeleteCatalog;
 use crate::ingest_pack::decode_ingest_pack;
-use crate::native_log_page::{
-    PAGE_RECORD_BATCH, PagePosition, decode_page_cursor, encode_page_cursor,
-    validate_page_query,
-};
 use crate::loki_api::{LogicalDeleteFilter, LokiApiError, LokiQueryResult, apply_logical_deletes};
+use crate::native_log_page::{
+    PAGE_RECORD_BATCH, PagePosition, decode_page_cursor, encode_page_cursor, validate_page_query,
+};
 use crate::rollup::MetricRollupCatalog;
 use crate::storage_format::DataDirectoryLease;
 use crate::{
     AnalyticsRelation, AnalyticsRow, AnalyticsScanOrder, AnalyticsScanRequest, CaseSensitivity,
     DeleteRequest, LocalObjectStore, LogMatch, LogPredicate, LogQuery, LokiEntry, LokiStore,
-    MetadataField, NativeQuery, NativeQueryDirection, NativeLogPageQuery, NativeLogQueryPage, ObjectTierConfig, OtlpSinkConfig,
-    QueryCursor, S3ObjectStore, S3ObjectStoreConfig, SharedTelemetryObjectStore,
-    SinkObjectTierConfig, SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig,
-    TelemetryService, TelemetrySinkFactory,
+    MetadataField, NativeLogPageQuery, NativeLogQueryPage, NativeQuery, NativeQueryDirection,
+    ObjectTierConfig, OtlpSinkConfig, QueryCursor, S3ObjectStore, S3ObjectStoreConfig,
+    SharedTelemetryObjectStore, SinkObjectTierConfig, SsdCacheConfig, StoreHealth, StoreMetrics,
+    StripeConfig, TelemetryService, TelemetrySinkFactory,
 };
 
 mod analytics_signals;

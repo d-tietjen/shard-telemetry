@@ -88,7 +88,10 @@ impl EmbeddedTelemetryRuntime {
     }
 
     /// Queries one log page within a strict returned-entry byte budget.
-    pub fn query_native_page(&self, query: &crate::NativeLogPageQuery) -> Result<crate::NativeLogQueryPage, LokiApiError> {
+    pub fn query_native_page(
+        &self,
+        query: &crate::NativeLogPageQuery,
+    ) -> Result<crate::NativeLogQueryPage, LokiApiError> {
         self.store.query_native_page(query)
     }
 
