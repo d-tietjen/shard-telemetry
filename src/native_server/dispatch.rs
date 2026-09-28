@@ -9,7 +9,10 @@ pub(super) async fn dispatch(
 ) -> NativeFrame {
     if matches!(
         header.opcode,
-        NativeOpcode::Query | NativeOpcode::QueryMetrics | NativeOpcode::QueryTraces
+        NativeOpcode::Query
+            | NativeOpcode::QueryLogsPage
+            | NativeOpcode::QueryMetrics
+            | NativeOpcode::QueryTraces
     ) && let Some(gate) = &config.request_gate
         && let Err(error) = gate.check_query()
     {
@@ -401,6 +404,86 @@ pub(super) async fn dispatch(
                 result
             });
             let result = match query_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, worker).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return error_frame(
+                            header,
+                            NativeStatus::Timeout,
+                            "native query deadline exceeded",
+                        );
+                    }
+                },
+                None => worker.await,
+            };
+            match result {
+                Ok(Ok(encoded)) => ok_frame(header, encoded),
+                Ok(Err(error)) => store_error_frame(header, error),
+                Err(error) => error_frame(
+                    header,
+                    NativeStatus::Internal,
+                    &format!("native query worker failed: {error}"),
+                ),
+            }
+        }
+        NativeOpcode::QueryLogsPage => {
+            let query_permit = match config.production.as_ref() {
+                Some(runtime) => match runtime.try_query() {
+                    Some(permit) => {
+                        runtime.record_query();
+                        Some(permit)
+                    }
+                    None if matches!(
+                        runtime.lifecycle().state(),
+                        ServiceState::Starting | ServiceState::Stopping | ServiceState::Failed
+                    ) =>
+                    {
+                        return error_frame(
+                            header,
+                            NativeStatus::Unavailable,
+                            "native query service is unavailable",
+                        );
+                    }
+                    None => {
+                        return error_frame(
+                            header,
+                            NativeStatus::TooManyRequests,
+                            "native query concurrency limit exceeded",
+                        );
+                    }
+                },
+                None => None,
+            };
+            let query = match crate::decode_native_log_page_query(&payload) {
+                Ok(query) => query,
+                Err(error) => {
+                    return error_frame(header, NativeStatus::BadRequest, &error.to_string());
+                }
+            };
+            if config
+                .production
+                .as_ref()
+                .is_some_and(|runtime| query.query.tenant != runtime.tenant())
+            {
+                return error_frame(
+                    header,
+                    NativeStatus::Unauthorized,
+                    "native query tenant does not match the authenticated tenant",
+                );
+            }
+            let timeout = config
+                .production
+                .as_ref()
+                .map(|runtime| runtime.query_timeout());
+            let worker = tokio::task::spawn_blocking(move || {
+                let result = store.query_native_page(&query).and_then(|page| {
+                    crate::encode_native_log_query_page(page)
+                        .map_err(|error| LokiApiError::internal(error.to_string()))
+                });
+                drop(query_permit);
+                result
+            });
+            let result = match timeout {
                 Some(timeout) => match tokio::time::timeout(timeout, worker).await {
                     Ok(result) => result,
                     Err(_) => {

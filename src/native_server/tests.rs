@@ -371,6 +371,13 @@ async fn production_native_protocol_requires_authentication_before_operations() 
     assert_eq!(response.header.status, NativeStatus::Unavailable);
     assert_eq!(response.payload, b"not the current leader");
 
+    let page_query =
+        NativeFrame::request(NativeOpcode::QueryLogsPage, 5, Vec::new()).expect("page query");
+    write_frame(&mut client, &page_query).await;
+    let response = read_frame(&mut client).await;
+    assert_eq!(response.header.status, NativeStatus::Unavailable);
+    assert_eq!(response.payload, b"not the current leader");
+
     drop(unauthenticated);
     drop(client);
     stop.send(()).expect("stop");

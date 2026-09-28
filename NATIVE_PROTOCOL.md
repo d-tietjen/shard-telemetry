@@ -10,7 +10,7 @@ Every request and response begins with a fixed 32-byte little-endian header:
 | ---: | ---: | --- |
 | 0 | 4 | Magic `STNP` |
 | 4 | 1 | Version `1` |
-| 5 | 1 | Opcode: append `1`, query `2`, ping `3`, authenticate `4` |
+| 5 | 1 | Opcode: append `1`, query `2`, ping `3`, authenticate `4`, metric query `5`, trace query `6`, describe `7`, untracked append `8`, log page query `9` |
 | 6 | 1 | Flags; bit 0 marks a response |
 | 7 | 1 | Status |
 | 8 | 16 | Caller-selected request ID |
@@ -62,6 +62,42 @@ partition, offset range, and envelope bytes.
 The current native query opcode exposes the fastest exact log lookup primitive. Its `STQ1` request supports tenant, exact labels, exact case-insensitive message terms, an optional time range, result limit, and sort direction.
 
 Log query responses use the response-only `STR1` format. Labels are grouped once per returned stream, but `STR1` is never accepted by append or storage code. Trace and metric native query messages will use their signal-native result schemas rather than reusing the log response.
+
+### Byte-bounded log pages
+
+Native opcode `9` accepts an `STQ4` page request containing the existing `STQ1`
+query, a nonzero `max_bytes` no greater than 32 MiB, and an optional opaque
+cursor. The initial lookup holds at most one projected candidate per active
+tenant partition, so its candidate count can exceed 256 when more than 256
+partitions are active. The merge examines at most 256 candidates per page in
+result order. It refills a partition head only after advancing that partition,
+within the same 256-candidate merge budget.
+It counts each returned log line, label key/value, and structured metadata
+key/value in UTF-8 bytes before copying the entry into the result.
+One entry that exceeds `max_bytes` fails the request explicitly; it is never
+silently skipped. A page can contain fewer records than the requested record
+limit when its byte budget is reached.
+
+The `STR4` response contains an ordered MessagePack page with the tenant,
+entries, and optional `next_cursor`. Page order is timestamp, logical
+partition, then durable offset, reversed for newest-first queries. A cursor is
+exclusive and bound to the complete query (including tenant, labels, terms,
+time range, direction, and record limit). Changing any of those fields while
+reusing a cursor fails validation. A cursor is a continuation hint, not a
+snapshot: appends, deletions, or retention between pages can change the
+visible set. A final empty page may follow a full batch or a batch of deleted
+records. Callers continue until `next_cursor` is absent and must still check
+the response tenant against their authenticated scope.
+
+Opcode `2` and `STR1` keep their existing behavior for older callers. Opcode
+`9` requires a page-capable server; an older server rejects it as unsupported.
+Deploy the server before migrating clients to `query_logs_page`, and pin a
+published ShardTelemetry crate revision that includes the page API for both
+embedded and remote clients. The default native server outbound window is
+8 MiB, including the frame and MessagePack overhead, so callers using that
+default should request a page budget below 8 MiB (for example, 7 MiB) or
+raise the outbound window. A configured outbound cap can return
+`TooManyRequests` when the encoded page exceeds it.
 
 Full LogQL, PromQL, and TraceQL remain on the compatible HTTP APIs.
 

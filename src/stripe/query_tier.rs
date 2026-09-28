@@ -1,5 +1,10 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static TIER_PAGE_FALLBACK_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl LogStripe {
     pub(super) fn query_tiered_groups(
         &self,
@@ -81,6 +86,7 @@ impl LogStripe {
                 version_token: payload_artifact.checksum.clone(),
                 content_digest: payload_artifact.checksum.clone(),
             };
+            let page_head = query.sort == crate::QuerySort::Timestamp && query.limit == Some(1);
             let mut selected = Vec::new();
             let mut ranges = Vec::new();
             for append in appends.iter() {
@@ -102,6 +108,29 @@ impl LogStripe {
                     continue;
                 }
                 for cold_frame in &append.frames {
+                    if !timestamp_bounds_overlap(
+                        query,
+                        cold_frame.min_timestamp_unix_nanos,
+                        cold_frame.max_timestamp_unix_nanos,
+                    ) {
+                        continue;
+                    }
+                    if page_head {
+                        // Sort only frame descriptors. Building fallback
+                        // candidates here can collect every ordinal in a
+                        // large group before the first page head is known.
+                        selected.push((
+                            Arc::clone(&bounds.tenant),
+                            bounds.first_offset,
+                            bounds.last_offset,
+                            bounds.record_count,
+                            cold_frame,
+                            None,
+                            None,
+                            false,
+                        ));
+                        continue;
+                    }
                     let cached_exact_candidates = exact_tokens
                         .as_deref()
                         .filter(|tokens| !tokens.is_empty() || !exact_fields.is_empty())
@@ -132,13 +161,7 @@ impl LogStripe {
                                 bounds.tenant.as_ref(),
                             )
                         });
-                    if candidates.is_empty()
-                        || !timestamp_bounds_overlap(
-                            query,
-                            cold_frame.min_timestamp_unix_nanos,
-                            cold_frame.max_timestamp_unix_nanos,
-                        )
-                    {
+                    if candidates.is_empty() {
                         continue;
                     }
                     let range_index = if self
@@ -161,7 +184,7 @@ impl LogStripe {
                         bounds.last_offset,
                         bounds.record_count,
                         cold_frame,
-                        candidates,
+                        Some(candidates),
                         range_index,
                         exact_candidates_cached,
                     ));
@@ -179,7 +202,7 @@ impl LogStripe {
                         .cmp(&right.4.min_timestamp_unix_nanos),
                 });
             }
-            let mut payloads = if ranges.is_empty() {
+            let mut payloads = if ranges.is_empty() || page_head {
                 Vec::new()
             } else {
                 state.payload_cache.read_ranges_with_metadata(
@@ -217,9 +240,85 @@ impl LogStripe {
                         break;
                     }
                 }
-                let compressed = range_index
-                    .map(|index| Bytes::from(std::mem::take(&mut payloads[index])))
-                    .unwrap_or_default();
+                let mut exact_candidates_cached = exact_candidates_cached;
+                let candidates = if let Some(candidates) = candidates {
+                    candidates
+                } else {
+                    let cached_exact_candidates = exact_tokens
+                        .as_deref()
+                        .filter(|tokens| !tokens.is_empty() || !exact_fields.is_empty())
+                        .and_then(|tokens| {
+                            self.cached_exact_frame_candidates(
+                                cold_frame.frame_id,
+                                tokens,
+                                &exact_fields,
+                            )
+                        });
+                    exact_candidates_cached = cached_exact_candidates.is_some();
+                    let cached_message_candidates = (query.terms.is_empty()
+                        && exact_fields.is_empty())
+                    .then(|| {
+                        self.cached_message_predicate_candidates_if_present(
+                            cold_frame.frame_id,
+                            &query.predicate,
+                        )
+                    })
+                    .flatten();
+                    let candidates = cached_exact_candidates
+                        .or(cached_message_candidates)
+                        .unwrap_or_else(|| {
+                            #[cfg(test)]
+                            TIER_PAGE_FALLBACK_CANDIDATES
+                                .with(|count| count.set(count.get().saturating_add(1)));
+                            indexed_frame_candidates_for_append(
+                                query,
+                                &cold_frame.index,
+                                cold_frame.record_count,
+                                tenant.as_ref(),
+                            )
+                        });
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    candidates
+                };
+                let range_index = if page_head
+                    && self
+                        .cached_indexed_frame_if_present(cold_frame.frame_id)
+                        .is_none()
+                {
+                    let range_end = cold_frame
+                        .payload_offset
+                        .checked_add(cold_frame.payload_bytes)
+                        .ok_or(TelemetryError::RecordTooLarge)?;
+                    let index = ranges.len();
+                    ranges.push(cold_frame.payload_offset..range_end);
+                    Some(index)
+                } else {
+                    range_index
+                };
+                let compressed = if let Some(index) = range_index {
+                    if page_head {
+                        let range = ranges.get(index).ok_or_else(|| {
+                            TelemetryError::CorruptTier(
+                                "tiered frame payload range is missing".into(),
+                            )
+                        })?;
+                        let payload = state.payload_cache.read_ranges_with_metadata(
+                            tier.object_store(),
+                            &payload_artifact.object_key,
+                            &payload_metadata,
+                            std::slice::from_ref(range),
+                        )?;
+                        Bytes::from(payload.into_iter().next().ok_or_else(|| {
+                            TelemetryError::CorruptTier("tiered frame payload is missing".into())
+                        })?)
+                    } else {
+                        Bytes::from(std::mem::take(&mut payloads[index]))
+                    }
+                } else {
+                    Bytes::new()
+                };
                 if range_index.is_some()
                     && blake3::hash(&compressed).to_hex().as_str() != cold_frame.payload_checksum
                 {
