@@ -89,6 +89,8 @@ pub enum NativeOpcode {
     /// Callers must use [`NativeOpcode::Append`] when they need to replay an
     /// indeterminate request safely after a connection failure.
     AppendUntracked = 8,
+    /// Executes a byte-bounded, cursor-paginated log query.
+    QueryLogsPage = 9,
 }
 
 impl NativeOpcode {
@@ -102,6 +104,7 @@ impl NativeOpcode {
             6 => Ok(Self::QueryTraces),
             7 => Ok(Self::Describe),
             8 => Ok(Self::AppendUntracked),
+            9 => Ok(Self::QueryLogsPage),
             _ => Err(NativeProtocolError::new(format!(
                 "unsupported native opcode {value}"
             ))),
@@ -310,7 +313,7 @@ pub struct NativeProtocolError {
 }
 
 impl NativeProtocolError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }

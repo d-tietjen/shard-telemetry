@@ -29,13 +29,17 @@ use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest};
 use crate::analytics::{AnalyticsGroupOrder, AnalyticsGroupRow};
 use crate::deletion::DeleteCatalog;
 use crate::ingest_pack::decode_ingest_pack;
+use crate::native_log_page::{
+    PAGE_RECORD_BATCH, PagePosition, decode_page_cursor, encode_page_cursor,
+    validate_page_query,
+};
 use crate::loki_api::{LogicalDeleteFilter, LokiApiError, LokiQueryResult, apply_logical_deletes};
 use crate::rollup::MetricRollupCatalog;
 use crate::storage_format::DataDirectoryLease;
 use crate::{
     AnalyticsRelation, AnalyticsRow, AnalyticsScanOrder, AnalyticsScanRequest, CaseSensitivity,
     DeleteRequest, LocalObjectStore, LogMatch, LogPredicate, LogQuery, LokiEntry, LokiStore,
-    MetadataField, NativeQuery, NativeQueryDirection, ObjectTierConfig, OtlpSinkConfig,
+    MetadataField, NativeQuery, NativeQueryDirection, NativeLogPageQuery, NativeLogQueryPage, ObjectTierConfig, OtlpSinkConfig,
     QueryCursor, S3ObjectStore, S3ObjectStoreConfig, SharedTelemetryObjectStore,
     SinkObjectTierConfig, SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig,
     TelemetryService, TelemetrySinkFactory,
@@ -1056,6 +1060,24 @@ fn log_match_to_entry(matched: LogMatch) -> Result<LokiEntry, LokiApiError> {
         line: matched.record.message.to_string(),
         structured_metadata,
     })
+}
+
+fn native_log_match_bytes(matched: &LogMatch) -> usize {
+    let mut labels = BTreeMap::<&str, &str>::new();
+    let mut metadata = BTreeMap::<&str, &str>::new();
+    for field in matched.record.fields.iter() {
+        if let Some(name) = field.key.as_ref().strip_prefix(LABEL_PREFIX) {
+            labels.insert(name, field.value.as_ref());
+        } else if let Some(name) = field.key.as_ref().strip_prefix(METADATA_PREFIX) {
+            metadata.insert(name, field.value.as_ref());
+        }
+    }
+    labels
+        .iter()
+        .chain(metadata.iter())
+        .fold(matched.record.message.len(), |bytes, (key, value)| {
+            bytes.saturating_add(key.len()).saturating_add(value.len())
+        })
 }
 
 fn engine_error(error: EngineError) -> LokiApiError {

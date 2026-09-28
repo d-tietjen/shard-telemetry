@@ -87,6 +87,11 @@ impl EmbeddedTelemetryRuntime {
         self.store.query_native(query)
     }
 
+    /// Queries one log page within a strict returned-entry byte budget.
+    pub fn query_native_page(&self, query: &crate::NativeLogPageQuery) -> Result<crate::NativeLogQueryPage, LokiApiError> {
+        self.store.query_native_page(query)
+    }
+
     /// Queries the recovered embedded trace index without exposing writable
     /// ingestion APIs outside the lifecycle gate.
     pub fn query_traces(

@@ -23,6 +23,7 @@ mod locality;
 mod loki_api;
 mod metric;
 mod native_client;
+mod native_log_page;
 mod native_protocol;
 mod native_server;
 mod offload;
@@ -99,6 +100,11 @@ pub use metric::{
     decode_metric_chunk, encode_metric_chunk, prometheus_string_labels,
 };
 pub use native_client::{NativeClientConfig, NativeClientError, ShardTelemetryClient};
+pub use native_log_page::{
+    MAX_NATIVE_LOG_PAGE_BYTES, NativeLogPageQuery, NativeLogQueryPage,
+    decode_native_log_page_query, decode_native_log_query_page, encode_native_log_page_query,
+    encode_native_log_query_page, native_log_entry_bytes,
+};
 pub use native_protocol::{
     MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeCapabilities, NativeFrame,
     NativeFrameHeader, NativeLogQueryResult, NativeOpcode, NativePartitionAck,

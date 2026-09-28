@@ -79,7 +79,7 @@ impl Default for LokiApiConfig {
 }
 
 /// One normalized Loki entry accepted by the compatibility boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LokiEntry {
     /// Nanosecond Unix timestamp.
     pub timestamp_unix_nanos: i64,

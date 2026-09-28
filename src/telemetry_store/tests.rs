@@ -1173,6 +1173,23 @@ fn logical_deletes_survive_restart_and_filter_native_and_analytical_reads() {
         .expect("native query");
     assert_eq!(native.len(), 2);
     assert!(native.iter().all(|entry| !entry.line.ends_with("101")));
+    let bounded = store
+        .query_native_page(&NativeLogPageQuery {
+            query: NativeQuery {
+                tenant: "tenant-a".to_owned(),
+                labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                terms: vec!["message".to_owned()],
+                start_timestamp_unix_nanos: None,
+                end_timestamp_unix_nanos: None,
+                limit: 10,
+                direction: NativeQueryDirection::OldestFirst,
+            },
+            max_bytes: 1_024,
+            cursor: None,
+        })
+        .expect("bounded native query respects deletes");
+    assert_eq!(bounded.entries, native);
+
 
     let mut rows = Vec::new();
     store
@@ -1195,6 +1212,93 @@ fn logical_deletes_survive_restart_and_filter_native_and_analytical_reads() {
     assert!(recovered.cancel_delete("tenant-a", &request_id).unwrap());
     assert_eq!(recovered.entries("tenant-a").unwrap().len(), 3);
     drop(recovered);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn native_log_pages_bound_bytes_and_keep_equal_timestamp_cursor_order() {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+    let directory = std::env::temp_dir().join(format!("shard-telemetry-native-pages-{}-{nonce}", std::process::id()));
+    let store = DurableTelemetryStore::open(DurableTelemetryConfig {
+        data_directory: directory.clone(),
+        object_store_directory: None,
+        s3_object_store: None,
+        recovery_journal: false,
+        retention: None,
+        shard_count: 2,
+        tenant_partitions: 2,
+        append_linger: Duration::ZERO,
+        stripe: StripeConfig::default(),
+        indexed_ack_timeout: Duration::from_secs(30),
+    })
+    .expect("store opens");
+    for line in ["first", "second", "third"] {
+        store
+            .push(
+                "tenant-a",
+                vec![LokiEntry {
+                    timestamp_unix_nanos: 100,
+                    labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                    line: line.to_owned(),
+                    structured_metadata: BTreeMap::new(),
+                }],
+            )
+            .expect("push");
+    }
+    let mut request = NativeLogPageQuery {
+        query: NativeQuery {
+            tenant: "tenant-a".to_owned(),
+            labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+            terms: Vec::new(),
+            start_timestamp_unix_nanos: None,
+            end_timestamp_unix_nanos: None,
+            limit: 10,
+            direction: NativeQueryDirection::OldestFirst,
+        },
+        max_bytes: 128,
+        cursor: None,
+    };
+    assert_eq!(store.tenant_partitions("tenant-a").expect("partitions").len(), 2);
+    let full = store.query_native_page(&request).expect("complete page");
+    assert_eq!(full.entries.len(), 3);
+    request.max_bytes = 12;
+    let mut paged = Vec::new();
+    let mut first_cursor = None;
+    for _ in 0..4 {
+        let page = store.query_native_page(&request).expect("bounded page");
+        assert!(page.entries.iter().map(crate::native_log_entry_bytes).sum::<usize>() <= 12);
+        paged.extend(page.entries);
+        match page.next_cursor {
+            Some(cursor) => {
+                if first_cursor.is_none() {
+                    first_cursor = Some(cursor.clone());
+                }
+                request.cursor = Some(cursor);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(paged, full.entries, "equal timestamps cross partitions without gaps or duplicates");
+    let cursor = first_cursor.expect("first continuation");
+
+    request.cursor = None;
+    request.query.direction = NativeQueryDirection::NewestFirst;
+    request.max_bytes = 128;
+    let newest = store.query_native_page(&request).expect("newest page");
+    assert_eq!(newest.entries.iter().rev().collect::<Vec<_>>(), full.entries.iter().collect::<Vec<_>>());
+    request.query.direction = NativeQueryDirection::OldestFirst;
+
+    request.cursor = Some(cursor);
+    request.query.tenant = "tenant-b".to_owned();
+    assert!(store.query_native_page(&request).is_err(), "cursor cannot cross tenants");
+    request.query.tenant = "tenant-a".to_owned();
+    request.query.labels.insert("app".to_owned(), "other".to_owned());
+    assert!(store.query_native_page(&request).is_err(), "cursor cannot cross filters");
+    request.cursor = None;
+    request.query.labels.insert("app".to_owned(), "api".to_owned());
+    request.max_bytes = 1;
+    assert!(store.query_native_page(&request).is_err(), "oversized first row fails explicitly");
+    drop(store);
     fs::remove_dir_all(directory).expect("cleanup");
 }
 

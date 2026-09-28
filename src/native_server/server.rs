@@ -253,7 +253,7 @@ pub(super) async fn serve_connection(
             // known until after stripe execution completes.
             let query_outbound = if matches!(
                 header.opcode,
-                NativeOpcode::Query | NativeOpcode::QueryMetrics | NativeOpcode::QueryTraces
+                NativeOpcode::Query | NativeOpcode::QueryLogsPage | NativeOpcode::QueryMetrics | NativeOpcode::QueryTraces
             ) {
                 match outbound_budget
                     .clone()
