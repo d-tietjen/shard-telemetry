@@ -17,9 +17,10 @@ impl DurableTelemetryStore {
             .collect()
     }
 
-    /// Returns a byte-bounded native log page. Candidate lookup retains at
-    /// most one small projected batch per partition; Loki entries are copied
-    /// only after their size fits the caller's remaining byte budget.
+    /// Returns a byte-bounded native log page. Candidate lookup retains one
+    /// projected head per partition and advances only while the page can
+    /// accept more records, so later matches are not collected ahead of the
+    /// caller's byte budget.
     pub fn query_native_page(
         &self,
         request: &NativeLogPageQuery,
@@ -44,14 +45,11 @@ impl DurableTelemetryStore {
                 "native log page cursor partition is invalid",
             ));
         }
-        let batch_limit = (request.query.limit as usize)
-            .min(PAGE_RECORD_BATCH)
-            .min(request.max_bytes as usize);
         let mut queries = Vec::with_capacity(partitions.len());
         for partition in partitions {
             let mut query = LogQuery::new(partition)
                 .sort_by_timestamp()
-                .with_limit(batch_limit)
+                .with_limit(1)
                 .with_field(TENANT_FIELD, request.query.tenant.as_str());
             query.start_timestamp_unix_nanos =
                 self.retained_query_start(request.query.start_timestamp_unix_nanos);
@@ -105,37 +103,84 @@ impl DurableTelemetryStore {
             }
             queries.push(query);
         }
-        let partition_matches = self
+        let heads = self
             .service
             .query_partitions_projected_each_with_fields(&queries, false, true)
             .map_err(|error| LokiApiError::internal(error.to_string()))?;
-        let potentially_more = partition_matches
-            .iter()
-            .any(|matches| matches.len() == batch_limit);
-        let mut matches = partition_matches.into_iter().flatten().collect::<Vec<_>>();
-        matches.sort_unstable_by(|left, right| {
-            let left_key = (
-                left.record.timestamp_unix_nanos,
-                left.record.record_ref.topic_partition.partition_id.get(),
-                left.record.record_ref.offset,
-            );
-            let right_key = (
-                right.record.timestamp_unix_nanos,
-                right.record.record_ref.topic_partition.partition_id.get(),
-                right.record.record_ref.offset,
-            );
-            match request.query.direction {
-                NativeQueryDirection::OldestFirst => left_key.cmp(&right_key),
-                NativeQueryDirection::NewestFirst => right_key.cmp(&left_key),
-            }
-        });
         let delete_filter =
             LogicalDeleteFilter::compile(&self.deletes.list(&request.query.tenant)?)?;
+        Self::collect_native_page(
+            request,
+            &query_bytes,
+            queries,
+            heads,
+            &delete_filter,
+            |query| {
+                self.service
+                    .query_partitions_projected_each_with_fields(
+                        std::slice::from_ref(query),
+                        false,
+                        true,
+                    )
+                    .map_err(|error| LokiApiError::internal(error.to_string()))
+                    .map(|results| {
+                        results
+                            .into_iter()
+                            .next()
+                            .and_then(|matches| matches.into_iter().next())
+                    })
+            },
+        )
+    }
+
+    fn collect_native_page(
+        request: &NativeLogPageQuery,
+        query_bytes: &[u8],
+        mut queries: Vec<LogQuery>,
+        heads: Vec<Vec<LogMatch>>,
+        delete_filter: &LogicalDeleteFilter,
+        mut fetch_next: impl FnMut(&LogQuery) -> Result<Option<LogMatch>, LokiApiError>,
+    ) -> Result<NativeLogQueryPage, LokiApiError> {
+        let mut heads = heads
+            .into_iter()
+            .map(|matches| matches.into_iter().next())
+            .collect::<Vec<_>>();
         let mut entries = Vec::new();
         let mut bytes = 0_usize;
         let mut last_scanned = None;
         let mut examined = 0_usize;
-        for matched in matches.iter().take(batch_limit) {
+        let mut needs_refill = None;
+        while examined < PAGE_RECORD_BATCH && entries.len() < request.query.limit as usize {
+            if bytes == request.max_bytes as usize {
+                break;
+            }
+            if let Some(index) = needs_refill.take() {
+                heads[index] = fetch_next(&queries[index])?;
+            }
+            let next = heads
+                .iter()
+                .enumerate()
+                .filter_map(|(index, matched)| matched.as_ref().map(|matched| (index, matched)))
+                .min_by(|(_, left), (_, right)| {
+                    let key = |matched: &LogMatch| {
+                        (
+                            matched.record.timestamp_unix_nanos,
+                            matched.record.record_ref.topic_partition.partition_id.get(),
+                            matched.record.record_ref.offset,
+                        )
+                    };
+                    match request.query.direction {
+                        NativeQueryDirection::OldestFirst => key(left).cmp(&key(right)),
+                        NativeQueryDirection::NewestFirst => key(right).cmp(&key(left)),
+                    }
+                })
+                .map(|(index, _)| index);
+            let Some(index) = next else {
+                break;
+            };
+            let matched = heads[index]
+                .as_ref()
+                .expect("selected native page head is present");
             let record = &matched.record;
             let position = PagePosition {
                 timestamp: record.timestamp_unix_nanos,
@@ -160,6 +205,9 @@ impl DurableTelemetryStore {
             if !delete_filter.is_empty() && delete_filter.matches(&entry) {
                 last_scanned = Some(position);
                 examined += 1;
+                heads[index] = None;
+                queries[index].after = Some(QueryCursor::new(position.timestamp, position.offset));
+                needs_refill = Some(index);
                 continue;
             }
             if entry_bytes > request.max_bytes as usize {
@@ -174,13 +222,13 @@ impl DurableTelemetryStore {
             entries.push(entry);
             last_scanned = Some(position);
             examined += 1;
-            if entries.len() == request.query.limit as usize {
-                break;
-            }
+            heads[index] = None;
+            queries[index].after = Some(QueryCursor::new(position.timestamp, position.offset));
+            needs_refill = Some(index);
         }
         let next_cursor = last_scanned
-            .filter(|_| examined < matches.len() || potentially_more)
-            .map(|position| encode_page_cursor(&query_bytes, position));
+            .filter(|_| needs_refill.is_some() || heads.iter().any(Option::is_some))
+            .map(|position| encode_page_cursor(query_bytes, position));
         Ok(NativeLogQueryPage {
             tenant: request.query.tenant.clone(),
             entries,
@@ -325,5 +373,86 @@ impl DurableTelemetryStore {
         });
         accepted.truncate(result_limit);
         Ok(accepted.into_iter().map(|(entry, _)| entry).collect())
+    }
+}
+
+#[cfg(test)]
+mod page_collection_tests {
+    use super::*;
+
+    fn projected(partition: TopicPartition, offset: u64, timestamp: u64, line: &str) -> LogMatch {
+        LogMatch {
+            record: crate::DurableLog::new_projected(
+                ShardId::new(0),
+                partition,
+                LogicalOffset::new(offset),
+                timestamp,
+                Arc::from(line),
+                crate::CompressionCohortId::new(0),
+            ),
+        }
+    }
+
+    #[test]
+    fn native_page_stops_fetching_and_encoding_at_its_byte_boundary() {
+        let partition = TopicPartition::new(LOKI_TOPIC_ID, LogicalPartitionId::new(0));
+        let mut request = NativeLogPageQuery {
+            query: NativeQuery {
+                tenant: "tenant-a".into(),
+                labels: BTreeMap::new(),
+                terms: Vec::new(),
+                start_timestamp_unix_nanos: None,
+                end_timestamp_unix_nanos: None,
+                limit: 10,
+                direction: NativeQueryDirection::OldestFirst,
+            },
+            max_bytes: 2,
+            cursor: None,
+        };
+        let query_bytes = validate_page_query(&request).expect("valid page query");
+        let query = LogQuery::new(partition).sort_by_timestamp().with_limit(1);
+        let deletes = LogicalDeleteFilter::compile(&[]).expect("empty delete filter");
+
+        // The first line exactly fills the page. A later record must never
+        // even be requested from the stripe when the byte budget is spent.
+        let page = DurableTelemetryStore::collect_native_page(
+            &request,
+            &query_bytes,
+            vec![query.clone()],
+            vec![vec![projected(partition, 0, 1, "aa")]],
+            &deletes,
+            |_| panic!("a full page fetched another projected record"),
+        )
+        .expect("bounded page");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].line, "aa");
+        assert!(page.next_cursor.is_some());
+
+        // One lookahead is needed when the remaining bytes cannot fit the
+        // next line. Its out-of-range timestamp would fail Loki conversion,
+        // proving that the over-budget record is not encoded into the page.
+        request.max_bytes = 3;
+        let mut fetched = 0;
+        let page = DurableTelemetryStore::collect_native_page(
+            &request,
+            &query_bytes,
+            vec![query],
+            vec![vec![projected(partition, 0, 1, "aa")]],
+            &deletes,
+            |query| {
+                fetched += 1;
+                assert_eq!(
+                    query.after,
+                    Some(QueryCursor::new(1, LogicalOffset::new(0)))
+                );
+                assert_eq!(fetched, 1, "page fetched beyond its byte boundary");
+                Ok(Some(projected(partition, 1, (i64::MAX as u64) + 1, "bb")))
+            },
+        )
+        .expect("over-budget lookahead was not encoded");
+        assert_eq!(fetched, 1);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].line, "aa");
+        assert!(page.next_cursor.is_some());
     }
 }

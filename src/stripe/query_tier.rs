@@ -179,7 +179,8 @@ impl LogStripe {
                         .cmp(&right.4.min_timestamp_unix_nanos),
                 });
             }
-            let mut payloads = if ranges.is_empty() {
+            let page_head = query.sort == crate::QuerySort::Timestamp && query.limit == Some(1);
+            let mut payloads = if ranges.is_empty() || page_head {
                 Vec::new()
             } else {
                 state.payload_cache.read_ranges_with_metadata(
@@ -217,9 +218,28 @@ impl LogStripe {
                         break;
                     }
                 }
-                let compressed = range_index
-                    .map(|index| Bytes::from(std::mem::take(&mut payloads[index])))
-                    .unwrap_or_default();
+                let compressed = if let Some(index) = range_index {
+                    if page_head {
+                        let range = ranges.get(index).ok_or_else(|| {
+                            TelemetryError::CorruptTier(
+                                "tiered frame payload range is missing".into(),
+                            )
+                        })?;
+                        let payload = state.payload_cache.read_ranges_with_metadata(
+                            tier.object_store(),
+                            &payload_artifact.object_key,
+                            &payload_metadata,
+                            std::slice::from_ref(range),
+                        )?;
+                        Bytes::from(payload.into_iter().next().ok_or_else(|| {
+                            TelemetryError::CorruptTier("tiered frame payload is missing".into())
+                        })?)
+                    } else {
+                        Bytes::from(std::mem::take(&mut payloads[index]))
+                    }
+                } else {
+                    Bytes::new()
+                };
                 if range_index.is_some()
                     && blake3::hash(&compressed).to_hex().as_str() != cold_frame.payload_checksum
                 {

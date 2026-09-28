@@ -196,6 +196,56 @@ fn compressed_frame_preserves_multi_token_and_bounded_phrase_matches() {
 }
 
 #[test]
+fn timestamp_page_head_decodes_only_one_matching_frame_row() {
+    let events = (0..512)
+        .map(|index| OtlpLogEvent {
+            timestamp_unix_nanos: 1_000 + index,
+            body: Some(TelemetryValue::String(Arc::from("page candidate"))),
+            message: Arc::from("page candidate"),
+            ..OtlpLogEvent::default()
+        })
+        .collect::<Vec<_>>();
+    let prepared = prepare_ingest_pack(&events).expect("pack prepares");
+    let mut stripe = LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe");
+    stripe
+        .apply_indexed_ingest_pack(
+            partition(),
+            LogicalOffset::new(0),
+            events.len() as u32,
+            Bytes::from(prepared.payload),
+        )
+        .expect("frame append indexes");
+
+    let head = stripe
+        .query_checked_with_typed_metadata(
+            &LogQuery::new(partition()).sort_by_timestamp().with_limit(1),
+            false,
+            true,
+        )
+        .expect("one projected page head");
+    assert_eq!(head.len(), 1);
+    assert_eq!(head[0].record.timestamp_unix_nanos, 1_000);
+    let decoded_messages = stripe
+        .indexed_frame_partitions
+        .get(&partition())
+        .expect("indexed partition")
+        .appends
+        .iter()
+        .flat_map(|append| &append.frames)
+        .filter_map(|frame| stripe.cached_indexed_frame_if_present(frame.frame_id))
+        .map(|cached| {
+            cached
+                .message_bodies
+                .lock()
+                .expect("frame cache lock")
+                .values
+                .len()
+        })
+        .sum::<usize>();
+    assert_eq!(decoded_messages, 1, "later matching rows were decoded");
+}
+
+#[test]
 fn cold_boolean_relevance_cache_excludes_negated_tokens() {
     let events = (0..64)
         .map(|index| {

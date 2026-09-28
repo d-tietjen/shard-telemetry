@@ -271,6 +271,7 @@ impl LogStripe {
             return Ok(Vec::new());
         }
         let mut matches = Vec::new();
+        let page_head = query.sort == crate::QuerySort::Timestamp && query.limit == Some(1);
         for append in &partition.appends {
             if !append_matches_query_bounds(query, append) {
                 continue;
@@ -279,6 +280,16 @@ impl LogStripe {
                 if !frame_matches_query_bounds(query, frame) {
                     continue;
                 }
+                if page_head && let Some(best) = matches.first() {
+                    let boundary = best.record.timestamp_unix_nanos;
+                    let cannot_improve = match query.order {
+                        QueryOrder::OldestFirst => frame.min_timestamp_unix_nanos > boundary,
+                        QueryOrder::NewestFirst => frame.max_timestamp_unix_nanos < boundary,
+                    };
+                    if cannot_improve {
+                        continue;
+                    }
+                }
                 matches.extend(self.query_indexed_frame(
                     query,
                     append,
@@ -286,6 +297,9 @@ impl LogStripe {
                     include_typed_metadata,
                     include_fields,
                 )?);
+                if page_head {
+                    sort_and_limit_matches(&mut matches, query, 1);
+                }
             }
         }
         Ok(matches)
@@ -294,6 +308,21 @@ impl LogStripe {
     pub(super) fn query_ordinals(&self, query: &LogQuery, partition: &PartitionIndex) -> Vec<u32> {
         if query.limit == Some(0) || query.has_invalid_range() {
             return Vec::new();
+        }
+        // Native log pages ask for one timestamp-ordered head at a time. A
+        // posting intersection here would collect every matching ordinal
+        // before the page's byte budget can stop the query. Select the head
+        // against borrowed hot records and project only that record instead.
+        if query.sort == crate::QuerySort::Timestamp && query.limit == Some(1) {
+            return partition
+                .records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| query.matches(&record.record))
+                .min_by(|(_, left), (_, right)| query.compare(&left.record, &right.record))
+                .and_then(|(ordinal, _)| u32::try_from(ordinal).ok())
+                .into_iter()
+                .collect();
         }
         let constraints = query.required_index_constraints();
         if constraints.impossible {

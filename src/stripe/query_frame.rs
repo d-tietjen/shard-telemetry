@@ -11,6 +11,7 @@ impl LogStripe {
     ) -> TelemetryResult<Vec<LogMatch>> {
         if query.sort == crate::QuerySort::Timestamp
             && query.limit.is_some_and(|limit| limit > 0)
+            && query.limit != Some(1)
             && let Some(candidates) =
                 self.embedded_indexed_frame_candidates(query, append, frame)?
         {
@@ -317,6 +318,61 @@ impl LogStripe {
         let decode_fields = include_typed_metadata
             || include_fields
             || !(message_predicate_checked || tenant_only_without_residual || candidates_are_exact);
+        if query.sort == crate::QuerySort::Timestamp && query.limit == Some(1) {
+            // A page head needs only one decoded record. Rank borrowed frame
+            // positions first, then decode candidates singly until residual
+            // filters accept one; never build a frame-sized match batch.
+            let offsets = cached.offsets.as_ref();
+            let timestamps = cached.timestamps.as_ref();
+            let structural = cached.structural.as_ref();
+            for ordinal in &candidates {
+                let ordinal = usize::try_from(*ordinal).map_err(|_| {
+                    TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+                })?;
+                if ordinal >= offsets.len() || ordinal >= timestamps.len() {
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "compressed ingest candidate ordinal is out of range",
+                    ));
+                }
+            }
+            candidates.sort_unstable_by(|left, right| {
+                let left = usize::try_from(*left).expect("candidate ordinal was validated");
+                let right = usize::try_from(*right).expect("candidate ordinal was validated");
+                let ordering =
+                    (timestamps[left], offsets[left]).cmp(&(timestamps[right], offsets[right]));
+                match query.order {
+                    QueryOrder::OldestFirst => ordering,
+                    QueryOrder::NewestFirst => ordering.reverse(),
+                }
+            });
+            for ordinal in candidates {
+                let matches = self.decode_decompressed_frame_candidates(
+                    query,
+                    append,
+                    frame,
+                    structural,
+                    &cached.embedded_index,
+                    &cached.templates,
+                    offsets,
+                    timestamps,
+                    &cached.attribute_tables,
+                    &cached,
+                    &[ordinal],
+                    include_typed_metadata,
+                    decode_fields,
+                    None,
+                    typed_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.packed.as_ref()),
+                    candidates_are_exact,
+                    message_predicate_checked,
+                )?;
+                if !matches.is_empty() {
+                    return Ok(matches);
+                }
+            }
+            return Ok(Vec::new());
+        }
         if query.sort == crate::QuerySort::Timestamp
             && (!query.has_residual_predicate() || message_filterable)
             && let Some(limit) = query.limit

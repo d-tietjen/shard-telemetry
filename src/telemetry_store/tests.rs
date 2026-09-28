@@ -1237,9 +1237,14 @@ fn native_log_pages_bound_bytes_and_keep_equal_timestamp_cursor_order() {
         indexed_ack_timeout: Duration::from_secs(30),
     })
     .expect("store opens");
-    for line in ["first", "second", "third"] {
-        store
-            .push(
+    // Route the fixture explicitly so equal timestamps span both partitions.
+    for (index, line) in ["first", "second", "third"].into_iter().enumerate() {
+        let partition = TopicPartition::new(
+            LOKI_TOPIC_ID,
+            LogicalPartitionId::new(if index % 2 == 0 { 0 } else { 1 }),
+        );
+        let (envelope, transient_context) =
+            crate::signal_ingest::prepare_loki_log_envelope_with_context(
                 "tenant-a",
                 vec![LokiEntry {
                     timestamp_unix_nanos: 100,
@@ -1248,7 +1253,17 @@ fn native_log_pages_bound_bytes_and_keep_equal_timestamp_cursor_order() {
                     structured_metadata: BTreeMap::new(),
                 }],
             )
-            .expect("push");
+            .expect("prepare log envelope");
+        store
+            .append_telemetry_partition(
+                &crate::NativePartitionAppend {
+                    topic_partition: partition,
+                    envelope,
+                    transient_context: Some(transient_context),
+                },
+                true,
+            )
+            .expect("append routed log");
     }
     let mut request = NativeLogPageQuery {
         query: NativeQuery {
