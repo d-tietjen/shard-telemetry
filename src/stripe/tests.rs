@@ -246,6 +246,144 @@ fn timestamp_page_head_decodes_only_one_matching_frame_row() {
 }
 
 #[test]
+fn tier_page_head_generates_candidates_only_through_equal_timestamp_boundary() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "shard-telemetry-tier-page-head-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).expect("tier directory");
+    let store =
+        crate::LocalObjectStore::open(directory.join("objects")).expect("local object store");
+    let control = Arc::new(
+        SsdObjectCache::open(&directory.join("control"), crate::SsdCacheConfig::default())
+            .expect("control cache"),
+    );
+    let payload = Arc::new(
+        SsdObjectCache::open(&directory.join("payload"), crate::SsdCacheConfig::default())
+            .expect("payload cache"),
+    );
+    let mut stripe = LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe");
+    stripe
+        .attach_object_tier(
+            crate::SharedTelemetryObjectStore::from(store),
+            directory.join("spool"),
+            (control, payload),
+            [partition()],
+            ObjectTierConfig::default(),
+            false,
+        )
+        .expect("attach tier");
+
+    let mut checkpoint = DurableSinkCheckpoint::initial(partition());
+    for (offset, timestamp) in [(0, 10), (1, 20), (2, 10)] {
+        let events = [OtlpLogEvent {
+            timestamp_unix_nanos: timestamp,
+            body: Some(TelemetryValue::String(Arc::from("tier page row"))),
+            message: Arc::from("tier page row"),
+            ..OtlpLogEvent::default()
+        }];
+        let prepared = prepare_ingest_pack(&events).expect("pack prepares");
+        let next = DurableSinkCheckpoint {
+            topic_partition: partition(),
+            next_placement_sequence: shard_stream_core::PlacementSequence::new(offset + 2),
+            next_offset: LogicalOffset::new(offset + 1),
+        };
+        stripe
+            .apply_checkpointed_ingest_pack(
+                Arc::from("test-tenant"),
+                partition(),
+                LogicalOffset::new(offset),
+                1,
+                Bytes::from(prepared.payload),
+                None,
+                false,
+                (checkpoint, next),
+            )
+            .expect("checkpointed frame append");
+        checkpoint = next;
+    }
+    assert_eq!(stripe.offload_indexed_groups(true).expect("tier flush"), 1);
+
+    let query = LogQuery::new(partition())
+        .sort_by_timestamp()
+        .with_limit(1)
+        .with_field("resource.loki.tenant", "test-tenant");
+    super::query_tier::TIER_PAGE_FALLBACK_CANDIDATES.with(|count| count.set(0));
+    let first = stripe
+        .query_tiered_groups(&query, false, true)
+        .expect("first tier page head");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].record.timestamp_unix_nanos, 10);
+    assert_eq!(first[0].record.record_ref.offset, LogicalOffset::new(0));
+    super::query_tier::TIER_PAGE_FALLBACK_CANDIDATES.with(|count| {
+        assert_eq!(count.get(), 2, "later frame generated page candidates");
+    });
+
+    let second = stripe
+        .query_tiered_groups(
+            &query
+                .clone()
+                .after(crate::QueryCursor::new(10, LogicalOffset::new(0))),
+            false,
+            true,
+        )
+        .expect("equal-timestamp continuation");
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].record.record_ref.offset, LogicalOffset::new(2));
+    let third = stripe
+        .query_tiered_groups(
+            &query
+                .clone()
+                .after(crate::QueryCursor::new(10, LogicalOffset::new(2))),
+            false,
+            true,
+        )
+        .expect("next-timestamp continuation");
+    assert_eq!(third.len(), 1);
+    assert_eq!(third[0].record.record_ref.offset, LogicalOffset::new(1));
+
+    let newest = query.newest_first();
+    let newest_first = stripe
+        .query_tiered_groups(&newest, false, true)
+        .expect("newest tier page head");
+    assert_eq!(
+        newest_first[0].record.record_ref.offset,
+        LogicalOffset::new(1)
+    );
+    let newest_second = stripe
+        .query_tiered_groups(
+            &newest
+                .clone()
+                .after(crate::QueryCursor::new(20, LogicalOffset::new(1))),
+            false,
+            true,
+        )
+        .expect("newest equal-timestamp continuation");
+    assert_eq!(
+        newest_second[0].record.record_ref.offset,
+        LogicalOffset::new(2)
+    );
+    let newest_third = stripe
+        .query_tiered_groups(
+            &newest.after(crate::QueryCursor::new(10, LogicalOffset::new(2))),
+            false,
+            true,
+        )
+        .expect("newest final continuation");
+    assert_eq!(
+        newest_third[0].record.record_ref.offset,
+        LogicalOffset::new(0)
+    );
+
+    drop(stripe);
+    std::fs::remove_dir_all(directory).expect("tier cleanup");
+}
+
+#[test]
 fn cold_boolean_relevance_cache_excludes_negated_tokens() {
     let events = (0..64)
         .map(|index| {
