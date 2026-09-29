@@ -907,9 +907,9 @@ dependencies = [
 
 [[package]]
 name = "dial9"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bab33c9f10e909fb3f1f6af2a9d976398ea793b90d1d286b4e23647a7d131d53"
+checksum = "a6b45b31143736103e8dca37f060493047908aa2c6ce02624c423ffaf38dca37"
 dependencies = [
  "bon",
  "dial9-core",
@@ -924,9 +924,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-core"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffd7231006b074b02765ae929bded4757a414224b06c7db324d3e6e902f182ee"
+checksum = "e917e087ee3b643449ac7dd23786c80734bd4a255984802154fe8fad04facb3b"
 dependencies = [
  "arc-swap",
  "bon",
@@ -957,9 +957,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-metrique"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f987e56dbafcab5998acc8e77eb91aaf66fa5441a691b38e99c8058c70725f58"
+checksum = "ef5c59184dc198a59300361f876874106f0faeb09a7339fa15b10e71ccb5b099"
 dependencies = [
  "dial9-core",
  "dial9-trace-format",
@@ -971,9 +971,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-perf-self-profile"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d81f74ada03919614ca5b1ba767271d00980376a5a0e0fc43f8c265bf90413d4"
+checksum = "951556d3105a96b5daf28782d7628fde16c104fe014a1366925a6dde2f9979fd"
 dependencies = [
  "blazesym",
  "bon",
@@ -990,9 +990,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-tokio-telemetry"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "934c027f628c59ae4c9664ca4dce758843c3da027dee5052d358f86a5d292ae6"
+checksum = "89efd773588cfecbaa1b686baec990544ea184fa416e92da92084cc76359d993"
 dependencies = [
  "bon",
  "bytes",
@@ -1015,9 +1015,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-trace-format"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86083b7240114b2d0da4a7e9d041571d80ca3b1f92ae0ec794f1be21709daa6a"
+checksum = "7a74503a498a7fe5616f0ad4952c333f5237473bf7e3c4d40f94ceed376a6cbe"
 dependencies = [
  "dial9-trace-format-derive",
  "serde",
@@ -1026,9 +1026,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-trace-format-derive"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9309248f12e414d88bcc9505f78b0c9ed47f79c5b62db611493e19a612cdc9d6"
+checksum = "d7062a8c4af86a878843c8ac2f99d9ecbce30de9069700e70b1aef333976719f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
