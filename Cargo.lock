@@ -467,9 +467,9 @@ dependencies = [
 
 [[package]]
 name = "bytes-handoff"
-version = "1.3.1"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f57b197d6e79e92e5745a23081cbe296ba0959d67b7036a91ce37e182069165a"
+checksum = "f1bb980031726ddc4964e1252f22db7c40dc414e56e8abac960a5f606b80ba0d"
 dependencies = [
  "bytes",
  "thiserror",
