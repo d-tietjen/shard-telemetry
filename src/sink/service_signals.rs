@@ -384,6 +384,15 @@ impl TelemetryService {
         &self,
         query: &CorrelationQuery,
     ) -> TelemetryResult<Vec<TelemetryRecordRef>> {
+        self.query_correlations_with_retention(query, [0; 3])
+    }
+
+    /// Enforces retention at each owner before its bounded result is collected.
+    pub(crate) fn query_correlations_with_retention(
+        &self,
+        query: &CorrelationQuery,
+        signal_cutoffs: [u64; 3],
+    ) -> TelemetryResult<Vec<TelemetryRecordRef>> {
         if query.limit == 0 {
             return Ok(Vec::new());
         }
@@ -399,6 +408,7 @@ impl TelemetryService {
             sender
                 .send(SinkCommand::Correlate {
                     query: query.clone(),
+                    signal_cutoffs,
                     buffer,
                     response,
                 })

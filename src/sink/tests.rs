@@ -591,6 +591,19 @@ fn trace_and_metric_queries_survive_object_tier_restart() {
         .expect("cold trace query");
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].name.as_ref(), "cold trace");
+    assert_eq!(
+        service
+            .query_traces(&TraceQuery {
+                tenant: Arc::from("tenant-a"),
+                trace_id: Some(trace_id),
+                start_time_unix_nanos: Some(15),
+                end_time_unix_nanos: Some(14),
+                limit: 10,
+                ..TraceQuery::default()
+            })
+            .expect("cold crossing span with retained end and historical start"),
+        spans
+    );
     let points = service
         .query_metrics(&MetricQuery {
             tenant: Arc::from("tenant-a"),
@@ -676,4 +689,51 @@ fn trace_and_metric_queries_survive_object_tier_restart() {
         .expect("object-tier cache diagnostics exist");
     assert_eq!(after_absent.payload.hits, before_absent.payload.hits);
     assert_eq!(after_absent.payload.misses, before_absent.payload.misses);
+    let retained = CorrelationQuery::new("tenant-a")
+        .with_trace_id(trace_id)
+        .with_limit(1);
+    let refs = service
+        .query_correlations_with_retention(&retained, [0, 15, 31])
+        .expect("cold retained correlation");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(
+        refs[0].signal,
+        TelemetrySignal::Traces,
+        "span crosses cutoff while metric point has expired"
+    );
+    let bounded_start = CorrelationQuery {
+        end_time_unix_nanos: Some(14),
+        ..retained.clone()
+    };
+    assert_eq!(
+        service
+            .query_correlations_with_retention(&bounded_start, [0, 15, 31])
+            .expect("cold start-time bound"),
+        refs
+    );
+    let after_span_start = CorrelationQuery {
+        start_time_unix_nanos: Some(11),
+        ..retained.clone()
+    };
+    assert!(
+        service
+            .query_correlations_with_retention(&after_span_start, [0, 15, 31])
+            .expect("preserve start-time filter")
+            .is_empty()
+    );
+    assert!(
+        service
+            .query_correlations_with_retention(&retained, [0, 21, 31])
+            .expect("expired native signals")
+            .is_empty()
+    );
+    service
+        .retain_object_tier_for_signal_windows([0, 15, 31], None)
+        .expect("independent physical maintenance");
+    assert_eq!(
+        service
+            .query_correlations_with_retention(&retained, [0, 15, 31])
+            .expect("cold crossing span after maintenance"),
+        refs
+    );
 }

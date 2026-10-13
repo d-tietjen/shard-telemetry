@@ -393,6 +393,7 @@ impl LokiStore for DurableTelemetryStore {
         emit: &mut dyn FnMut(&[AnalyticsRow]) -> Result<(), LokiApiError>,
     ) -> Result<(), LokiApiError> {
         request.validate()?;
+        let request = &self.retained_analytics_request(request);
         match request.relation {
             AnalyticsRelation::Logs => {}
             AnalyticsRelation::Spans

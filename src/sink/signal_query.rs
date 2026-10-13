@@ -32,7 +32,15 @@ pub(super) fn query_trace_stripe(
         &partitions,
         TierQueryRange {
             min_timestamp_unix_nanos: query.start_time_unix_nanos,
-            max_timestamp_unix_nanos: query.end_time_unix_nanos,
+            // Native trace bounds match span end against the lower bound
+            // and span start against the upper bound. A retained crossing
+            // span can match even when those bounds do not form an ordinary
+            // point-timestamp interval. Decode enforces the original bounds.
+            max_timestamp_unix_nanos: query.end_time_unix_nanos.filter(|end| {
+                query
+                    .start_time_unix_nanos
+                    .is_none_or(|start| *end >= start)
+            }),
             signal_identity: identity,
             ..TierQueryRange::default()
         },
@@ -284,6 +292,7 @@ pub(super) fn finalize_metric_query(
 pub(super) fn query_correlation_stripe(
     stripe: &TelemetryStripeState,
     query: &CorrelationQuery,
+    signal_cutoffs: [u64; 3],
     mut refs: Vec<TelemetryRecordRef>,
 ) -> TelemetryResult<Vec<TelemetryRecordRef>> {
     refs.clear();
@@ -295,10 +304,15 @@ pub(super) fn query_correlation_stripe(
     {
         return Ok(refs);
     }
-    stripe.correlations.query_into(query, &mut refs);
+    stripe
+        .correlations
+        .query_into_with_retention(query, signal_cutoffs, &mut refs);
     if query
         .signal
         .is_none_or(|signal| signal == TelemetrySignal::Logs)
+        && query
+            .end_time_unix_nanos
+            .is_none_or(|end| end >= signal_cutoffs[0])
         && query
             .after
             .is_none_or(|after| after.signal <= TelemetrySignal::Logs)
@@ -348,7 +362,12 @@ pub(super) fn query_correlation_stripe(
             let mut log_query = LogQuery::new(partition)
                 .where_predicate(LogPredicate::and(label_predicates.clone()))
                 .with_limit(query.limit);
-            log_query.start_timestamp_unix_nanos = query.start_time_unix_nanos;
+            log_query.start_timestamp_unix_nanos = Some(
+                query
+                    .start_time_unix_nanos
+                    .unwrap_or(0)
+                    .max(signal_cutoffs[0]),
+            );
             log_query.end_timestamp_unix_nanos = query.end_time_unix_nanos;
             if let Some(after) = query.after.filter(|after| {
                 after.signal == TelemetrySignal::Logs && after.topic_partition == partition
@@ -373,6 +392,10 @@ pub(super) fn query_correlation_stripe(
     for signal in [TelemetrySignal::Traces, TelemetrySignal::Metrics] {
         if query.signal.is_some_and(|requested| requested != signal)
             || query.after.is_some_and(|after| after.signal > signal)
+            || (signal == TelemetrySignal::Metrics
+                && query
+                    .end_time_unix_nanos
+                    .is_some_and(|end| end < signal_cutoffs[2]))
         {
             continue;
         }
@@ -381,12 +404,23 @@ pub(super) fn query_correlation_stripe(
         };
         let mut partitions = state.tiers.keys().copied().collect::<Vec<_>>();
         partitions.sort_unstable();
+        let retained_start = query.start_time_unix_nanos.unwrap_or(0).max(match signal {
+            TelemetrySignal::Traces => signal_cutoffs[1],
+            TelemetrySignal::Metrics => signal_cutoffs[2],
+            TelemetrySignal::Logs => signal_cutoffs[0],
+        });
+        // A span can start before the retained window and finish inside it.
+        // When the caller's upper start-time bound predates the retention
+        // cutoff, omit that coarse bound and enforce it on decoded spans.
+        let coarse_end = query
+            .end_time_unix_nanos
+            .filter(|end| *end >= retained_start);
         for payload in read_signal_tier_payloads(
             state,
             &partitions,
             TierQueryRange {
-                min_timestamp_unix_nanos: query.start_time_unix_nanos,
-                max_timestamp_unix_nanos: query.end_time_unix_nanos,
+                min_timestamp_unix_nanos: Some(retained_start),
+                max_timestamp_unix_nanos: coarse_end,
                 ..TierQueryRange::default()
             },
             Some(query),
@@ -396,7 +430,11 @@ pub(super) fn query_correlation_stripe(
                     decode_trace_block(payload.as_ref())?
                         .into_iter()
                         .filter(|span| {
-                            correlation_time_matches(query, span.start_time_unix_nanos)
+                            correlation_record_is_retained(
+                                TelemetrySignal::Traces,
+                                span.end_time_unix_nanos().unwrap_or(u64::MAX),
+                                signal_cutoffs,
+                            ) && correlation_time_matches(query, span.start_time_unix_nanos)
                                 && span_matches_correlation(query, span)
                         })
                         .map(|span| span.record_ref),
@@ -405,7 +443,11 @@ pub(super) fn query_correlation_stripe(
                     decode_metric_chunk(payload.as_ref())?
                         .into_iter()
                         .filter(|point| {
-                            correlation_time_matches(query, point.timestamp_unix_nanos)
+                            correlation_record_is_retained(
+                                TelemetrySignal::Metrics,
+                                point.timestamp_unix_nanos,
+                                signal_cutoffs,
+                            ) && correlation_time_matches(query, point.timestamp_unix_nanos)
                                 && metric_matches_correlation(query, point)
                         })
                         .map(|point| point.record_ref),

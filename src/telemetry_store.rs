@@ -51,6 +51,8 @@ mod loki;
 mod native_query;
 mod remote_write;
 mod retention;
+#[cfg(test)]
+mod retention_qualification;
 mod signal_query;
 mod startup;
 #[cfg(test)]
@@ -392,6 +394,7 @@ pub struct DurableTelemetryStore {
     remote_write_append: Box<[Mutex<()>]>,
     deletes: DeleteCatalog,
     retention: Option<Duration>,
+    signal_retention: [Option<Duration>; 3],
     retention_runs: AtomicU64,
     retention_advanced_offsets: AtomicU64,
     retention_failures: AtomicU64,

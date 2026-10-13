@@ -108,14 +108,19 @@ impl DurableTelemetryStore {
     /// The durable sink checkpoint is an engine-level retention pin, so this
     /// cannot reclaim a source pack before its query index has applied it.
     pub fn compact_retention(&self) -> Result<RetentionReport, LokiApiError> {
-        let cutoff = self.retention_cutoff();
-        if cutoff.is_none()
+        let cutoffs = [
+            crate::TelemetrySignal::Logs,
+            crate::TelemetrySignal::Traces,
+            crate::TelemetrySignal::Metrics,
+        ]
+        .map(|signal| self.signal_retention_cutoff(signal).unwrap_or(0));
+        if cutoffs == [0; 3]
             && (self.archive_object_tier || self.max_object_payload_bytes_per_partition.is_none())
         {
             return Ok(RetentionReport::default());
         }
-        let cutoff = cutoff.unwrap_or(0);
-        let result = self.compact_retention_before(cutoff);
+        let cutoff = cutoffs.into_iter().min().unwrap_or(0);
+        let result = self.compact_retention_for_signals(cutoffs);
         self.retention_runs.fetch_add(1, Ordering::Relaxed);
         match &result {
             Ok(report) => {
@@ -142,76 +147,117 @@ impl DurableTelemetryStore {
         &self,
         cutoff: u64,
     ) -> Result<RetentionReport, LokiApiError> {
+        self.compact_retention_for_signals([cutoff; 3])
+    }
+
+    fn compact_retention_for_signals(
+        &self,
+        cutoffs: [u64; 3],
+    ) -> Result<RetentionReport, LokiApiError> {
         self.flush(self.indexed_ack_timeout)?;
         let mut report = RetentionReport {
-            cutoff_timestamp_unix_nanos: cutoff,
+            cutoff_timestamp_unix_nanos: cutoffs.into_iter().min().unwrap_or(0),
             ..RetentionReport::default()
         };
         if self.object_tier_enabled && !self.archive_object_tier {
             let tier = self
                 .service
-                .retain_object_tier(cutoff, self.max_object_payload_bytes_per_partition)
+                .retain_object_tier_for_signal_windows(
+                    cutoffs,
+                    self.max_object_payload_bytes_per_partition,
+                )
                 .map_err(|error| LokiApiError::internal(error.to_string()))?;
             report.retired_object_groups = tier.retired_groups;
             report.retired_object_payload_bytes = tier.retired_payload_bytes;
             report.retired_object_keys = tier.retired_objects;
         }
-        for partition_id in self.engine.topic_partitions(LOKI_TOPIC_ID) {
-            let partition = TopicPartition::new(LOKI_TOPIC_ID, partition_id);
-            let watermarks = self.engine.watermarks(partition).map_err(engine_error)?;
-            let original_start = watermarks.log_start;
-            let mut scan_offset = original_start;
-            let mut retained_start = original_start;
-            let mut reached_retained_batch = false;
-            while scan_offset < watermarks.last_stable_offset && !reached_retained_batch {
-                let batches = self
-                    .engine
-                    .fetch(FetchRequest {
-                        request_id: 0,
-                        topic_id: partition.topic_id,
-                        partition_id: partition.partition_id,
-                        start_offset: scan_offset,
-                        max_bytes: self.max_fetch_bytes,
-                        mode: FetchMode::Ordered,
-                    })
-                    .map_err(engine_error)?;
-                if batches.is_empty() {
-                    break;
-                }
-                for batch in batches {
-                    let envelope = crate::TelemetryEnvelope::decode(&batch.payload)
-                        .map_err(|error| LokiApiError::internal(error.to_string()))?;
-                    if envelope.signal != crate::TelemetrySignal::Logs {
-                        return Err(LokiApiError::internal(
-                            "log retention encountered a non-log envelope",
-                        ));
-                    }
-                    let records = decode_ingest_pack(&envelope.payload)
-                        .map_err(|error| LokiApiError::internal(error.to_string()))?;
-                    if records
-                        .iter()
-                        .any(|record| record.timestamp_unix_nanos >= cutoff)
-                    {
-                        reached_retained_batch = true;
+        for (signal, cutoff) in [
+            crate::TelemetrySignal::Logs,
+            crate::TelemetrySignal::Traces,
+            crate::TelemetrySignal::Metrics,
+        ]
+        .into_iter()
+        .zip(cutoffs)
+        {
+            if cutoff == 0 {
+                continue;
+            }
+            let topic_id = match signal {
+                crate::TelemetrySignal::Logs => LOKI_TOPIC_ID,
+                crate::TelemetrySignal::Traces => crate::TRACES_TOPIC_ID,
+                crate::TelemetrySignal::Metrics => crate::METRICS_TOPIC_ID,
+            };
+            for partition_id in self.engine.topic_partitions(topic_id) {
+                let partition = TopicPartition::new(topic_id, partition_id);
+                let watermarks = self.engine.watermarks(partition).map_err(engine_error)?;
+                let original_start = watermarks.log_start;
+                let mut scan_offset = original_start;
+                let mut retained_start = original_start;
+                let mut reached_retained_batch = false;
+                while scan_offset < watermarks.last_stable_offset && !reached_retained_batch {
+                    let batches = self
+                        .engine
+                        .fetch(FetchRequest {
+                            request_id: 0,
+                            topic_id: partition.topic_id,
+                            partition_id: partition.partition_id,
+                            start_offset: scan_offset,
+                            max_bytes: self.max_fetch_bytes,
+                            mode: FetchMode::Ordered,
+                        })
+                        .map_err(engine_error)?;
+                    if batches.is_empty() {
                         break;
                     }
-                    let next = batch
-                        .last_offset
-                        .get()
-                        .checked_add(1)
-                        .ok_or_else(|| LokiApiError::internal("retention offset exhausted"))?;
-                    retained_start = LogicalOffset::new(next);
-                    scan_offset = retained_start;
+                    for batch in batches {
+                        let envelope = crate::TelemetryEnvelope::decode(&batch.payload)
+                            .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                        if envelope.signal != signal {
+                            return Err(LokiApiError::internal(
+                                "retention envelope signal differs from its topic",
+                            ));
+                        }
+                        let retained = match signal {
+                            crate::TelemetrySignal::Logs => decode_ingest_pack(&envelope.payload)
+                                .map_err(|error| LokiApiError::internal(error.to_string()))?
+                                .iter()
+                                .any(|record| record.timestamp_unix_nanos >= cutoff),
+                            crate::TelemetrySignal::Traces => {
+                                crate::decode_trace_block(&envelope.payload)
+                                    .map_err(|error| LokiApiError::internal(error.to_string()))?
+                                    .iter()
+                                    .any(|record| {
+                                        record.end_time_unix_nanos().is_none_or(|end| end >= cutoff)
+                                    })
+                            }
+                            crate::TelemetrySignal::Metrics => {
+                                crate::decode_metric_chunk(&envelope.payload)
+                                    .map_err(|error| LokiApiError::internal(error.to_string()))?
+                                    .iter()
+                                    .any(|record| record.timestamp_unix_nanos >= cutoff)
+                            }
+                        };
+                        if retained {
+                            reached_retained_batch = true;
+                            break;
+                        }
+                        let next =
+                            batch.last_offset.get().checked_add(1).ok_or_else(|| {
+                                LokiApiError::internal("retention offset exhausted")
+                            })?;
+                        retained_start = LogicalOffset::new(next);
+                        scan_offset = retained_start;
+                    }
                 }
-            }
-            if retained_start > original_start {
-                self.engine
-                    .truncate_partition(partition, retained_start)
-                    .map_err(engine_error)?;
-                report.advanced_partitions += 1;
-                report.advanced_offsets = report
-                    .advanced_offsets
-                    .saturating_add(retained_start.get().saturating_sub(original_start.get()));
+                if retained_start > original_start {
+                    self.engine
+                        .truncate_partition(partition, retained_start)
+                        .map_err(engine_error)?;
+                    report.advanced_partitions += 1;
+                    report.advanced_offsets = report
+                        .advanced_offsets
+                        .saturating_add(retained_start.get().saturating_sub(original_start.get()));
+                }
             }
         }
         Ok(report)

@@ -18,9 +18,14 @@ pub(super) fn query_keys(query: &CorrelationQuery) -> impl Iterator<Item = Corre
 
 pub(super) fn correlation_posting_matches(
     query: &CorrelationQuery,
+    cutoffs: [u64; 3],
     posting: &CorrelationPosting,
 ) -> bool {
-    query
+    correlation_record_is_retained(
+        posting.record_ref.signal,
+        posting.retention_timestamp_unix_nanos,
+        cutoffs,
+    ) && query
         .signal
         .is_none_or(|signal| posting.record_ref.signal == signal)
         && query
@@ -33,6 +38,7 @@ pub(super) fn correlation_posting_matches(
 
 pub(super) fn query_single_posting(
     query: &CorrelationQuery,
+    cutoffs: [u64; 3],
     postings: &[CorrelationPosting],
     selected: &mut Vec<TelemetryRecordRef>,
 ) {
@@ -40,7 +46,8 @@ pub(super) fn query_single_posting(
         postings.partition_point(|posting| posting.record_ref <= after)
     });
     selected.reserve(query.limit.min(postings.len().saturating_sub(start)));
-    if query.signal.is_none()
+    if cutoffs == [0; 3]
+        && query.signal.is_none()
         && query.start_time_unix_nanos.is_none()
         && query.end_time_unix_nanos.is_none()
     {
@@ -53,7 +60,7 @@ pub(super) fn query_single_posting(
         return;
     }
     for posting in &postings[start..] {
-        if correlation_posting_matches(query, posting) {
+        if correlation_posting_matches(query, cutoffs, posting) {
             selected.push(posting.record_ref);
             if selected.len() == query.limit {
                 break;
@@ -64,6 +71,7 @@ pub(super) fn query_single_posting(
 
 pub(super) fn query_two_postings(
     query: &CorrelationQuery,
+    cutoffs: [u64; 3],
     left: &[CorrelationPosting],
     right: &[CorrelationPosting],
     selected: &mut Vec<TelemetryRecordRef>,
@@ -80,7 +88,8 @@ pub(super) fn query_two_postings(
         incoming.partition_point(|posting| posting.record_ref <= after)
     });
     selected.reserve(query.limit.min(first.len().saturating_sub(start)));
-    if query.signal.is_none()
+    if cutoffs == [0; 3]
+        && query.signal.is_none()
         && query.start_time_unix_nanos.is_none()
         && query.end_time_unix_nanos.is_none()
     {
@@ -106,7 +115,7 @@ pub(super) fn query_two_postings(
         return;
     }
     for posting in &first[start..] {
-        if !correlation_posting_matches(query, posting) {
+        if !correlation_posting_matches(query, cutoffs, posting) {
             continue;
         }
         let record = posting.record_ref;

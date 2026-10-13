@@ -65,46 +65,35 @@ impl CorrelationIndex {
         let Some(tenant_id) = self.tenant_id(tenant) else {
             return;
         };
+        let timestamps = CorrelationTimestamps {
+            event: span.start_time_unix_nanos,
+            retention: span.end_time_unix_nanos().unwrap_or(u64::MAX),
+        };
         self.insert(
             tenant_id,
             CorrelationKey::Trace(span.trace_id),
             span.record_ref,
-            span.start_time_unix_nanos,
+            timestamps,
         );
         for link in span.links.iter() {
             self.insert(
                 tenant_id,
                 CorrelationKey::Trace(link.trace_id),
                 span.record_ref,
-                span.start_time_unix_nanos,
+                timestamps,
             );
-            self.index_attribute_set(
-                tenant_id,
-                span.record_ref,
-                span.start_time_unix_nanos,
-                &link.attributes,
-            );
+            self.index_attribute_set(tenant_id, span.record_ref, timestamps, &link.attributes);
         }
         self.index_contexts(
             tenant_id,
             span.record_ref,
-            span.start_time_unix_nanos,
+            timestamps,
             &span.resource,
             &span.scope,
         );
-        self.index_attribute_set(
-            tenant_id,
-            span.record_ref,
-            span.start_time_unix_nanos,
-            &span.attributes,
-        );
+        self.index_attribute_set(tenant_id, span.record_ref, timestamps, &span.attributes);
         for event in span.events.iter() {
-            self.index_attribute_set(
-                tenant_id,
-                span.record_ref,
-                span.start_time_unix_nanos,
-                &event.attributes,
-            );
+            self.index_attribute_set(tenant_id, span.record_ref, timestamps, &event.attributes);
         }
     }
 
@@ -162,6 +151,16 @@ impl CorrelationIndex {
     /// Fills a reusable output buffer with the deterministic posting
     /// intersection. The buffer is cleared before results are written.
     pub fn query_into(&self, query: &CorrelationQuery, selected: &mut Vec<TelemetryRecordRef>) {
+        self.query_into_with_retention(query, [0; 3], selected);
+    }
+
+    /// Applies signal retention independently of the caller's event-time filter.
+    pub(crate) fn query_into_with_retention(
+        &self,
+        query: &CorrelationQuery,
+        cutoffs: [u64; 3],
+        selected: &mut Vec<TelemetryRecordRef>,
+    ) {
         selected.clear();
         if query.limit == 0 {
             return;
@@ -179,7 +178,7 @@ impl CorrelationIndex {
             .map(Vec::as_slice)
             .unwrap_or_default();
         let Some(second_key) = key_iter.next() else {
-            query_single_posting(query, first, selected);
+            query_single_posting(query, cutoffs, first, selected);
             return;
         };
         let second = self
@@ -188,7 +187,7 @@ impl CorrelationIndex {
             .map(Vec::as_slice)
             .unwrap_or_default();
         if key_iter.next().is_none() {
-            query_two_postings(query, first, second, selected);
+            query_two_postings(query, cutoffs, first, second, selected);
             return;
         }
 
@@ -223,7 +222,7 @@ impl CorrelationIndex {
             .collect::<Vec<_>>();
         'candidate: for posting in &first[start..] {
             let record = posting.record_ref;
-            if !correlation_posting_matches(query, posting) {
+            if !correlation_posting_matches(query, cutoffs, posting) {
                 continue;
             }
             for (incoming, cursor) in lists[1..].iter().zip(&mut cursors) {
@@ -249,9 +248,21 @@ impl CorrelationIndex {
 
     /// Drops expired bounded navigation postings without touching durable data.
     pub fn retain_since_timestamp(&mut self, cutoff_timestamp_unix_nanos: u64) {
+        self.retain_since_signal_timestamps([cutoff_timestamp_unix_nanos; 3]);
+    }
+
+    /// Reclaims navigation postings according to each signal's own window.
+    pub(crate) fn retain_since_signal_timestamps(&mut self, cutoffs: [u64; 3]) {
         let mut retained = 0usize;
         self.postings.retain(|_, postings| {
-            postings.retain(|posting| posting.timestamp_unix_nanos >= cutoff_timestamp_unix_nanos);
+            postings.retain(|posting| {
+                let cutoff = match posting.record_ref.signal {
+                    TelemetrySignal::Logs => cutoffs[0],
+                    TelemetrySignal::Traces => cutoffs[1],
+                    TelemetrySignal::Metrics => cutoffs[2],
+                };
+                posting.retention_timestamp_unix_nanos >= cutoff
+            });
             retained = retained.saturating_add(postings.len());
             !postings.is_empty()
         });
@@ -272,51 +283,43 @@ impl CorrelationIndex {
         &mut self,
         tenant_id: u32,
         record_ref: TelemetryRecordRef,
-        timestamp_unix_nanos: u64,
+        timestamps: impl Into<CorrelationTimestamps>,
         resource: &Arc<ResourceContext>,
         scope: &Arc<ScopeContext>,
     ) {
+        let timestamps = timestamps.into();
         let resource_id = self.resource_id(resource);
         let scope_id = self.scope_id(scope);
         self.insert(
             tenant_id,
             CorrelationKey::Resource(resource_id),
             record_ref,
-            timestamp_unix_nanos,
+            timestamps,
         );
         self.insert(
             tenant_id,
             CorrelationKey::Scope(scope_id),
             record_ref,
-            timestamp_unix_nanos,
+            timestamps,
         );
-        self.index_attribute_set(
-            tenant_id,
-            record_ref,
-            timestamp_unix_nanos,
-            &resource.attributes,
-        );
-        self.index_attribute_set(
-            tenant_id,
-            record_ref,
-            timestamp_unix_nanos,
-            &scope.attributes,
-        );
+        self.index_attribute_set(tenant_id, record_ref, timestamps, &resource.attributes);
+        self.index_attribute_set(tenant_id, record_ref, timestamps, &scope.attributes);
     }
 
     fn index_attribute_set(
         &mut self,
         tenant_id: u32,
         record_ref: TelemetryRecordRef,
-        timestamp_unix_nanos: u64,
+        timestamps: impl Into<CorrelationTimestamps>,
         attributes: &Arc<Vec<TelemetryAttribute>>,
     ) {
+        let timestamps = timestamps.into();
         for id in self.attribute_ids(attributes).iter().copied() {
             self.insert(
                 tenant_id,
                 CorrelationKey::Attribute(id),
                 record_ref,
-                timestamp_unix_nanos,
+                timestamps,
             );
         }
     }
@@ -450,8 +453,9 @@ impl CorrelationIndex {
         tenant_id: u32,
         key: CorrelationKey,
         record_ref: TelemetryRecordRef,
-        timestamp_unix_nanos: u64,
+        timestamps: impl Into<CorrelationTimestamps>,
     ) {
+        let timestamps = timestamps.into();
         let lookup = (tenant_id, key);
         let refs = if self.postings.len() < self.config.max_keys {
             self.postings.entry(lookup).or_default()
@@ -473,7 +477,8 @@ impl CorrelationIndex {
         }
         let posting = CorrelationPosting {
             record_ref,
-            timestamp_unix_nanos,
+            timestamp_unix_nanos: timestamps.event,
+            retention_timestamp_unix_nanos: timestamps.retention,
         };
         if refs.last().is_none_or(|last| last.record_ref < record_ref) {
             refs.push(posting);

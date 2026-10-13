@@ -127,6 +127,16 @@ allocated directory bytes, rollup bytes and series, WAL payload bytes, index
 backlog, retention failures, quota headroom, and the last successful
 maintenance time.
 
+The durable store preserves separate log, trace, and raw metric retention
+windows when `DurableTelemetryConfig.retention` is `None`. An explicit global
+window overrides all three signal windows. Reads enforce these windows before
+optimized owner queries; trace retention uses the span end time, including
+spans that begin before the cutoff. Events and links follow their parent span,
+and exemplars follow their parent metric point. Maintenance removes complete
+expired signal groups and safely checkpoints their WAL offsets; restart keeps
+the same windows. Retention requires a recovery journal or immutable object
+tier. Lifetime metric rollups keep their separate aggregate semantics.
+
 Use `EmbeddedEvictionPolicy::OffloadToS3` instead of `Delete` to preserve full
 raw history. Publication is write-through: a group becomes authoritative in a
 dedicated S3 prefix before its payload and index are admitted to the bounded

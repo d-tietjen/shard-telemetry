@@ -217,6 +217,36 @@ pub struct CorrelationIndex {
 struct CorrelationPosting {
     record_ref: TelemetryRecordRef,
     timestamp_unix_nanos: u64,
+    retention_timestamp_unix_nanos: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CorrelationTimestamps {
+    event: u64,
+    retention: u64,
+}
+
+impl From<u64> for CorrelationTimestamps {
+    fn from(timestamp: u64) -> Self {
+        Self {
+            event: timestamp,
+            retention: timestamp,
+        }
+    }
+}
+
+/// Separates retention clocks from correlation's public event-time predicates.
+pub(crate) fn correlation_record_is_retained(
+    signal: TelemetrySignal,
+    timestamp: u64,
+    cutoffs: [u64; 3],
+) -> bool {
+    let cutoff = match signal {
+        TelemetrySignal::Logs => cutoffs[0],
+        TelemetrySignal::Traces => cutoffs[1],
+        TelemetrySignal::Metrics => cutoffs[2],
+    };
+    timestamp >= cutoff
 }
 
 #[derive(Debug)]

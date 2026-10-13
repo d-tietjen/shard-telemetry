@@ -20,7 +20,9 @@ use shard_stream_engine::{
 };
 
 use crate::analytics::RelevanceScorer;
-use crate::correlation::{metric_matches_correlation, span_matches_correlation};
+use crate::correlation::{
+    correlation_record_is_retained, metric_matches_correlation, span_matches_correlation,
+};
 use crate::ingest_pack::validate_ingest_pack;
 use crate::metric::{metric_exact_series_point_matches, metric_query_matches};
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
@@ -629,6 +631,7 @@ enum SinkCommand {
     },
     Correlate {
         query: CorrelationQuery,
+        signal_cutoffs: [u64; 3],
         buffer: Vec<TelemetryRecordRef>,
         response: SyncSender<TelemetryResult<Vec<TelemetryRecordRef>>>,
     },
@@ -636,7 +639,7 @@ enum SinkCommand {
         response: SyncSender<TelemetryResult<usize>>,
     },
     RetainObjectTier {
-        cutoff_timestamp_unix_nanos: u64,
+        signal_cutoffs: [u64; 3],
         max_payload_bytes_per_partition: Option<u64>,
         response: SyncSender<TelemetryResult<TierRetentionReport>>,
     },

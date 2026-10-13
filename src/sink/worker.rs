@@ -179,23 +179,29 @@ pub(super) fn run_sink_worker(
             }
             SinkCommand::Correlate {
                 query,
+                signal_cutoffs,
                 buffer,
                 response,
             } => {
-                let _ = response.send(query_correlation_stripe(&stripe, &query, buffer));
+                let _ = response.send(query_correlation_stripe(
+                    &stripe,
+                    &query,
+                    signal_cutoffs,
+                    buffer,
+                ));
             }
             SinkCommand::Flush { response } => {
                 let result = flush_object_tiers(&mut stripe, &checkpoints);
                 let _ = response.send(result);
             }
             SinkCommand::RetainObjectTier {
-                cutoff_timestamp_unix_nanos,
+                signal_cutoffs,
                 max_payload_bytes_per_partition,
                 response,
             } => {
                 let _ = response.send(retain_object_tiers(
                     &mut stripe,
-                    cutoff_timestamp_unix_nanos,
+                    signal_cutoffs,
                     max_payload_bytes_per_partition,
                 ));
             }

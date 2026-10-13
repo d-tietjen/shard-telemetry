@@ -198,15 +198,13 @@ pub(super) fn flush_object_tiers(
 
 pub(super) fn retain_object_tiers(
     stripe: &mut TelemetryStripeState,
-    cutoff_timestamp_unix_nanos: u64,
+    signal_cutoffs: [u64; 3],
     max_payload_bytes_per_partition: Option<u64>,
 ) -> TelemetryResult<TierRetentionReport> {
     stripe
         .correlations
-        .retain_since_timestamp(cutoff_timestamp_unix_nanos);
-    let mut total = stripe
-        .logs
-        .retain_object_tier_since(cutoff_timestamp_unix_nanos)?;
+        .retain_since_signal_timestamps(signal_cutoffs);
+    let mut total = stripe.logs.retain_object_tier_since(signal_cutoffs[0])?;
     if let Some(max_payload_bytes) = max_payload_bytes_per_partition {
         add_retention_report(
             &mut total,
@@ -215,9 +213,14 @@ pub(super) fn retain_object_tiers(
                 .retain_object_tier_to_payload_bytes(max_payload_bytes)?,
         );
     }
-    for state in stripe.signal_tiers.values_mut() {
+    for (signal, state) in &mut stripe.signal_tiers {
+        let cutoff = match signal {
+            TelemetrySignal::Logs => signal_cutoffs[0],
+            TelemetrySignal::Traces => signal_cutoffs[1],
+            TelemetrySignal::Metrics => signal_cutoffs[2],
+        };
         for tier in state.tiers.values_mut() {
-            let report = tier.retain_since_timestamp(cutoff_timestamp_unix_nanos)?;
+            let report = tier.retain_since_timestamp(cutoff)?;
             add_retention_report(&mut total, report);
             if let Some(max_payload_bytes) = max_payload_bytes_per_partition {
                 let report = tier.retain_to_payload_bytes(max_payload_bytes)?;

@@ -167,3 +167,96 @@ fn time_bounds_and_retention_remove_expired_navigation_postings() {
     };
     assert!(index.query(&expired).is_empty());
 }
+
+#[test]
+fn span_retention_uses_end_time_before_limits_and_preserves_event_time_filters() {
+    let trace_id = TraceId::from_bytes([1; 16]).expect("trace ID");
+    let attribute = TelemetryAttribute::new("shared", TelemetryValue::String(Arc::from("scope")));
+    let resource = Arc::new(ResourceContext {
+        attributes: Arc::new(vec![attribute.clone()]),
+        ..Default::default()
+    });
+    let scope = Arc::new(ScopeContext::default());
+    let partition = TopicPartition::new(crate::TRACES_TOPIC_ID, LogicalPartitionId::new(0));
+    let make_span = |offset, duration| DurableSpan {
+        stream_shard_id: ShardId::new(0),
+        record_ref: TelemetryRecordRef::for_signal(
+            TelemetrySignal::Traces,
+            partition,
+            LogicalOffset::new(offset),
+        ),
+        tenant: Arc::from("tenant-a"),
+        resource: Arc::clone(&resource),
+        scope: Arc::clone(&scope),
+        trace_id,
+        span_id: crate::SpanId::from_bytes([1; 8]).expect("span ID"),
+        parent_span_id: None,
+        trace_state: Arc::from(""),
+        flags: 0,
+        name: Arc::from("crossing cutoff"),
+        kind: 1,
+        start_time_unix_nanos: 10,
+        duration_nanos: duration,
+        attributes: Arc::new(vec![attribute.clone()]),
+        dropped_attributes_count: 0,
+        events: Arc::new(Vec::new()),
+        dropped_events_count: 0,
+        links: Arc::new(Vec::new()),
+        dropped_links_count: 0,
+        status: None,
+    };
+    let expired = make_span(0, 4);
+    let crossing = make_span(1, 10);
+    let mut index = CorrelationIndex::new(CorrelationConfig::default());
+    index.index_span(&expired);
+    index.index_span(&crossing);
+    let one_key = CorrelationQuery::new("tenant-a")
+        .with_trace_id(trace_id)
+        .with_limit(1);
+    let two_keys = one_key.clone().with_resource_id(resource.id());
+    let many_keys = two_keys
+        .clone()
+        .with_scope_id(scope.id())
+        .with_attribute(&attribute);
+    for query in [one_key, two_keys, many_keys] {
+        assert_eq!(
+            index.query(&query),
+            vec![expired.record_ref],
+            "public unscoped API retains its behavior"
+        );
+        let mut refs = Vec::new();
+        index.query_into_with_retention(&query, [0, 15, 0], &mut refs);
+        assert_eq!(
+            refs,
+            vec![crossing.record_ref],
+            "expired lower offsets cannot consume the limit"
+        );
+        let before_cutoff = CorrelationQuery {
+            end_time_unix_nanos: Some(14),
+            ..query.clone()
+        };
+        index.query_into_with_retention(&before_cutoff, [0, 15, 0], &mut refs);
+        assert_eq!(
+            refs,
+            vec![crossing.record_ref],
+            "caller bounds still refer to span start"
+        );
+        let after_start = CorrelationQuery {
+            start_time_unix_nanos: Some(11),
+            ..query.clone()
+        };
+        index.query_into_with_retention(&after_start, [0, 15, 0], &mut refs);
+        assert!(refs.is_empty());
+        let other_tenant = CorrelationQuery {
+            tenant: Arc::from("tenant-b"),
+            ..query
+        };
+        index.query_into_with_retention(&other_tenant, [0, 15, 0], &mut refs);
+        assert!(refs.is_empty());
+    }
+    index.retain_since_signal_timestamps([0, 15, 0]);
+    let query = CorrelationQuery::new("tenant-a").with_trace_id(trace_id);
+    assert_eq!(index.query(&query), vec![crossing.record_ref]);
+    index.retain_since_signal_timestamps([0, 21, 0]);
+    assert!(index.query(&query).is_empty());
+}
