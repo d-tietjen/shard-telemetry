@@ -382,7 +382,8 @@ pub(super) fn query_correlation_stripe(
                     .unwrap_or(0)
                     .max(signal_cutoffs[0]),
             );
-            log_query.end_timestamp_unix_nanos = query.end_time_unix_nanos;
+            log_query.end_timestamp_unix_nanos =
+                query.end_time_unix_nanos.and_then(|end| end.checked_add(1));
             if let Some(after) = query.after.filter(|after| {
                 after.signal == TelemetrySignal::Logs && after.topic_partition == partition
             }) {

@@ -12,9 +12,9 @@ use shard_stream_core::ShardId;
 use super::*;
 use crate::{
     CorrelationConfig, CorrelationQuery, DurableMetricPoint, EmbeddedTelemetryConfig,
-    MetricExemplar, MetricIdentity, MetricKind, MetricValue, NumberValue, OtlpLogEvent,
-    OtlpTelemetryDecoder, ResourceContext, ScopeContext, TelemetryAttribute, TelemetryRecordRef,
-    TelemetrySignal, TelemetryValue, TraceId,
+    MetadataField, MetricExemplar, MetricIdentity, MetricKind, MetricValue, NumberValue,
+    OtlpLogEvent, OtlpTelemetryDecoder, ResourceContext, ScopeContext, TelemetryAttribute,
+    TelemetryRecordRef, TelemetrySignal, TelemetryValue, TraceId,
 };
 
 #[test]
@@ -497,6 +497,90 @@ fn assert_navigation_results(
             string_refs[tenant]
         );
     }
+}
+
+#[test]
+fn field_only_log_correlations_preserve_inclusive_time_bounds_through_cold_restart() {
+    let now = unix_nanos_now();
+    let timestamp = now - 10_000_000_000;
+    let directory = std::env::temp_dir().join(format!(
+        "shard-telemetry-field-boundary-{}-{now}",
+        std::process::id(),
+    ));
+    let mut bounded =
+        EmbeddedTelemetryConfig::bounded_local(directory.clone(), Duration::from_secs(3_600))
+            .with_max_ram_bytes(8 * 1024 * 1024);
+    bounded.store.append_linger = Duration::ZERO;
+    bounded.object_tier.target_group_payload_bytes = 1;
+    let config = bounded.store;
+    let tier = bounded.object_tier;
+    let limits = bounded.local_limits;
+    let store = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+        config.clone(),
+        tier,
+        limits.clone(),
+    )
+    .expect("store");
+    let events = [timestamp, timestamp + 1]
+        .into_iter()
+        .map(|timestamp_unix_nanos| OtlpLogEvent {
+            timestamp_unix_nanos,
+            message: Arc::from("field-only boundary"),
+            fields: Arc::new(vec![MetadataField::new("legacy.label", "value")]),
+            ..OtlpLogEvent::default()
+        })
+        .collect();
+    let ack = store
+        .append_log_events("tenant-a", events, true)
+        .expect("field-only logs");
+    let records = acknowledgement_refs(&ack);
+    assert_eq!(records.len(), 2);
+    let mut boundary = CorrelationQuery::new("tenant-a")
+        .with_label("legacy.label", "value")
+        .for_signal(TelemetrySignal::Logs);
+    boundary.start_time_unix_nanos = Some(timestamp);
+    boundary.end_time_unix_nanos = Some(timestamp);
+    let verify = |store: &DurableTelemetryStore| {
+        assert_eq!(
+            store
+                .query_correlations(&boundary)
+                .expect("inclusive boundary"),
+            vec![records[0]]
+        );
+        assert!(
+            store
+                .query_correlations(&boundary.clone().after(records[0]))
+                .expect("boundary cursor end")
+                .is_empty()
+        );
+        let mut maximum = boundary.clone();
+        maximum.end_time_unix_nanos = Some(u64::MAX);
+        assert_eq!(
+            store
+                .query_correlations(&maximum)
+                .expect("maximum upper bound"),
+            records
+        );
+    };
+    verify(&store);
+    store
+        .flush(Duration::from_secs(30))
+        .expect("publication flush");
+    verify(&store);
+    drop(store);
+    let recovered =
+        DurableTelemetryStore::open_with_object_tier_config_and_local_limits(config, tier, limits)
+            .expect("cold restart");
+    assert_eq!(
+        recovered
+            .service
+            .retained_payload_bytes()
+            .expect("resident payload"),
+        0
+    );
+    verify(&recovered);
+    drop(recovered);
+    fs::remove_dir_all(directory).expect("remove fixture");
 }
 
 #[test]

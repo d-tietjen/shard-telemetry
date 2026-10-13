@@ -139,6 +139,8 @@ tier. Lifetime metric rollups keep their separate aggregate semantics.
 
 Correlation lookups enforce the requested tenant in both navigation indexes
 and cold log reads, including when tenants share a partition, trace ID, or label.
+Correlation event-time bounds are inclusive for every signal, including logs
+that carry only compatibility fields.
 
 An embedded RAM budget disables the optional retained correlation navigation
 postings and identity caches. Correlation lookups then match exact typed signal
