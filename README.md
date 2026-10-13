@@ -137,6 +137,9 @@ expired signal groups and safely checkpoints their WAL offsets; restart keeps
 the same windows. Retention requires a recovery journal or immutable object
 tier. Lifetime metric rollups keep their separate aggregate semantics.
 
+Correlation lookups enforce the requested tenant in both navigation indexes
+and cold log reads, including when tenants share a partition, trace ID, or label.
+
 Use `EmbeddedEvictionPolicy::OffloadToS3` instead of `Delete` to preserve full
 raw history. Publication is write-through: a group becomes authoritative in a
 dedicated S3 prefix before its payload and index are admitted to the bounded

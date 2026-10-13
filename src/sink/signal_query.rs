@@ -360,6 +360,7 @@ pub(super) fn query_correlation_stripe(
                 continue;
             }
             let mut log_query = LogQuery::new(partition)
+                .with_field("resource.loki.tenant", Arc::clone(&query.tenant))
                 .where_predicate(LogPredicate::and(label_predicates.clone()))
                 .with_limit(query.limit);
             log_query.start_timestamp_unix_nanos = Some(

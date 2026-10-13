@@ -47,6 +47,8 @@ use crate::{
 mod analytics_signals;
 mod append;
 mod append_helpers;
+#[cfg(test)]
+mod correlation_qualification;
 mod loki;
 mod native_query;
 mod remote_write;
