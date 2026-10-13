@@ -1,6 +1,18 @@
 use super::*;
 
 impl DurableTelemetryStore {
+    /// Returns the maximum encoded STEL envelope accepted by this store.
+    ///
+    /// Each envelope must fit the engine's append ceiling. The complete set of
+    /// envelopes in one normalized call must also fit the configured signal
+    /// ingestion ceiling, measured using exact durable encoding sizes.
+    #[must_use]
+    pub fn maximum_append_bytes(&self) -> usize {
+        self.engine
+            .maximum_batch_bytes()
+            .min(self.service.maximum_ingest_bytes())
+    }
+
     /// Returns the common logical partition count used by this local store.
     #[must_use]
     pub const fn telemetry_partition_count(&self) -> u32 {
@@ -213,6 +225,7 @@ impl DurableTelemetryStore {
         let sink_config = OtlpSinkConfig {
             stripe: config.stripe,
             signals,
+            correlations: limits.correlations,
             state_directory: config
                 .recovery_journal
                 .then(|| config.data_directory.join("index-journal")),

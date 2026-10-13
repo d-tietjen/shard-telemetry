@@ -21,7 +21,8 @@ use shard_stream_engine::{
 
 use crate::analytics::RelevanceScorer;
 use crate::correlation::{
-    correlation_record_is_retained, metric_matches_correlation, span_matches_correlation,
+    correlation_record_is_retained, log_matches_correlation, metric_matches_correlation,
+    span_matches_correlation,
 };
 use crate::ingest_pack::validate_ingest_pack;
 use crate::metric::{metric_exact_series_point_matches, metric_query_matches};
@@ -146,12 +147,9 @@ impl Default for OtlpSinkConfig {
 impl OtlpSinkConfig {
     fn validate(&self) -> TelemetryResult<()> {
         self.signals.validate()?;
-        if self.correlations.max_keys == 0
-            || self.correlations.max_refs_per_key == 0
-            || self.correlations.max_total_refs == 0
-        {
+        if self.correlations != CorrelationConfig::disabled() && !self.correlations.is_enabled() {
             return Err(TelemetryError::InvalidConfig(
-                "correlation index bounds must be nonzero",
+                "correlation index bounds must be all nonzero or all zero to disable navigation",
             ));
         }
         if self.queue_slots == 0 {
@@ -729,4 +727,5 @@ pub struct TelemetryService {
     tier_caches: Option<TierCaches>,
     object_store: Option<SharedTelemetryObjectStore>,
     router: TelemetryRouter,
+    max_ingest_bytes: usize,
 }

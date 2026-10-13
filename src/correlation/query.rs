@@ -173,6 +173,22 @@ const fn mix_filter_hash(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// Matches typed log identities after the log index has enforced tenant scope.
+pub(crate) fn log_matches_correlation(query: &CorrelationQuery, log: &DurableLog) -> bool {
+    query_keys(query).all(|key| match key {
+        CorrelationKey::Trace(trace_id) => log.trace_id == Some(trace_id),
+        CorrelationKey::Resource(resource_id) => log.resource_id() == resource_id,
+        CorrelationKey::Scope(scope_id) => log.scope_id() == scope_id,
+        CorrelationKey::Attribute(attribute_id) => log
+            .resource
+            .attributes
+            .iter()
+            .chain(log.scope.attributes.iter())
+            .chain(log.attributes.iter())
+            .any(|attribute| attribute.fingerprint() == attribute_id),
+    })
+}
+
 pub(crate) fn span_matches_correlation(query: &CorrelationQuery, span: &DurableSpan) -> bool {
     if span.tenant != query.tenant {
         return false;

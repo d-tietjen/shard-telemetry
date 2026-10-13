@@ -4,31 +4,50 @@ impl CorrelationIndex {
     /// Creates a bounded stripe-local index.
     #[must_use]
     pub fn new(config: CorrelationConfig) -> Self {
+        let context_entries = if config.is_enabled() {
+            CONTEXT_ID_CACHE_ENTRIES
+        } else {
+            0
+        };
+        let attribute_entries = if config.is_enabled() {
+            ATTRIBUTE_ID_CACHE_ENTRIES
+        } else {
+            0
+        };
+        let keys = if config.is_enabled() {
+            config.max_keys.min(4_096)
+        } else {
+            0
+        };
         Self {
             config,
             tenants: HashMap::new(),
-            postings: HashMap::with_capacity(config.max_keys.min(4_096)),
+            postings: HashMap::with_capacity(keys),
             resource_pointer_ids: std::iter::repeat_with(|| None)
-                .take(CONTEXT_ID_CACHE_ENTRIES)
+                .take(context_entries)
                 .collect(),
             resource_ids: std::iter::repeat_with(|| None)
-                .take(CONTEXT_ID_CACHE_ENTRIES)
+                .take(context_entries)
                 .collect(),
             scope_pointer_ids: std::iter::repeat_with(|| None)
-                .take(CONTEXT_ID_CACHE_ENTRIES)
+                .take(context_entries)
                 .collect(),
             scope_ids: std::iter::repeat_with(|| None)
-                .take(CONTEXT_ID_CACHE_ENTRIES)
+                .take(context_entries)
                 .collect(),
             attribute_pointer_ids: std::iter::repeat_with(|| None)
-                .take(ATTRIBUTE_ID_CACHE_ENTRIES)
+                .take(attribute_entries)
                 .collect(),
             attribute_ids: std::iter::repeat_with(|| None)
-                .take(ATTRIBUTE_ID_CACHE_ENTRIES)
+                .take(attribute_entries)
                 .collect(),
             refs: 0,
             dropped_postings: 0,
         }
+    }
+
+    pub(crate) const fn is_disabled(&self) -> bool {
+        !self.config.is_enabled()
     }
 
     /// Indexes one durable log without retaining its body or metadata values.
@@ -436,6 +455,9 @@ impl CorrelationIndex {
     }
 
     pub(super) fn tenant_id(&mut self, tenant: &str) -> Option<u32> {
+        if self.is_disabled() {
+            return None;
+        }
         if let Some(tenant_id) = self.tenants.get(tenant).copied() {
             return Some(tenant_id);
         }

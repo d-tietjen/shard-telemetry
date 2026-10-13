@@ -85,6 +85,34 @@ fn embedded_budget_builder_bounds_local_and_s3_managed_storage() {
 }
 
 #[test]
+fn ram_budgets_disable_retained_correlation_navigation_and_reject_overrides() {
+    let config = EmbeddedTelemetryConfig::bounded_local(
+        std::env::temp_dir().join("shard-telemetry-unused-correlation-budget"),
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        config.local_limits.correlations,
+        crate::CorrelationConfig::default()
+    );
+    for ram in [8 * 1024 * 1024, 64 * 1024 * 1024] {
+        let bounded = config.clone().with_max_ram_bytes(ram);
+        assert_eq!(
+            bounded.local_limits.correlations,
+            crate::CorrelationConfig::disabled()
+        );
+        bounded.validate().expect("RAM budget");
+        let mut override_limits = bounded.local_limits.clone();
+        override_limits.correlations = crate::CorrelationConfig::default();
+        assert!(
+            bounded
+                .with_local_limits(override_limits)
+                .validate()
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn direct_embedded_log_path_is_lifecycle_checked_and_avoids_the_native_listener() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -108,6 +136,8 @@ fn direct_embedded_log_path_is_lifecycle_checked_and_avoids_the_native_listener(
             indexed_ack_timeout: Duration::from_secs(30),
         }))
         .expect("runtime opens");
+    assert_eq!(runtime.telemetry_partition_count(), 1);
+    assert_eq!(runtime.maximum_append_bytes(), 1024 * 1024);
     let event = OtlpLogEvent {
         timestamp_unix_nanos: 42,
         message: Arc::from("embedded fast path"),

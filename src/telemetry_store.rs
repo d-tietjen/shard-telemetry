@@ -48,6 +48,8 @@ mod analytics_signals;
 mod append;
 mod append_helpers;
 #[cfg(test)]
+mod capacity_qualification;
+#[cfg(test)]
 mod correlation_qualification;
 mod loki;
 mod native_query;
@@ -272,6 +274,11 @@ pub struct DurableTelemetryConfig {
 pub struct DurableTelemetryLimits {
     /// Per-signal in-memory head and query limits.
     pub signals: crate::ShardTelemetryConfig,
+    /// Retained cross-signal navigation policy.
+    ///
+    /// [`crate::CorrelationConfig::disabled`] allocates no navigation postings
+    /// or identity caches; exact signal storage supplies correlation results.
+    pub correlations: crate::CorrelationConfig,
     /// Maximum bytes retained in each recovery index journal.
     pub max_index_journal_bytes: u64,
     /// Enables the local lifetime rollup with this distinct-series bound.
@@ -316,6 +323,7 @@ impl Default for DurableTelemetryLimits {
     fn default() -> Self {
         Self {
             signals: crate::ShardTelemetryConfig::default(),
+            correlations: crate::CorrelationConfig::default(),
             max_index_journal_bytes: 64 * 1024 * 1024 * 1024,
             max_lifetime_rollup_series: None,
             max_lifetime_rollup_bytes: 512 * 1024 * 1024,

@@ -87,6 +87,7 @@ impl EmbeddedTelemetryConfig {
     #[must_use]
     pub fn with_max_ram_bytes(mut self, max_bytes: u64) -> Self {
         self.max_ram_bytes = Some(max_bytes);
+        self.local_limits.correlations = crate::CorrelationConfig::disabled();
         let stripes = u64::from(
             self.store
                 .shard_count
@@ -260,6 +261,11 @@ impl EmbeddedTelemetryConfig {
             ));
         }
         if let Some(max_bytes) = self.max_ram_bytes {
+            if self.local_limits.correlations != crate::CorrelationConfig::disabled() {
+                return Err(LokiApiError::configuration(
+                    "bounded embedded RAM requires disabled retained correlation navigation",
+                ));
+            }
             let stripes = u64::from(
                 self.store
                     .shard_count

@@ -483,6 +483,12 @@ impl std::fmt::Display for LokiApiError {
 impl std::error::Error for LokiApiError {}
 
 impl LokiApiError {
+    /// Returns whether invalid input must be rejected without retrying it.
+    #[must_use]
+    pub fn is_bad_request(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST
+    }
+
     /// Creates a retryable storage/control-plane availability error for an
     /// embedded backend implementation.
     pub fn backend_unavailable(message: impl Into<String>) -> Self {

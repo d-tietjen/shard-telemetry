@@ -68,15 +68,7 @@ impl TelemetryEnvelope {
 
     /// Encodes the single pre-release `STEL` wire format.
     pub fn encode(&self) -> TelemetryResult<Vec<u8>> {
-        self.validate()?;
-        let total_len = ENVELOPE_HEADER_BYTES
-            .checked_add(self.tenant.len())
-            .and_then(|value| value.checked_add(self.routing_metadata.len()))
-            .and_then(|value| value.checked_add(self.payload.len()))
-            .ok_or(TelemetryError::TelemetryEnvelopeTooLarge)?;
-        if total_len > MAX_TELEMETRY_ENVELOPE_BYTES {
-            return Err(TelemetryError::TelemetryEnvelopeTooLarge);
-        }
+        let total_len = self.encoded_len()?;
         let mut encoded = Vec::with_capacity(total_len);
         encoded.resize(ENVELOPE_HEADER_BYTES, 0);
         encoded[..4].copy_from_slice(&ENVELOPE_MAGIC);
@@ -104,6 +96,20 @@ impl TelemetryEnvelope {
         let checksum = checksum(&encoded);
         encoded[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 32].copy_from_slice(checksum.as_bytes());
         Ok(encoded)
+    }
+
+    /// Returns the exact durable encoding size without allocating its bytes.
+    pub(crate) fn encoded_len(&self) -> TelemetryResult<usize> {
+        self.validate()?;
+        let total_len = ENVELOPE_HEADER_BYTES
+            .checked_add(self.tenant.len())
+            .and_then(|value| value.checked_add(self.routing_metadata.len()))
+            .and_then(|value| value.checked_add(self.payload.len()))
+            .ok_or(TelemetryError::TelemetryEnvelopeTooLarge)?;
+        if total_len > MAX_TELEMETRY_ENVELOPE_BYTES {
+            return Err(TelemetryError::TelemetryEnvelopeTooLarge);
+        }
+        Ok(total_len)
     }
 
     /// Decodes and verifies an `STEL` envelope before exposing any payload bytes.

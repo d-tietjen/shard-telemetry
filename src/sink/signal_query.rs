@@ -307,6 +307,19 @@ pub(super) fn query_correlation_stripe(
     stripe
         .correlations
         .query_into_with_retention(query, signal_cutoffs, &mut refs);
+    if stripe.correlations.is_disabled()
+        && query
+            .signal
+            .is_none_or(|signal| signal == TelemetrySignal::Logs)
+        && query
+            .end_time_unix_nanos
+            .is_none_or(|end| end >= signal_cutoffs[0])
+        && query
+            .after
+            .is_none_or(|after| after.signal <= TelemetrySignal::Logs)
+    {
+        query_typed_log_correlations(stripe, query, signal_cutoffs[0], &mut refs)?;
+    }
     if query
         .signal
         .is_none_or(|signal| signal == TelemetrySignal::Logs)
@@ -400,6 +413,9 @@ pub(super) fn query_correlation_stripe(
         {
             continue;
         }
+        if stripe.correlations.is_disabled() {
+            query_resident_native_correlations(stripe, query, signal, signal_cutoffs, &mut refs)?;
+        }
         let Some(state) = stripe.signal_tiers.get(&signal) else {
             continue;
         };
@@ -470,4 +486,132 @@ pub(super) fn query_correlation_stripe(
     }
     refs.truncate(query.limit);
     Ok(refs)
+}
+
+/// Scans bounded offset pages because typed identities must match before limit.
+fn query_typed_log_correlations(
+    stripe: &TelemetryStripeState,
+    query: &CorrelationQuery,
+    cutoff: u64,
+    refs: &mut Vec<TelemetryRecordRef>,
+) -> TelemetryResult<()> {
+    const RECORDS_PER_PAGE: usize = 64;
+    for partition in 0..stripe.log_partitions {
+        let partition = TopicPartition::new(
+            TelemetrySignal::Logs.topic_id(),
+            shard_stream_core::LogicalPartitionId::new(u32::from(partition)),
+        );
+        if query
+            .after
+            .is_some_and(|after| after.topic_partition > partition)
+        {
+            continue;
+        }
+        let mut log_query = LogQuery::new(partition)
+            .with_field("resource.loki.tenant", Arc::clone(&query.tenant))
+            .with_limit(RECORDS_PER_PAGE);
+        log_query.start_timestamp_unix_nanos =
+            Some(query.start_time_unix_nanos.unwrap_or(0).max(cutoff));
+        log_query.end_timestamp_unix_nanos =
+            query.end_time_unix_nanos.and_then(|end| end.checked_add(1));
+        if let Some(after) = query
+            .after
+            .filter(|after| after.topic_partition == partition)
+        {
+            let Some(next) = after.offset.get().checked_add(1) else {
+                continue;
+            };
+            log_query.start_offset = Some(shard_stream_core::LogicalOffset::new(next));
+        }
+        loop {
+            let page = stripe.logs.query_checked(&log_query)?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            let next = last.record.record_ref.offset.get().checked_add(1);
+            let saturated = page.len() == RECORDS_PER_PAGE;
+            for matched in page {
+                if log_matches_correlation(query, &matched.record) {
+                    refs.push(matched.record.record_ref);
+                    if refs.len() == query.limit {
+                        return Ok(());
+                    }
+                }
+            }
+            let Some(next) = next.filter(|_| saturated) else {
+                break;
+            };
+            log_query.start_offset = Some(shard_stream_core::LogicalOffset::new(next));
+        }
+    }
+    Ok(())
+}
+
+/// Native heads provide exact identities when optional navigation is disabled.
+fn query_resident_native_correlations(
+    stripe: &TelemetryStripeState,
+    query: &CorrelationQuery,
+    signal: TelemetrySignal,
+    cutoffs: [u64; 3],
+    refs: &mut Vec<TelemetryRecordRef>,
+) -> TelemetryResult<()> {
+    match signal {
+        TelemetrySignal::Traces => {
+            let native = TraceQuery {
+                tenant: Arc::clone(&query.tenant),
+                start_time_unix_nanos: Some(
+                    query.start_time_unix_nanos.unwrap_or(0).max(cutoffs[1]),
+                ),
+                end_time_unix_nanos: query.end_time_unix_nanos.and_then(|end| end.checked_add(1)),
+                limit: usize::MAX,
+                ..TraceQuery::default()
+            };
+            refs.extend(
+                stripe
+                    .traces
+                    .query(&native)?
+                    .into_iter()
+                    .filter(|span| {
+                        correlation_record_is_retained(
+                            signal,
+                            span.end_time_unix_nanos().unwrap_or(u64::MAX),
+                            cutoffs,
+                        ) && correlation_time_matches(query, span.start_time_unix_nanos)
+                            && span_matches_correlation(query, span)
+                    })
+                    .map(|span| span.record_ref),
+            );
+        }
+        TelemetrySignal::Metrics => {
+            let native = MetricQuery {
+                tenant: Arc::clone(&query.tenant),
+                start_time_unix_nanos: Some(
+                    query.start_time_unix_nanos.unwrap_or(0).max(cutoffs[2]),
+                ),
+                end_time_unix_nanos: query.end_time_unix_nanos,
+                limit: usize::MAX,
+                ..MetricQuery::default()
+            };
+            refs.extend(
+                stripe
+                    .metrics
+                    .query(&native)?
+                    .into_iter()
+                    .filter(|point| {
+                        correlation_record_is_retained(signal, point.timestamp_unix_nanos, cutoffs)
+                            && correlation_time_matches(query, point.timestamp_unix_nanos)
+                            && metric_matches_correlation(query, point)
+                    })
+                    .map(|point| point.record_ref),
+            );
+        }
+        TelemetrySignal::Logs => unreachable!("resident native loop contains traces and metrics"),
+    }
+    refs.sort_unstable();
+    refs.dedup();
+    if let Some(after) = query.after {
+        refs.retain(|record| *record > after);
+    }
+    refs.truncate(query.limit);
+    Ok(())
 }

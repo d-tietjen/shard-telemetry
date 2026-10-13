@@ -1,6 +1,10 @@
 use super::*;
 
 impl TelemetryService {
+    pub(crate) const fn maximum_ingest_bytes(&self) -> usize {
+        self.max_ingest_bytes
+    }
+
     /// Returns shared cold-tier cache occupancy and object-read counters.
     #[must_use]
     pub fn object_tier_cache_stats(&self) -> Option<ObjectTierCacheStats> {

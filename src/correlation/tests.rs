@@ -6,6 +6,38 @@ use crate::{
 };
 
 #[test]
+fn disabled_navigation_retains_no_allocated_postings_or_identity_caches() {
+    let mut index = CorrelationIndex::new(CorrelationConfig::disabled());
+    let partition = TopicPartition::new(LOGS_TOPIC_ID, LogicalPartitionId::new(0));
+    let log = DurableLog::new(
+        ShardId::new(0),
+        partition,
+        LogicalOffset::new(0),
+        42,
+        "body",
+        CompressionCohortId::new(1),
+    );
+    for tenant in ["tenant-a", "tenant-b"] {
+        index.index_log(tenant, &log);
+    }
+    assert!(index.is_disabled());
+    assert_eq!(index.stats(), CorrelationStats::default());
+    assert_eq!(index.tenants.capacity(), 0);
+    assert_eq!(index.postings.capacity(), 0);
+    assert_eq!(index.resource_pointer_ids.capacity(), 0);
+    assert_eq!(index.resource_ids.capacity(), 0);
+    assert_eq!(index.scope_pointer_ids.capacity(), 0);
+    assert_eq!(index.scope_ids.capacity(), 0);
+    assert_eq!(index.attribute_pointer_ids.capacity(), 0);
+    assert_eq!(index.attribute_ids.capacity(), 0);
+    assert!(
+        index
+            .query(&CorrelationQuery::new("tenant-a").with_resource_id(log.resource_id()))
+            .is_empty()
+    );
+}
+
+#[test]
 fn shared_typed_metadata_connects_signals_without_retaining_values() {
     let service = TelemetryAttribute::new(
         "service.name",

@@ -140,6 +140,22 @@ tier. Lifetime metric rollups keep their separate aggregate semantics.
 Correlation lookups enforce the requested tenant in both navigation indexes
 and cold log reads, including when tenants share a partition, trace ID, or label.
 
+An embedded RAM budget disables the optional retained correlation navigation
+postings and identity caches. Correlation lookups then match exact typed signal
+records in the resident indexes and object tier, including logs, span links and
+metric exemplars. This retains query results while trading additional lookup
+and decoding work for lower retained memory. Stores without a RAM budget keep
+the default navigation policy; `DurableTelemetryLimits.correlations` can select
+an explicit policy or disable navigation independently.
+
+Normalized in-process calls reject oversized input with `LokiApiError::is_bad_request()`
+before dispatching any partition or reserving a retry identity. Each exact encoded
+STEL envelope must fit the engine's append ceiling, and their combined bytes must
+fit `signals.max_otlp_request_bytes`. This normalized-data ceiling is separate
+from the original decompressed OTLP transport body. Store and embedded runtime
+`maximum_append_bytes()` expose the conservative single-envelope ceiling; native
+transport adapters must also enforce their own complete encoded-frame ceiling.
+
 Use `EmbeddedEvictionPolicy::OffloadToS3` instead of `Delete` to preserve full
 raw history. Publication is write-through: a group becomes authoritative in a
 dedicated S3 prefix before its payload and index are admitted to the bounded

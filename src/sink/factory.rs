@@ -223,6 +223,7 @@ impl TelemetrySinkFactory {
     #[must_use]
     pub fn service(&self) -> TelemetryService {
         TelemetryService {
+            max_ingest_bytes: self.config.signals.max_otlp_request_bytes,
             workers: Arc::clone(&self.query_workers),
             correlation_buffers: Arc::clone(&self.correlation_buffers),
             active_log_partition_cache: Arc::clone(&self.active_log_partition_cache),
