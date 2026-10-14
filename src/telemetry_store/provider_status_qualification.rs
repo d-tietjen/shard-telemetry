@@ -263,8 +263,10 @@ fn provider_status_keeps_applied_prefix_distinct_from_expired_query_data() {
         .expect("same store with finite retention after recovery");
     let retention = store
         .compact_retention()
-        .expect("configured policy expires payload and reclaims WAL");
-    assert_eq!(retention.retired_object_groups, 1);
+        .expect("configured policy expires query eligibility and reclaims WAL");
+    // The newest immutable group remains the durable recovery anchor even
+    // after its rows leave the configured query window.
+    assert_eq!(retention.retired_object_groups, 0);
     assert!(
         store
             .query_native(&query)
