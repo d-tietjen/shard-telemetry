@@ -156,6 +156,7 @@ impl TelemetrySinkFactory {
                 correlations: CorrelationIndex::new(config.correlations),
                 log_partitions: config.signals.logs.logical_partitions.get(),
                 signal_tiers,
+                indexed_publications: HashMap::new(),
                 router: TelemetryRouter::from_config(&config.signals),
                 native_query_work: config.native_query_work,
             };

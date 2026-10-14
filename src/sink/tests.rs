@@ -31,7 +31,7 @@ use crate::{
 
 use super::*;
 
-struct TempDir(PathBuf);
+pub(super) struct TempDir(pub(super) PathBuf);
 
 #[test]
 fn bounded_correlation_top_k_handles_late_earlier_offsets_in_real_groups() {
@@ -263,7 +263,7 @@ fn bounded_fanout_merge_sorts_only_the_selected_prefix() {
 }
 
 impl TempDir {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -337,7 +337,7 @@ fn payload() -> Vec<u8> {
         .expect("STEL encodes")
 }
 
-fn durable_append(
+pub(super) fn durable_append(
     topic_partition: TopicPartition,
     payload: Vec<u8>,
     batch: u128,

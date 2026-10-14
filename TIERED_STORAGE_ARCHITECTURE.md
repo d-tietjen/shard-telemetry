@@ -307,6 +307,16 @@ only after the new `CURRENT` generation is selected. On restart, catalog
 checkpoints skip already-published recovery transactions. Queries load a group
 index before payload and verify each selected frame checksum after range read.
 
+After a complete append boundary is indexed, a stripe retains its exact durable
+descriptors until required offload and checkpoint advancement succeed. A matching
+retry republishes the existing resident blocks without re-indexing the append;
+a changed descriptor at that boundary fails closed. This prevents a publication
+outage from repeatedly sealing trace spans after their bounded recent retry state
+has been evicted. The retained descriptors share the engine's pending payload
+buffers and are cleared after success. They are process-local retry state; restart
+continues to use the authoritative WAL and recovered catalog/journal checkpoints.
+The sink checkpoint does not advance early to acknowledge failed publication.
+
 The standalone binary ships both `LocalObjectStore` and the Rust-native
 `S3ObjectStore`. The public `TelemetryObjectStore` trait remains the integration
 point for other backends; adapters must preserve immutable create, bounded

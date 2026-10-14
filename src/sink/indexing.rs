@@ -35,23 +35,39 @@ pub(super) fn apply_durable_appends(
         return Ok(DurableSinkApply::CheckpointConflict(actual));
     }
 
-    if let Some(journal) = journal {
-        journal
-            .append(expected, appends, next)
-            .map_err(log_error_to_engine)?;
+    if let Some(indexed) = stripe.indexed_publications.get(&expected.topic_partition) {
+        if !indexed.matches(expected, appends, next) {
+            return Err(EngineError::DurableSinkCheckpoint(
+                "retry does not match the already indexed publication boundary".into(),
+            ));
+        }
+    } else {
+        if let Some(journal) = journal {
+            journal
+                .append(expected, appends, next)
+                .map_err(log_error_to_engine)?;
+        }
+        // StreamEngine validated this unchanged payload before delivery.
+        // Remember successful full indexing before any fallible offload:
+        // sealed payloads outlive evictable span retry state during an outage.
+        index_durable_appends(
+            stripe,
+            appends,
+            validated_signal_cache,
+            true,
+            expected,
+            next,
+        )
+        .map_err(log_error_to_engine)?;
+        stripe.indexed_publications.insert(
+            expected.topic_partition,
+            IndexedPublication {
+                expected,
+                next,
+                appends: appends.to_vec(),
+            },
+        );
     }
-    // StreamEngine calls the sink factory's validate_append before delivering
-    // live commands. The Bytes payload is then forwarded unchanged, so the
-    // indexer can retain its slice without repeating the envelope checksum.
-    index_durable_appends(
-        stripe,
-        appends,
-        validated_signal_cache,
-        true,
-        expected,
-        next,
-    )
-    .map_err(log_error_to_engine)?;
     stripe
         .logs
         .offload_indexed_groups(false)
@@ -69,6 +85,7 @@ pub(super) fn apply_durable_appends(
             EngineError::DurableSinkUnavailable("shard-telemetry checkpoint lock poisoned".into())
         })?
         .insert(next.topic_partition, next);
+    stripe.indexed_publications.remove(&next.topic_partition);
     Ok(DurableSinkApply::Applied)
 }
 

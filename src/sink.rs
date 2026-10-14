@@ -45,6 +45,8 @@ use crate::{
 mod factory;
 mod indexing;
 mod object_tier;
+#[cfg(test)]
+mod outage_qualification;
 mod service_logs;
 mod service_routing;
 mod service_signals;
@@ -458,8 +460,42 @@ struct TelemetryStripeState {
     correlations: CorrelationIndex,
     log_partitions: u16,
     signal_tiers: HashMap<TelemetrySignal, SignalTierState>,
+    indexed_publications: HashMap<TopicPartition, IndexedPublication>,
     router: TelemetryRouter,
     native_query_work: Option<crate::NativeQueryWorkLimits>,
+}
+
+/// One fully indexed boundary whose publication has not yet succeeded.
+/// Payloads share the engine's charged pending buffers rather than copying
+/// their bytes. A retry must match the complete original durable descriptors.
+#[derive(Debug)]
+struct IndexedPublication {
+    expected: DurableSinkCheckpoint,
+    next: DurableSinkCheckpoint,
+    appends: Vec<DurableAppend>,
+}
+
+impl IndexedPublication {
+    fn matches(
+        &self,
+        expected: DurableSinkCheckpoint,
+        appends: &[DurableAppend],
+        next: DurableSinkCheckpoint,
+    ) -> bool {
+        self.expected == expected
+            && self.next == next
+            && self.appends.len() == appends.len()
+            && self.appends.iter().zip(appends).all(|(previous, retry)| {
+                previous.event_id == retry.event_id
+                    && previous.physical_shard_id == retry.physical_shard_id
+                    && previous.reservation == retry.reservation
+                    && previous.producer_event_id == retry.producer_event_id
+                    && previous.atomic_group == retry.atomic_group
+                    && previous.delivery == retry.delivery
+                    && previous.payload == retry.payload
+                    && previous.transient_context == retry.transient_context
+            })
+    }
 }
 
 #[derive(Debug)]
