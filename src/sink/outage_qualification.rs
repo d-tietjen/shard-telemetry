@@ -98,6 +98,7 @@ fn trace_publication_outage_retries_keep_resident_bytes_and_checkpoint_stable() 
     let partition = TopicPartition::new(crate::TRACES_TOPIC_ID, LogicalPartitionId::new(0));
     let mut signals = ShardTelemetryConfig::default();
     signals.traces.logical_partitions = NonZeroU16::new(1).expect("one trace partition");
+    signals.traces.physical_stripes = NonZeroU16::new(1).expect("one trace owner");
     signals.traces.head_memory_bytes_per_stripe = 64 * 1024;
     let config = OtlpSinkConfig {
         signals,
