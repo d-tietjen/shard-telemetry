@@ -113,6 +113,24 @@ fn ram_budgets_disable_retained_correlation_navigation_and_reject_overrides() {
 }
 
 #[test]
+fn ram_budget_requires_an_immutable_tier_even_with_a_recovery_journal() {
+    let mut config = EmbeddedTelemetryConfig::bounded_local(
+        std::env::temp_dir().join("shard-telemetry-unused-no-tier-budget"),
+        Duration::from_secs(60),
+    );
+    config.store.object_store_directory = None;
+    config.store.recovery_journal = true;
+    config
+        .validate()
+        .expect("unbudgeted journal-only configuration remains supported");
+    let error = config
+        .with_max_ram_bytes(8 * 1024 * 1024)
+        .validate()
+        .expect_err("a journal cannot release sealed native payloads");
+    assert!(error.to_string().contains("immutable object tier"));
+}
+
+#[test]
 fn native_query_work_limits_scale_across_physical_owners_and_reject_unsafe_overrides() {
     for ram in [8 * 1024 * 1024, 64 * 1024 * 1024] {
         let mut config = EmbeddedTelemetryConfig::bounded_local(

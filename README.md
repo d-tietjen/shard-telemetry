@@ -174,6 +174,11 @@ behavior. An explicit work policy requires disabled retained correlation
 navigation. Additional scan latency, startup/publication state, allocator
 overhead and process memory still require operational qualification.
 
+`with_max_ram_bytes` requires a local or S3 immutable object tier. A recovery
+journal alone cannot release sealed trace and metric payloads from resident
+storage. Configurations that omit the RAM budget preserve their existing
+journal-only or memory-only choices.
+
 Normalized in-process calls reject oversized input with `LokiApiError::is_bad_request()`
 before dispatching any partition or reserving a retry identity. Each exact encoded
 STEL envelope must fit the engine's append ceiling, and their combined bytes must

@@ -84,6 +84,9 @@ impl EmbeddedTelemetryConfig {
     /// Two thirds is divided across log, trace, and metric heads on every
     /// physical stripe, one twelfth is reserved for compression dictionaries,
     /// and the remainder is divided across verified payload and control caches.
+    /// A local or S3 immutable object tier is required so sealed native payloads
+    /// can leave resident storage. Configurations without a RAM budget retain
+    /// their existing tier choices.
     #[must_use]
     pub fn with_max_ram_bytes(mut self, max_bytes: u64) -> Self {
         self.max_ram_bytes = Some(max_bytes);
@@ -277,6 +280,11 @@ impl EmbeddedTelemetryConfig {
             ));
         }
         if let Some(max_bytes) = self.max_ram_bytes {
+            if self.store.object_store_directory.is_none() && self.store.s3_object_store.is_none() {
+                return Err(LokiApiError::configuration(
+                    "bounded embedded RAM requires a local or S3 immutable object tier",
+                ));
+            }
             if self.local_limits.correlations != crate::CorrelationConfig::disabled() {
                 return Err(LokiApiError::configuration(
                     "bounded embedded RAM requires disabled retained correlation navigation",
