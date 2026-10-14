@@ -211,7 +211,7 @@ fn bounded_native_queries_scan_many_groups_with_exact_types_cursors_and_restart(
             after.payload.hits + after.payload.misses > before.payload.hits + before.payload.misses
         );
         assert!(
-            after.payload.source_bytes > 2_048,
+            after.payload.used_bytes > 2_048,
             "a corpus larger than one-block ceiling remains queryable"
         );
         drop(recovered);
