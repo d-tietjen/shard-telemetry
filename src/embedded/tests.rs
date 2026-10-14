@@ -36,6 +36,36 @@ fn embedded_budget_builder_bounds_local_and_s3_managed_storage() {
             .is_some()
     );
     assert_eq!(local.object_tier.retirement_grace, Duration::ZERO);
+    for ram_first in [true, false] {
+        let config = EmbeddedTelemetryConfig::bounded_local(
+            std::env::temp_dir().join("shard-telemetry-unused-small-ssd-config"),
+            Duration::from_secs(60),
+        );
+        let small_ssd = if ram_first {
+            config
+                .with_max_ram_bytes(64 * 1024 * 1024)
+                .with_max_ssd_bytes(1024 * 1024)
+        } else {
+            config
+                .with_max_ssd_bytes(1024 * 1024)
+                .with_max_ram_bytes(64 * 1024 * 1024)
+        };
+        small_ssd
+            .validate()
+            .expect("either builder order clamps to the smaller group allowance");
+        let resident = small_ssd
+            .local_limits
+            .native_resident
+            .expect("resident policy");
+        assert!(
+            resident.max_payload_bytes_per_partition
+                <= small_ssd.object_tier.max_group_payload_bytes
+        );
+        assert!(
+            resident.append_work.max_encoded_block_bytes as u64
+                <= resident.publication_target_bytes()
+        );
+    }
 
     let archived = EmbeddedTelemetryConfig::bounded(
         std::env::temp_dir().join("shard-telemetry-unused-s3-budget-config"),
@@ -167,6 +197,42 @@ fn native_query_work_limits_scale_across_physical_owners_and_reject_unsafe_overr
                 "{kind}"
             );
         }
+    }
+}
+
+#[test]
+fn native_resident_policy_cannot_be_removed_or_enlarged_after_ram_configuration() {
+    let mut config = EmbeddedTelemetryConfig::bounded_local(
+        std::env::temp_dir().join("shard-telemetry-unused-resident-budget"),
+        Duration::from_secs(60),
+    );
+    assert!(config.local_limits.native_resident.is_none());
+    config.store.tenant_partitions = 256;
+    let bounded = config.with_max_ram_bytes(64 * 1024 * 1024);
+    bounded
+        .validate()
+        .expect("partition and owner reserves fit");
+    for kind in ["missing", "partition", "decoded", "encoded"] {
+        let mut limits = bounded.local_limits.clone();
+        if kind == "missing" {
+            limits.native_resident = None;
+        } else {
+            let resident = limits.native_resident.as_mut().expect("resident limits");
+            match kind {
+                "partition" => resident.max_payload_bytes_per_partition += 1,
+                "decoded" => resident.append_work.max_winner_bytes += 1,
+                "encoded" => resident.append_work.max_encoded_block_bytes += 1,
+                _ => unreachable!(),
+            }
+        }
+        assert!(
+            bounded
+                .clone()
+                .with_local_limits(limits)
+                .validate()
+                .is_err(),
+            "{kind}"
+        );
     }
 }
 

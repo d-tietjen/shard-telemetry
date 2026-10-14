@@ -125,6 +125,10 @@ impl QueryWorkBudget {
         Self { limits, bytes: 0 }
     }
 
+    pub(crate) const fn used_bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub(crate) fn replace<T: serde::Serialize>(
         &mut self,
         previous: Option<&T>,

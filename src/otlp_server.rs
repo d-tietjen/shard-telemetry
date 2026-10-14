@@ -103,9 +103,12 @@ impl OtlpIngestService {
     /// Creates a transport-independent OTLP ingestion service.
     pub fn new(
         store: Arc<DurableTelemetryStore>,
-        config: OtlpReceiverConfig,
+        mut config: OtlpReceiverConfig,
     ) -> TelemetryResult<Self> {
         config.validate()?;
+        if let Some(maximum) = store.bounded_ingest_bytes() {
+            config.max_request_bytes = config.max_request_bytes.min(maximum);
+        }
         let router = TelemetryRouter::from_config(&config.signals);
         Ok(Self {
             store,
@@ -625,22 +628,32 @@ pub async fn serve_otlp_grpc<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let maximum = service
+        .store
+        .bounded_ingest_bytes()
+        .map(|_| service.config.max_request_bytes);
+    let logs = LogsServiceServer::new(service.clone())
+        .accept_compressed(CompressionEncoding::Gzip)
+        .send_compressed(CompressionEncoding::Gzip);
+    let traces = TraceServiceServer::new(service.clone())
+        .accept_compressed(CompressionEncoding::Gzip)
+        .send_compressed(CompressionEncoding::Gzip);
+    let metrics = MetricsServiceServer::new(service)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .send_compressed(CompressionEncoding::Gzip);
+    let (logs, traces, metrics) = if let Some(maximum) = maximum {
+        (
+            logs.max_decoding_message_size(maximum),
+            traces.max_decoding_message_size(maximum),
+            metrics.max_decoding_message_size(maximum),
+        )
+    } else {
+        (logs, traces, metrics)
+    };
     tonic::transport::Server::builder()
-        .add_service(
-            LogsServiceServer::new(service.clone())
-                .accept_compressed(CompressionEncoding::Gzip)
-                .send_compressed(CompressionEncoding::Gzip),
-        )
-        .add_service(
-            TraceServiceServer::new(service.clone())
-                .accept_compressed(CompressionEncoding::Gzip)
-                .send_compressed(CompressionEncoding::Gzip),
-        )
-        .add_service(
-            MetricsServiceServer::new(service)
-                .accept_compressed(CompressionEncoding::Gzip)
-                .send_compressed(CompressionEncoding::Gzip),
-        )
+        .add_service(logs)
+        .add_service(traces)
+        .add_service(metrics)
         .serve_with_shutdown(address, shutdown)
         .await
 }
@@ -778,6 +791,80 @@ mod tests {
         let decoded = decode_http_body(&headers, &body, body.len()).expect("body is within limit");
         assert!(matches!(decoded, std::borrow::Cow::Borrowed(_)));
         assert_eq!(decoded.as_ref(), body);
+    }
+
+    #[tokio::test]
+    async fn bounded_store_clamps_raw_otlp_before_decode_despite_receiver_override() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-otlp-resident-{}-{nonce}",
+            std::process::id()
+        ));
+        let mut config =
+            crate::EmbeddedTelemetryConfig::bounded_local(&directory, Duration::from_secs(3_600));
+        config.store.tenant_partitions = 256;
+        config = config.with_max_ram_bytes(64 * 1024 * 1024);
+        let store = Arc::new(
+            DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+                config.store,
+                config.object_tier,
+                config.local_limits,
+            )
+            .expect("real bounded store"),
+        );
+        let maximum = store.maximum_append_bytes();
+        let service = OtlpIngestService::new(
+            store.clone(),
+            OtlpReceiverConfig {
+                max_request_bytes: 64 * 1024 * 1024,
+                ..OtlpReceiverConfig::default()
+            },
+        )
+        .expect("receiver override is clamped");
+        assert_eq!(service.config.max_request_bytes, maximum);
+        let app = otlp_http_router(service.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/v1/metrics")
+                    .header(header::CONTENT_TYPE, "application/x-protobuf")
+                    .body(Body::from(vec![0xff; maximum + 1]))
+                    .expect("oversized malformed body"),
+            )
+            .await
+            .expect("body limit response");
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "raw input fails before protobuf decoding"
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/v1/metrics")
+                    .header(header::CONTENT_TYPE, "application/x-protobuf")
+                    .body(Body::empty())
+                    .expect("valid later request"),
+            )
+            .await
+            .expect("empty export");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            store
+                .query_metrics(&MetricQuery {
+                    tenant: Arc::from("default"),
+                    ..Default::default()
+                })
+                .expect("no records admitted")
+                .is_empty()
+        );
+        drop(app);
+        drop(service);
+        drop(store);
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -11,6 +11,7 @@ impl TraceStripe {
         Ok(Self {
             head_budget_bytes,
             query_work_limits: None,
+            resident_payload_limit: None,
             head_bytes: 0,
             idle_nanos: DEFAULT_TRACE_IDLE_NANOS,
             late_grace_nanos: DEFAULT_LATE_TRACE_NANOS,
@@ -357,6 +358,55 @@ impl TraceStripe {
         now_nanos: u64,
     ) -> TelemetryResult<Vec<Vec<u8>>> {
         ready.sort_unstable();
+        if let Some(limit) = self.resident_payload_limit {
+            // Probe exactly the same source-byte grouping before removing any
+            // heads or updating recent state. Capacity rejection preserves data.
+            let mut by_partition = BTreeMap::<TopicPartition, Vec<&HotTrace>>::new();
+            for key in &ready {
+                if let Some(trace) = self.traces.get(key)
+                    && let Some(span) = trace.spans.values().next()
+                {
+                    by_partition
+                        .entry(span.record_ref.topic_partition)
+                        .or_default()
+                        .push(trace);
+                }
+            }
+            for (partition, traces) in by_partition {
+                let mut retained = self
+                    .pending_blocks
+                    .iter()
+                    .filter(|block| block.topic_partition == partition)
+                    .fold(0_u64, |total, block| {
+                        total.saturating_add(u64::try_from(block.payload.len()).unwrap_or(u64::MAX))
+                    });
+                let mut group = Vec::new();
+                let mut group_bytes = 0_usize;
+                for trace in traces {
+                    if !group.is_empty()
+                        && group_bytes.saturating_add(trace.bytes) > TARGET_TRACE_BLOCK_SOURCE_BYTES
+                    {
+                        retained = retained.saturating_add(
+                            u64::try_from(encode_trace_block(&group)?.len()).unwrap_or(u64::MAX),
+                        );
+                        group.clear();
+                        group_bytes = 0;
+                    }
+                    group.extend(trace.spans.values().cloned());
+                    group_bytes = group_bytes.saturating_add(trace.bytes);
+                }
+                if !group.is_empty() {
+                    retained = retained.saturating_add(
+                        u64::try_from(encode_trace_block(&group)?.len()).unwrap_or(u64::MAX),
+                    );
+                }
+                if retained > limit {
+                    return Err(TelemetryError::InvalidConfig(
+                        "sealed trace payload capacity exhausted",
+                    ));
+                }
+            }
+        }
         let mut by_partition = BTreeMap::<TopicPartition, Vec<PreparedTrace>>::new();
         for key in ready {
             let trace = self.traces.remove(&key).expect("selected trace exists");
@@ -499,6 +549,25 @@ impl TraceStripe {
             .values()
             .map(|payload| u64::try_from(payload.len()).unwrap_or(u64::MAX))
             .sum()
+    }
+
+    pub(crate) fn set_resident_payload_limit(&mut self, limit: Option<u64>) {
+        self.resident_payload_limit = limit;
+    }
+
+    pub(crate) fn partition_append_time(&self, partition: TopicPartition) -> u64 {
+        self.traces
+            .values()
+            .filter(|trace| {
+                trace
+                    .spans
+                    .values()
+                    .next()
+                    .is_some_and(|span| span.record_ref.topic_partition == partition)
+            })
+            .map(|trace| trace.last_append_nanos)
+            .max()
+            .unwrap_or(0)
     }
 
     pub(super) fn analytical_resource_candidates(

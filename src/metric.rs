@@ -404,6 +404,7 @@ struct SeriesHead {
 pub struct MetricStripe {
     head_budget_bytes: usize,
     query_work_limits: Option<crate::NativeQueryWorkLimits>,
+    resident_payload_limit: Option<u64>,
     head_bytes: usize,
     out_of_order_nanos: u64,
     chunk_bytes: usize,

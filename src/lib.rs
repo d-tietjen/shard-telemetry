@@ -40,6 +40,7 @@ mod query_index;
 mod query_work;
 mod realtime_dictionary;
 mod remote_write;
+mod resident;
 mod rollup;
 mod s3_object_store;
 mod signal_ingest;
@@ -143,6 +144,7 @@ pub use remote_write::{
     DecodedRemoteWrite, METRIC_FLAG_STALE, PROMETHEUS_STALE_NAN_BITS, RemoteWriteDecoder,
     RemoteWriteStats, RemoteWriteVersion,
 };
+pub use resident::NativeResidentLimits;
 pub use rollup::LifetimeMetricRollup;
 pub use s3_object_store::{S3ObjectStore, S3ObjectStoreConfig};
 pub use signal_ingest::{

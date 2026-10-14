@@ -282,6 +282,8 @@ pub struct DurableTelemetryLimits {
     /// Optional per-owner native-query input, decoding and winner ceilings.
     /// Exhaustion returns an error, never an incomplete successful result.
     pub native_query_work: Option<crate::NativeQueryWorkLimits>,
+    /// Optional resident native payload and pre-WAL append ceilings.
+    pub native_resident: Option<crate::NativeResidentLimits>,
     /// Maximum bytes retained in each recovery index journal.
     pub max_index_journal_bytes: u64,
     /// Enables the local lifetime rollup with this distinct-series bound.
@@ -328,6 +330,7 @@ impl Default for DurableTelemetryLimits {
             signals: crate::ShardTelemetryConfig::default(),
             correlations: crate::CorrelationConfig::default(),
             native_query_work: None,
+            native_resident: None,
             max_index_journal_bytes: 64 * 1024 * 1024 * 1024,
             max_lifetime_rollup_series: None,
             max_lifetime_rollup_bytes: 512 * 1024 * 1024,

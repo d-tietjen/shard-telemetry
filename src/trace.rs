@@ -368,6 +368,7 @@ pub enum TraceApplyOutcome {
 pub struct TraceStripe {
     head_budget_bytes: usize,
     query_work_limits: Option<crate::NativeQueryWorkLimits>,
+    resident_payload_limit: Option<u64>,
     head_bytes: usize,
     idle_nanos: u64,
     late_grace_nanos: u64,

@@ -161,6 +161,13 @@ pub(super) fn index_payload(
     };
     match envelope.signal {
         TelemetrySignal::Logs => {
+            if let Some(resident) = stripe.native_resident {
+                crate::ingest_pack::validate_ingest_pack_with_work_limits(
+                    envelope.payload,
+                    envelope.item_count,
+                    Some(resident.append_work),
+                )?;
+            }
             // `decode_indexed_ingest_frames` validates every compressed group
             // before publishing its frame metadata. Repeating that checksum
             // scan here only burns CPU on the live path; the same validation
@@ -182,7 +189,17 @@ pub(super) fn index_payload(
         TelemetrySignal::Traces => {
             let records = match cached_signal {
                 Some(ValidatedSignalPayload::Traces(records)) => records,
-                _ => decode_trace_block(envelope.payload)?,
+                _ => {
+                    if let Some(resident) = stripe.native_resident {
+                        crate::trace::decode_trace_block_with_work_limits(
+                            envelope.payload,
+                            None,
+                            Some(resident.append_work),
+                        )?
+                    } else {
+                        decode_trace_block(envelope.payload)?
+                    }
+                }
             };
             validate_relative_offsets(
                 records.iter().map(|record| record.record_ref.offset),
@@ -224,7 +241,16 @@ pub(super) fn index_payload(
             let protocol = MetricIngestProtocol::from_wire(envelope.routing_metadata[4])?;
             let records = match cached_signal {
                 Some(ValidatedSignalPayload::Metrics(records)) => records,
-                _ => decode_metric_chunk(envelope.payload)?,
+                _ => {
+                    if let Some(resident) = stripe.native_resident {
+                        crate::metric::decode_metric_chunk_with_work_limits(
+                            envelope.payload,
+                            Some(resident.append_work),
+                        )?
+                    } else {
+                        decode_metric_chunk(envelope.payload)?
+                    }
+                }
             };
             validate_relative_offsets(
                 records.iter().map(|record| record.record_ref.offset),

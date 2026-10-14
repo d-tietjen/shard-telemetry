@@ -19,6 +19,24 @@ pub(super) fn offload_signal_partition(
     if !state.tiers.contains_key(&partition) {
         return Ok(0);
     }
+    if stripe.native_resident.is_some() {
+        // A bounded native boundary never leaves an older mutable head to
+        // spill into a later admitted append's sealed payload allowance.
+        match signal {
+            TelemetrySignal::Traces => {
+                let append_time = stripe.traces.partition_append_time(partition);
+                stripe.traces.seal_partition(partition, append_time)?;
+            }
+            TelemetrySignal::Metrics => stripe.metrics.seal_partition(partition)?,
+            TelemetrySignal::Logs => unreachable!("signal was selected above"),
+        }
+    }
+    let state = stripe
+        .signal_tiers
+        .get(&signal)
+        .ok_or(TelemetryError::InvalidConfig(
+            "native signal tier disappeared",
+        ))?;
     let pending = match signal {
         TelemetrySignal::Traces => stripe.traces.pending_partition(partition),
         TelemetrySignal::Metrics => stripe.metrics.pending_partition(partition),

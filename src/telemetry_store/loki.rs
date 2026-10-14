@@ -108,6 +108,10 @@ impl DurableTelemetryStore {
 }
 
 impl LokiStore for DurableTelemetryStore {
+    fn maximum_ingest_request_bytes(&self) -> Option<usize> {
+        self.bounded_ingest_bytes()
+    }
+
     fn push(&self, tenant: &str, entries: Vec<LokiEntry>) -> Result<(), LokiApiError> {
         if entries.is_empty() {
             return Ok(());

@@ -117,6 +117,8 @@ pub struct OtlpSinkConfig {
     pub correlations: CorrelationConfig,
     /// Optional native query working-set ceilings on each owner.
     pub native_query_work: Option<crate::NativeQueryWorkLimits>,
+    /// Optional per-partition resident payload and append-admission ceilings.
+    pub native_resident: Option<crate::NativeResidentLimits>,
     /// Number of durable append batches waiting to be indexed per shard.
     pub queue_slots: usize,
     /// Directory containing crash-safe stripe-local sink journals.
@@ -140,6 +142,7 @@ impl Default for OtlpSinkConfig {
             signals: ShardTelemetryConfig::default(),
             correlations: CorrelationConfig::default(),
             native_query_work: None,
+            native_resident: None,
             queue_slots: 256,
             state_directory: None,
             max_journal_bytes: 64 * 1024 * 1024 * 1024,
@@ -152,6 +155,48 @@ impl Default for OtlpSinkConfig {
 impl OtlpSinkConfig {
     fn validate(&self) -> TelemetryResult<()> {
         self.signals.validate()?;
+        if let Some(resident) = self.native_resident {
+            resident.validate()?;
+            let tier = self
+                .object_tier
+                .as_ref()
+                .ok_or(TelemetryError::InvalidConfig(
+                    "native resident limits require an immutable tier",
+                ))?;
+            if tier.tier.max_group_payload_bytes < resident.max_payload_bytes_per_partition
+                || resident.append_work.max_winner_bytes
+                    > self
+                        .signals
+                        .traces
+                        .head_memory_bytes_per_stripe
+                        .min(self.signals.metrics.head_memory_bytes_per_stripe)
+            {
+                return Err(TelemetryError::InvalidConfig(
+                    "native resident append allowance exceeds group or head capacity",
+                ));
+            }
+            for (signal, count) in [
+                (
+                    TelemetrySignal::Traces,
+                    self.signals.traces.logical_partitions.get(),
+                ),
+                (
+                    TelemetrySignal::Metrics,
+                    self.signals.metrics.logical_partitions.get(),
+                ),
+            ] {
+                for id in 0..count {
+                    if !tier.partitions.contains(&TopicPartition::new(
+                        signal.topic_id(),
+                        shard_stream_core::LogicalPartitionId::new(u32::from(id)),
+                    )) {
+                        return Err(TelemetryError::InvalidConfig(
+                            "native resident policy requires every admitted signal partition to have a tier",
+                        ));
+                    }
+                }
+            }
+        }
         if let Some(limits) = self.native_query_work {
             limits.validate()?;
             if self.correlations != CorrelationConfig::disabled() {
@@ -249,6 +294,7 @@ pub struct TelemetrySinkFactory {
     correlation_buffers: Arc<Mutex<CorrelationBufferPool>>,
     active_log_partition_cache: Arc<Mutex<HashMap<Arc<str>, Vec<TopicPartition>>>>,
     validated_signal_cache: Arc<ValidatedSignalCache>,
+    native_validation: Mutex<()>,
     tier_caches: Option<TierCaches>,
     object_store: Option<SharedTelemetryObjectStore>,
 }
@@ -341,17 +387,20 @@ struct ValidatedSignalCacheShard {
     entries: HashMap<[u8; 32], (usize, ValidatedSignalPayload)>,
     order: VecDeque<[u8; 32]>,
     bytes: usize,
+    max_bytes: Option<usize>,
 }
 
 impl ValidatedSignalCacheShard {
     fn insert(&mut self, key: [u8; 32], payload_bytes: usize, payload: ValidatedSignalPayload) {
-        if payload_bytes > MAX_VALIDATED_SIGNAL_CACHE_BYTES_PER_SHARD {
+        let maximum = self
+            .max_bytes
+            .unwrap_or(MAX_VALIDATED_SIGNAL_CACHE_BYTES_PER_SHARD);
+        if payload_bytes > maximum {
             return;
         }
         self.remove(key);
         while (self.entries.len() >= MAX_VALIDATED_SIGNAL_CACHE_ENTRIES_PER_SHARD
-            || self.bytes.saturating_add(payload_bytes)
-                > MAX_VALIDATED_SIGNAL_CACHE_BYTES_PER_SHARD)
+            || self.bytes.saturating_add(payload_bytes) > maximum)
             && !self.entries.is_empty()
         {
             let Some(oldest) = self.order.pop_front() else {
@@ -401,6 +450,18 @@ impl Default for ValidatedSignalCache {
 }
 
 impl ValidatedSignalCache {
+    fn bounded(max_bytes: usize) -> Self {
+        Self {
+            shards: (0..VALIDATED_SIGNAL_CACHE_SHARDS)
+                .map(|_| {
+                    Mutex::new(ValidatedSignalCacheShard {
+                        max_bytes: Some(max_bytes / VALIDATED_SIGNAL_CACHE_SHARDS),
+                        ..Default::default()
+                    })
+                })
+                .collect(),
+        }
+    }
     fn shard(&self, key: [u8; 32]) -> &Mutex<ValidatedSignalCacheShard> {
         let shard =
             usize::from(u16::from_le_bytes([key[0], key[1]])) % VALIDATED_SIGNAL_CACHE_SHARDS;
@@ -463,6 +524,7 @@ struct TelemetryStripeState {
     indexed_publications: HashMap<TopicPartition, IndexedPublication>,
     router: TelemetryRouter,
     native_query_work: Option<crate::NativeQueryWorkLimits>,
+    native_resident: Option<crate::NativeResidentLimits>,
 }
 
 /// One fully indexed boundary whose publication has not yet succeeded.
@@ -787,4 +849,5 @@ pub struct TelemetryService {
     router: TelemetryRouter,
     max_ingest_bytes: usize,
     native_query_work: Option<crate::NativeQueryWorkLimits>,
+    native_resident: Option<crate::NativeResidentLimits>,
 }

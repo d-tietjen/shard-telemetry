@@ -165,6 +165,12 @@ pub struct LokiQueryResult {
 
 /// Storage contract used by the Loki-compatible protocol boundary.
 pub trait LokiStore: Send + Sync + std::fmt::Debug {
+    /// Optional raw protocol request ceiling for a bounded native backend.
+    /// Reference/unbudgeted stores retain the caller's existing API policy.
+    fn maximum_ingest_request_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Atomically accepts one normalized push for a tenant.
     fn push(&self, tenant: &str, entries: Vec<LokiEntry>) -> Result<(), LokiApiError>;
 

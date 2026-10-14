@@ -13,6 +13,12 @@ impl DurableTelemetryStore {
             .min(self.service.maximum_ingest_bytes())
     }
 
+    pub(crate) fn bounded_ingest_bytes(&self) -> Option<usize> {
+        self.service
+            .bounded_ingest_bytes()
+            .map(|_| self.maximum_append_bytes())
+    }
+
     /// Returns the common logical partition count used by this local store.
     #[must_use]
     pub const fn telemetry_partition_count(&self) -> u32 {
@@ -227,6 +233,7 @@ impl DurableTelemetryStore {
             signals,
             correlations: limits.correlations,
             native_query_work: limits.native_query_work,
+            native_resident: limits.native_resident,
             state_directory: config
                 .recovery_journal
                 .then(|| config.data_directory.join("index-journal")),

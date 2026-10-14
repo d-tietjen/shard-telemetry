@@ -179,11 +179,39 @@ journal alone cannot release sealed trace and metric payloads from resident
 storage. Configurations that omit the RAM budget preserve their existing
 journal-only or memory-only choices.
 
+RAM-budget mode supplies `DurableTelemetryLimits.native_resident` as well.
+For allowance `R` and the sum `N` of logical trace and metric partitions,
+`NativeResidentLimits` reserves `R/4` for sealed payloads: each uniquely owned
+partition has ceiling `G = R/(4*N)`. The native publication target and encoded
+append ceiling are at most `G/4`; later group/request overrides cannot enlarge
+these effective ceilings. Each completed bounded append seals its partition
+before evaluating the publication threshold. Actual encoded sealing checks
+the ceiling before removing heads. A failed publication keeps its indexed
+boundary for an identical retry, so retries do not add another sealed copy.
+Other partitions have independent finite allowances.
+
+Decoded append work is derived from `R/(16*physical_owners)` and capped by the
+native head allowances. Record counts, declared decompressed sidecars and log
+structural bytes, and cumulative serialized record/header charges are checked
+before WAL admission. This owner allowance lets ordinary multi-source metric
+metadata use more than a tiny fraction of one logical partition's encoded
+allowance; compressed expansion that exceeds it fails admission. The builder
+reserves separate preflight, owner decode and decoded validation-cache charges,
+in addition to query work and queues, before allocating heads/dictionaries/caches.
+These are finite declared encoded/materialization charges. Allocator/RSS,
+startup metadata and transport concurrency still require measured qualification.
+Unbudgeted configurations retain their existing append, sealing and group policy.
+Enabling a resident policy does not rewrite existing WAL or immutable blocks.
+An over-budget persisted input fails closed when bounded reopen/replay or query
+decoding reads it; existing data must be qualified against the new ceilings.
+
 Normalized in-process calls reject oversized input with `LokiApiError::is_bad_request()`
 before dispatching any partition or reserving a retry identity. Each exact encoded
 STEL envelope must fit the engine's append ceiling, and their combined bytes must
 fit `signals.max_otlp_request_bytes`. This normalized-data ceiling is separate
-from the original decompressed OTLP transport body. Store and embedded runtime
+from the original decompressed OTLP transport body. With a resident policy,
+HTTP body/gzip limits and OTLP/gRPC decoding also clamp to the effective native
+input ceiling before protocol decoding. Store and embedded runtime
 `maximum_append_bytes()` expose the conservative single-envelope ceiling; native
 transport adapters must also enforce their own complete encoded-frame ceiling.
 

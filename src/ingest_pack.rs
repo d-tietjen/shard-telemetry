@@ -280,9 +280,26 @@ pub(crate) fn validate_ingest_pack(
     payload: &[u8],
     expected_record_count: u32,
 ) -> TelemetryResult<()> {
+    validate_ingest_pack_with_work_limits(payload, expected_record_count, None)
+}
+
+pub(crate) fn validate_ingest_pack_with_work_limits(
+    payload: &[u8],
+    expected_record_count: u32,
+    limits: Option<crate::NativeQueryWorkLimits>,
+) -> TelemetryResult<()> {
+    if let Some(limits) = limits {
+        limits.encoded(payload.len())?;
+        limits.rows(expected_record_count as usize)?;
+    }
     let mut cursor = IngestPackCursor::new(payload, expected_record_count)?;
+    let mut structural_bytes = 0_usize;
     for _ in 0..cursor.group_count {
         let group = cursor.next_group()?;
+        if let Some(limits) = limits {
+            structural_bytes = structural_bytes.saturating_add(group.structural_bytes);
+            limits.metric_values(structural_bytes)?;
+        }
         validate_group(&group)?;
     }
     cursor.finish()

@@ -18,6 +18,172 @@ use crate::{
 };
 
 #[test]
+fn bounded_resident_input_keeps_metadata_and_rejects_expansion_before_wal() {
+    let now = unix_nanos_now();
+    let directory = std::env::temp_dir().join(format!(
+        "shard-telemetry-resident-admission-{}-{now}",
+        std::process::id()
+    ));
+    let mut bounded =
+        EmbeddedTelemetryConfig::bounded_local(&directory, Duration::from_secs(3_600));
+    bounded.store.shard_count = 1;
+    bounded.store.tenant_partitions = 256;
+    bounded = bounded.with_max_ram_bytes(64 * 1024 * 1024);
+    let resident = bounded
+        .local_limits
+        .native_resident
+        .expect("resident policy");
+    assert_eq!(resident.max_payload_bytes_per_partition, 32 * 1024);
+    assert!(resident.append_work.max_winner_bytes > 2 * 1024);
+    bounded.local_limits.signals.max_otlp_request_bytes = 64 * 1024 * 1024;
+    let store = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+        bounded.store,
+        bounded.object_tier,
+        bounded.local_limits,
+    )
+    .expect("real bounded store with later raw-limit override");
+    assert_eq!(
+        store.maximum_append_bytes(),
+        resident.append_work.max_encoded_block_bytes
+    );
+    let trace = TraceId::from_bytes([73; 16]).expect("trace");
+    let mut point = navigation_metric(
+        "tenant-a",
+        now,
+        trace,
+        &TelemetryAttribute::new("typed", TelemetryValue::Integer(1)),
+        &Arc::new(ResourceContext::default()),
+        &Arc::new(ScopeContext::default()),
+    );
+    // A multi-source metadata payload larger than the old proposed 2-KiB
+    // decoded ceiling must survive the real native codec and storage path.
+    let coverage = (0..10)
+        .map(|index| {
+            serde_json::json!({
+                "source": index, "digest": format!("{index:064x}"),
+                "dimensions": "synthetic coverage dimension ".repeat(12),
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_string(&coverage).expect("coverage metadata");
+    assert!(payload.len() > 2 * 1024);
+    point.metadata = Arc::new(vec![TelemetryAttribute::new(
+        "fixture.coverage",
+        TelemetryValue::String(Arc::from(payload.as_str())),
+    )]);
+    let partition = store
+        .telemetry_router
+        .metric(&point.identity.tenant, point.series_fingerprint());
+    let first = store
+        .append_metric_points(vec![point.clone()], true)
+        .expect("ordinary metadata remains usable");
+    let query = crate::MetricQuery {
+        tenant: Arc::from("tenant-a"),
+        limit: 10,
+        ..Default::default()
+    };
+    let observed = store
+        .query_metrics(&query)
+        .expect("query accepted metadata");
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].metadata, point.metadata);
+    let before = store
+        .fetch_telemetry_batches(partition, LogicalOffset::new(0), 1024 * 1024)
+        .expect("original WAL");
+    let mut expanded = point.clone();
+    expanded.timestamp_unix_nanos += 1;
+    expanded.metadata = Arc::new(vec![TelemetryAttribute::new(
+        "fixture.coverage",
+        TelemetryValue::String(Arc::from(
+            "a".repeat(resident.append_work.max_decoded_sidecar_bytes + 1024),
+        )),
+    )]);
+    let event = crate::OtlpMetricEvent::from_durable(expanded).expect("valid expanded source");
+    let envelope =
+        crate::prepare_metric_envelope(partition, vec![event]).expect("actual expanded envelope");
+    assert!(
+        envelope.encode().expect("encoded expansion").len() < store.maximum_append_bytes(),
+        "fixture must test decompression/materialization rather than encoded size"
+    );
+    let batch = crate::NativeTelemetryBatch {
+        partitions: vec![crate::NativePartitionAppend {
+            topic_partition: partition,
+            envelope,
+            transient_context: None,
+        }],
+    };
+    assert!(
+        store
+            .append_telemetry_batch(&batch, true)
+            .expect_err("expanded native input fails before WAL")
+            .is_bad_request()
+    );
+    let after = store
+        .fetch_telemetry_batches(partition, LogicalOffset::new(0), 1024 * 1024)
+        .expect("unchanged WAL");
+    assert_eq!(before.len(), after.len());
+    assert_eq!(
+        store
+            .query_metrics(&query)
+            .expect("unchanged logical records"),
+        observed
+    );
+    point.timestamp_unix_nanos += 2;
+    let next = store
+        .append_metric_points(vec![point], true)
+        .expect("later valid point progresses");
+    assert_eq!(
+        next.partitions[0].first_offset,
+        first.partitions[0].last_offset + 1
+    );
+    assert_eq!(
+        store
+            .query_metrics(&query)
+            .expect("two accepted records")
+            .len(),
+        2
+    );
+    let log_partition = store.telemetry_router.log("tenant-a", Some(trace), &[]);
+    let oversized_log = OtlpLogEvent {
+        timestamp_unix_nanos: now,
+        trace_id: Some(trace),
+        message: Arc::from("a".repeat(resident.append_work.max_decoded_sidecar_bytes + 1024)),
+        ..Default::default()
+    };
+    let log_envelope =
+        crate::prepare_log_envelope("tenant-a", std::slice::from_ref(&oversized_log))
+            .expect("compressed structural input");
+    assert!(log_envelope.encode().expect("actual log STEL").len() < store.maximum_append_bytes());
+    assert!(
+        store
+            .append_log_events("tenant-a", vec![oversized_log], true)
+            .expect_err("structural expansion fails before WAL")
+            .is_bad_request()
+    );
+    assert!(
+        store
+            .fetch_telemetry_batches(log_partition, LogicalOffset::new(0), 1024 * 1024)
+            .expect("log WAL remains empty")
+            .is_empty()
+    );
+    let accepted_log = store
+        .append_log_events(
+            "tenant-a",
+            vec![OtlpLogEvent {
+                timestamp_unix_nanos: now + 1,
+                trace_id: Some(trace),
+                message: Arc::from("valid after rejected expansion"),
+                ..Default::default()
+            }],
+            true,
+        )
+        .expect("later log progresses");
+    assert_eq!(accepted_log.partitions[0].first_offset, 0);
+    drop(store);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
 fn bounded_native_queries_scan_many_groups_with_exact_types_cursors_and_restart() {
     let now = unix_nanos_now();
     let trace = TraceId::from_bytes([17; 16]).expect("trace");

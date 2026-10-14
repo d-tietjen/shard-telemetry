@@ -45,6 +45,26 @@ partition budget. Byte accounting covers engine-controlled payload/cache state;
 filesystem metadata and one in-flight WAL/spool group remain bounded bursts
 that operators must reserve headroom for.
 
+For a configured RAM allowance, native trace/metric publication additionally
+has a finite resident policy. One quarter of that allowance is divided across
+the sum of their logical partitions; a logical partition has one engine owner,
+so adding physical stripes does not duplicate its sealed-payload allowance.
+Publication closes at no more than one quarter of each partition allowance.
+The current append's encoded input is capped at that threshold and its decoded
+rows/sidecars and serialized deep record/header charge are bounded per physical
+owner before WAL mutation. Decoded validation-cache entries are charged by
+their materialized records instead of their compressed input size.
+
+Bounded appends seal the current partition before deciding whether to publish.
+Actual trace/metric encoding checks the resident ceiling before removing heads,
+including forced maintenance. A publication failure retains one indexed retry
+descriptor and its existing sealed payload for that partition; its checkpoint
+advances only after publication succeeds. An identical retry resumes publication
+without re-indexing, and different content at that boundary fails closed. These
+encoded/materialization limits do not establish allocator/RSS or startup-metadata
+quotas. Configurations without the optional resident policy retain the default
+group and sealing behavior.
+
 At the worst case of one PiB of already-compressed payload and 1 GiB groups,
 there are 1,048,576 groups and 1,024 catalog pages. A root therefore has about
 one thousand references, not one million block entries. With highly

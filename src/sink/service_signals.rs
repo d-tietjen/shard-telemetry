@@ -1,6 +1,9 @@
 use super::*;
 
 impl TelemetryService {
+    pub(crate) fn bounded_ingest_bytes(&self) -> Option<usize> {
+        self.native_resident.map(|_| self.max_ingest_bytes)
+    }
     fn query_result_capacity(&self, limit: usize, owners: usize) -> usize {
         let capacity = fanout_result_capacity(Some(limit), owners);
         self.native_query_work.map_or(capacity, |work| {
