@@ -108,12 +108,23 @@ impl LogStripe {
         self.query_refs_checked(query).unwrap_or_default()
     }
 
-    pub(super) fn query_refs_checked(
+    /// Returns exact log references and propagates decoding/capacity errors to native callers.
+    pub(crate) fn query_refs_checked(
         &self,
         query: &LogQuery,
     ) -> TelemetryResult<Vec<TelemetryRecordRef>> {
         if query.limit == Some(0) || query.has_invalid_range() {
             return Ok(Vec::new());
+        }
+        if self.native_query_work.is_some() {
+            return self
+                .query_checked_with_typed_metadata(query, false, false)
+                .map(|matches| {
+                    matches
+                        .into_iter()
+                        .map(|matched| matched.record.record_ref)
+                        .collect()
+                });
         }
         if self
             .indexed_frame_partitions
@@ -138,7 +149,7 @@ impl LogStripe {
         }
         if query.sort != crate::QuerySort::Offset || self.tier.is_some() {
             return Ok(self
-                .query(query)
+                .query_checked(query)?
                 .into_iter()
                 .map(|matched| matched.record.record_ref)
                 .collect());

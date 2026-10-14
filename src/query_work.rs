@@ -1,6 +1,8 @@
 //! Declared working-set ceilings for native queries, independent of corpus size.
 
+use crate::structural::StructuralRecordView;
 use crate::{TelemetryError, TelemetryResult};
+use serde::ser::{SerializeSeq, SerializeTuple};
 
 /// Work limits checked before native payload reads, decoding and winner growth.
 ///
@@ -10,7 +12,7 @@ use crate::{TelemetryError, TelemetryResult};
 pub struct NativeQueryWorkLimits {
     /// Maximum encoded bytes read for one signal block.
     pub max_encoded_block_bytes: usize,
-    /// Maximum decompressed bytes per sidecar or variable metric-value lane.
+    /// Maximum decompressed bytes per sidecar, log frame/metadata lane, or variable metric-value lane.
     pub max_decoded_sidecar_bytes: usize,
     /// Maximum rows decoded from one signal block.
     pub max_decoded_records: usize,
@@ -20,7 +22,7 @@ pub struct NativeQueryWorkLimits {
     /// This deliberately charges shared payloads again; it is a conservative
     /// materialization proxy, not an allocator measurement.
     pub max_winner_bytes: usize,
-    /// Maximum encoded catalog-page or manifest bytes read by one query.
+    /// Maximum encoded control-object bytes or decoded log query-index bytes.
     pub max_control_object_bytes: usize,
 }
 
@@ -174,6 +176,67 @@ impl QueryWorkBudget {
 struct WorkCounter {
     bytes: usize,
     maximum: usize,
+}
+
+/// Charges exact log payloads without adding a public log serialization format.
+pub(crate) struct LogQueryWorkBudget(QueryWorkBudget);
+
+impl LogQueryWorkBudget {
+    /// Starts independent cumulative log-winner accounting; `None` preserves legacy admission.
+    pub(crate) fn new(limits: Option<NativeQueryWorkLimits>) -> Self {
+        Self(QueryWorkBudget::new(limits))
+    }
+
+    /// Admits an insertion/replacement including the concrete log header and caller key bytes.
+    pub(crate) fn replace(
+        &mut self,
+        previous: Option<&crate::DurableLog>,
+        incoming: &crate::DurableLog,
+        key_bytes: usize,
+    ) -> TelemetryResult<()> {
+        let previous = previous.map(LogQueryCharge);
+        let incoming = LogQueryCharge(incoming);
+        self.0.replace(
+            previous.as_ref(),
+            &incoming,
+            key_bytes
+                .saturating_add(std::mem::size_of::<crate::DurableLog>())
+                .saturating_sub(std::mem::size_of::<LogQueryCharge<'_>>()),
+        )
+    }
+}
+
+struct LogQueryCharge<'a>(&'a crate::DurableLog);
+
+impl serde::Serialize for LogQueryCharge<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let record = self.0;
+        let mut tuple = serializer.serialize_tuple(4)?;
+        tuple.serialize_element(&(
+            record.stream_shard_id.get(),
+            record.record_ref.topic_partition.topic_id.get(),
+            record.record_ref.topic_partition.partition_id.get(),
+            record.record_ref.offset.get(),
+            record.timestamp_unix_nanos,
+            record.compression_cohort.get(),
+        ))?;
+        tuple.serialize_element(record.message.as_ref())?;
+        tuple.serialize_element(&LogQueryFields(&record.fields))?;
+        tuple.serialize_element(&record.structural_log_metadata())?;
+        tuple.end()
+    }
+}
+
+struct LogQueryFields<'a>(&'a [crate::MetadataField]);
+
+impl serde::Serialize for LogQueryFields<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for field in self.0 {
+            sequence.serialize_element(&(field.key.as_ref(), field.value.as_ref()))?;
+        }
+        sequence.end()
+    }
 }
 
 impl std::io::Write for WorkCounter {

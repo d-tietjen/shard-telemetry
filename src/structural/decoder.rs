@@ -1,5 +1,47 @@
 use super::*;
 
+/// Verify structural rows and the typed lane's declared expansion before parsing them.
+pub(crate) fn validate_structural_query_work_limits(
+    encoded: &[u8],
+    work: crate::NativeQueryWorkLimits,
+) -> TelemetryResult<()> {
+    if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "missing structural block magic",
+        ));
+    }
+    if encoded.len() > work.max_decoded_sidecar_bytes {
+        return Err(TelemetryError::InvalidQuery(format!(
+            "native query capacity exceeded for decoded log frame bytes: {} > {}",
+            encoded.len(),
+            work.max_decoded_sidecar_bytes,
+        )));
+    }
+    let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+    work.rows(read_usize(encoded, &mut cursor)?)?;
+    for _ in 0..6 {
+        let _ = read_section(encoded, &mut cursor)?;
+    }
+    let typed = read_section(encoded, &mut cursor)?;
+    let _ = read_section(encoded, &mut cursor)?;
+    require_consumed(encoded, cursor)?;
+    if !typed.is_empty() {
+        let header = typed.get(..4).ok_or(TelemetryError::InvalidBlockEncoding(
+            "truncated typed log metadata lane",
+        ))?;
+        let raw = u32::from_le_bytes(header.try_into().map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("invalid typed log metadata length")
+        })?) as usize;
+        if raw > work.max_decoded_sidecar_bytes {
+            return Err(TelemetryError::InvalidQuery(format!(
+                "native query capacity exceeded for decoded typed log metadata bytes: {raw} > {}",
+                work.max_decoded_sidecar_bytes,
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn decode_structural_records_internal(
     encoded: &[u8],
     record_ordinals: &[u32],

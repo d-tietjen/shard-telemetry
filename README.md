@@ -159,6 +159,13 @@ logical partitions does not multiply that allowance. Cache chunks/read bounds
 follow these ceilings. Cold native queries visit one catalog page, manifest and
 block at a time. Correlation pages retain the smallest exact references across
 all candidates, including later-published groups with earlier offsets.
+Checked log queries also traverse groups and frames lazily, keeping an admitted
+top result set in the requested offset or timestamp order. They preflight
+compressed query-index expansion, structural rows and typed metadata expansion,
+and avoid retaining parsed log frames or posting caches. Exact typed correlation
+filters continue across bounded pages, so a string identity cannot consume the
+limit for an integer identity. Compatibility-field lookups propagate the same
+capacity errors.
 
 Winner accounting streams MessagePack into a byte counter rather than creating
 another encoded payload. It charges serialized deep payloads and concrete

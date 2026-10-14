@@ -439,7 +439,13 @@ pub(super) fn query_correlation_stripe(
             let mut log_query = LogQuery::new(partition)
                 .with_field("resource.loki.tenant", Arc::clone(&query.tenant))
                 .where_predicate(LogPredicate::and(label_predicates.clone()))
-                .with_limit(query.limit.min(64));
+                .with_limit(
+                    query.limit.min(
+                        stripe
+                            .native_query_work
+                            .map_or(64, |work| 64.min(work.max_winner_records)),
+                    ),
+                );
             log_query.start_timestamp_unix_nanos = Some(
                 query
                     .start_time_unix_nanos
@@ -466,7 +472,7 @@ pub(super) fn query_correlation_stripe(
                 log_query = log_query.with_field("otel.scope.id", scope_id.to_string());
             }
             loop {
-                let page = stripe.logs.query_refs(&log_query);
+                let page = stripe.logs.query_refs_checked(&log_query)?;
                 let last = page.last().copied();
                 let saturated = page.len() == log_query.limit.unwrap_or(64);
                 for record in page {
@@ -606,6 +612,9 @@ fn query_typed_log_correlations(
     ref_budget: &mut crate::query_work::QueryWorkBudget,
 ) -> TelemetryResult<()> {
     const RECORDS_PER_PAGE: usize = 64;
+    let records_per_page = stripe.native_query_work.map_or(RECORDS_PER_PAGE, |work| {
+        RECORDS_PER_PAGE.min(work.max_winner_records)
+    });
     for partition in 0..stripe.log_partitions {
         let partition = TopicPartition::new(
             TelemetrySignal::Logs.topic_id(),
@@ -619,7 +628,7 @@ fn query_typed_log_correlations(
         }
         let mut log_query = LogQuery::new(partition)
             .with_field("resource.loki.tenant", Arc::clone(&query.tenant))
-            .with_limit(RECORDS_PER_PAGE);
+            .with_limit(records_per_page);
         log_query.start_timestamp_unix_nanos =
             Some(query.start_time_unix_nanos.unwrap_or(0).max(cutoff));
         log_query.end_timestamp_unix_nanos =
@@ -639,7 +648,7 @@ fn query_typed_log_correlations(
                 break;
             };
             let next = last.record.record_ref.offset.get().checked_add(1);
-            let saturated = page.len() == RECORDS_PER_PAGE;
+            let saturated = page.len() == records_per_page;
             for matched in page {
                 if log_matches_correlation(query, &matched.record) {
                     push_correlation_ref(

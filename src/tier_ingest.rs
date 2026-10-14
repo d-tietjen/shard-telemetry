@@ -188,6 +188,15 @@ pub(crate) fn decode_tier_ingest_group(
     encoded: &[u8],
     blocks: &[TierBlockEntry],
 ) -> TelemetryResult<Vec<DecodedTierIngestAppend>> {
+    decode_tier_ingest_group_with_work_limits(encoded, blocks, None)
+}
+
+/// Checks control expansion and per-frame rows before parsing a bounded query index.
+pub(crate) fn decode_tier_ingest_group_with_work_limits(
+    encoded: &[u8],
+    blocks: &[TierBlockEntry],
+    work: Option<crate::NativeQueryWorkLimits>,
+) -> TelemetryResult<Vec<DecodedTierIngestAppend>> {
     if encoded.len() < QUERY_INDEX_HEADER_BYTES
         || encoded.get(..QUERY_INDEX_MAGIC.len()) != Some(QUERY_INDEX_MAGIC)
     {
@@ -205,6 +214,10 @@ pub(crate) fn decode_tier_ingest_group(
         return Err(TelemetryError::CorruptTier(
             "ingest query-index decoded length is invalid".into(),
         ));
+    }
+    if let Some(work) = work {
+        work.control(encoded.len() as u64)?;
+        work.control(uncompressed_bytes as u64)?;
     }
     let raw = zstd::bulk::decompress(&encoded[QUERY_INDEX_HEADER_BYTES..], uncompressed_bytes)
         .map_err(|error| {
@@ -239,6 +252,9 @@ pub(crate) fn decode_tier_ingest_group(
             let frame_id = read_u64(&raw, &mut cursor)?;
             let cohort = CompressionCohortId::new(read_u64(&raw, &mut cursor)?);
             let frame_record_count = read_u32(&raw, &mut cursor)?;
+            if let Some(work) = work {
+                work.rows(frame_record_count as usize)?;
+            }
             let structural_bytes = usize::try_from(read_u64(&raw, &mut cursor)?)
                 .map_err(|_| TelemetryError::RecordTooLarge)?;
             let min_timestamp_unix_nanos = read_u64(&raw, &mut cursor)?;

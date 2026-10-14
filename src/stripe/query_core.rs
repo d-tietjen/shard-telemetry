@@ -24,6 +24,9 @@ impl LogStripe {
         if query.limit == Some(0) || query.has_invalid_range() {
             return Ok(Vec::new());
         }
+        if self.native_query_work.is_some() {
+            return self.query_bounded(query, include_typed_metadata, include_fields);
+        }
         let mut matches = self.query_hot_matches(query, include_typed_metadata, include_fields);
         if let Some(partition) = self.indexed_frame_partitions.get(&query.topic_partition) {
             matches.extend(self.query_indexed_frames(
@@ -75,6 +78,9 @@ impl LogStripe {
         let Some(ordering_query) = queries.first() else {
             return Ok(Vec::new());
         };
+        if self.native_query_work.is_some() {
+            return self.query_partitions_bounded(queries, include_typed_metadata, include_fields);
+        }
         if self.tier.is_some() {
             let mut matches = queries.iter().try_fold(Vec::new(), |mut matches, query| {
                 matches.extend(self.query_checked_with_typed_metadata(
@@ -191,6 +197,25 @@ impl LogStripe {
         include_typed_metadata: bool,
         include_fields: bool,
     ) -> TelemetryResult<Vec<Vec<LogMatch>>> {
+        if let Some(work) = self.native_query_work {
+            let mut budget = crate::query_work::LogQueryWorkBudget::new(Some(work));
+            let mut count = 0usize;
+            let mut batches = Vec::new();
+            for query in queries {
+                let matches = self.query_checked_with_typed_metadata(
+                    query,
+                    include_typed_metadata,
+                    include_fields,
+                )?;
+                work.winners(count.saturating_add(matches.len()))?;
+                for matched in &matches {
+                    budget.replace(None, &matched.record, 0)?;
+                }
+                count = count.saturating_add(matches.len());
+                batches.push(matches);
+            }
+            return Ok(batches);
+        }
         queries
             .iter()
             .map(|query| {

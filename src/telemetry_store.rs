@@ -51,6 +51,8 @@ mod append_helpers;
 mod capacity_qualification;
 #[cfg(test)]
 mod correlation_qualification;
+#[cfg(test)]
+mod log_query_qualification;
 mod loki;
 mod native_query;
 mod remote_write;

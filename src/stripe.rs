@@ -753,6 +753,7 @@ pub struct LogStripe {
     compressor: StripeCompressor,
     tier: Option<StripeTierState>,
     next_frame_id: u64,
+    native_query_work: Option<crate::NativeQueryWorkLimits>,
 }
 
 mod append;
@@ -761,8 +762,10 @@ pub(crate) use cache::*;
 mod lifecycle;
 mod object_tier;
 mod query_aggregate;
+mod query_bounded;
 mod query_cache;
 mod query_core;
+use query_bounded::check_log_decoded_bytes;
 mod query_frame;
 mod query_hot;
 mod query_tier;

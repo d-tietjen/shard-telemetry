@@ -1062,6 +1062,20 @@ impl LogStripe {
         blocks: &[crate::TierBlockEntry],
         control_cache: &SsdObjectCache,
     ) -> TelemetryResult<Arc<[DecodedTierIngestAppend]>> {
+        if let Some(work) = self.native_query_work {
+            work.control(query_artifact.bytes)?;
+            let query_index = tier.read_artifact_cached(
+                query_artifact,
+                work.max_control_object_bytes as u64,
+                control_cache,
+            )?;
+            return crate::tier_ingest::decode_tier_ingest_group_with_work_limits(
+                &query_index,
+                blocks,
+                Some(work),
+            )
+            .map(Arc::from);
+        }
         if let Some(appends) = control_cache.parsed_tier_ingest_hit(&query_artifact.object_key)? {
             return Ok(appends);
         }

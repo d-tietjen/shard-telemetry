@@ -76,6 +76,7 @@ impl TelemetrySinkFactory {
                 )?,
                 None => LogStripe::new(shard_id, config.stripe.clone())?,
             };
+            logs.set_query_work_limits(config.native_query_work);
             if let Some(observer) = &realtime_dictionary {
                 logs.attach_realtime_dictionary(observer.clone());
             }

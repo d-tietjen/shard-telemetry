@@ -213,7 +213,11 @@ impl LogStripe {
         &self,
         frame: &IndexedIngestFrame,
     ) -> TelemetryResult<Arc<CachedIndexedFrame>> {
-        {
+        if let Some(work) = self.native_query_work {
+            work.encoded(frame.compressed.len())?;
+            work.rows(frame.record_count as usize)?;
+            check_log_decoded_bytes(work, frame.structural_bytes, "decoded log frame bytes")?;
+        } else {
             let mut cache = self
                 .indexed_frame_query_cache
                 .lock()
@@ -224,6 +228,9 @@ impl LogStripe {
         }
 
         let structural = Arc::<[u8]>::from(decompress_indexed_ingest_frame(frame)?);
+        if let Some(work) = self.native_query_work {
+            crate::structural::validate_structural_query_work_limits(&structural, work)?;
+        }
         let embedded_index = Arc::new(crate::structural::decode_embedded_frame_index(&structural)?);
         let templates = Arc::<[Vec<Vec<u8>>]>::from(decode_structural_templates(&structural)?);
         let attribute_tables = Arc::new(decode_structural_attribute_tables(&structural)?);
@@ -245,6 +252,9 @@ impl LogStripe {
             exact_fields: Mutex::new(HashMap::new()),
             field_postings: Mutex::new(HashMap::new()),
         });
+        if self.native_query_work.is_some() {
+            return Ok(cached);
+        }
         let mut cache = self
             .indexed_frame_query_cache
             .lock()
@@ -381,6 +391,9 @@ impl LogStripe {
     }
 
     pub(super) fn cache_exact_posting(&self, key: ExactPostingKey, posting: Arc<[u32]>) {
+        if self.native_query_work.is_some() {
+            return;
+        }
         self.exact_posting_cache
             .lock()
             .expect("exact posting cache lock is not poisoned")
