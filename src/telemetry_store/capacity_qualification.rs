@@ -31,13 +31,19 @@ fn bounded_resident_input_keeps_metadata_and_rejects_expansion_before_wal() {
     bounded = bounded.with_max_ram_bytes(64 * 1024 * 1024);
     // A stricter declared decoder ceiling proves compressed expansion refusal
     // without spending the qualification run building a multi-megabyte token.
-    bounded
+    let stricter = bounded
         .local_limits
         .native_resident
         .as_mut()
-        .expect("resident policy")
-        .append_work
-        .max_decoded_sidecar_bytes = 64 * 1024;
+        .expect("resident policy");
+    let decoded = 64 * 1024;
+    let row_bytes = std::mem::size_of::<crate::DurableSpan>()
+        .max(std::mem::size_of::<crate::DurableMetricPoint>())
+        .max(1);
+    stricter.append_work.max_decoded_sidecar_bytes = decoded;
+    stricter.append_work.max_winner_bytes = decoded;
+    stricter.append_work.max_decoded_records = (decoded / row_bytes).max(1);
+    stricter.append_work.max_winner_records = (decoded / row_bytes).max(1);
     let resident = bounded
         .local_limits
         .native_resident
