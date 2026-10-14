@@ -111,6 +111,28 @@ fn query_index_lengths(directory: &Path) -> Vec<(usize, usize)> {
     lengths
 }
 
+fn maximum_control_file_bytes(directory: &Path) -> usize {
+    fs::read_dir(directory)
+        .expect("owned object directory")
+        .map(|entry| {
+            let entry = entry.expect("owned object entry");
+            let path = entry.path();
+            if entry.file_type().expect("owned object type").is_dir() {
+                maximum_control_file_bytes(&path)
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                usize::try_from(entry.metadata().expect("actual control size").len())
+                    .expect("control size")
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 #[test]
 fn bounded_logs_scan_unsorted_groups_and_exact_typed_cursor_pages_after_reopen() {
     let config = fixture("bounded-log-pages");
@@ -344,23 +366,15 @@ fn limit_one_log_query_refuses_encoded_typed_expansion_and_winner_bytes_after_co
             .with_trace_id(trace)
             .for_signal(TelemetrySignal::Logs)
             .with_limit(1);
-        if boundary == "winner" {
-            assert_eq!(
-                store
-                    .query_correlations(&compatibility_query)
-                    .expect("reference projection does not retain the typed body")
-                    .len(),
-                1
-            );
-        } else {
-            assert!(
-                store
-                    .query_correlations(&compatibility_query)
-                    .expect_err("checked compatibility-field fallback preserves refusal")
-                    .to_string()
-                    .contains("native query capacity")
-            );
-        }
+        // Disabled navigation also runs exact typed matching for this query;
+        // omitting an attribute cannot erase its oversized typed-body charge.
+        assert!(
+            store
+                .query_correlations(&compatibility_query)
+                .expect_err("checked no-attribute fallback preserves refusal")
+                .to_string()
+                .contains("native query capacity")
+        );
         if boundary == "encoded" {
             let after = store
                 .service
@@ -381,6 +395,8 @@ fn limit_one_log_query_refuses_encoded_typed_expansion_and_winner_bytes_after_co
 fn cold_log_query_refuses_compressed_control_expansion_before_payload_read() {
     let mut config = fixture("bounded-log-control-expansion");
     config.local_limits.native_query_work = None;
+    config.object_tier.target_group_payload_bytes = 64 * 1024;
+    let tenant = "t".repeat(1024);
     let trace = TraceId::from_bytes([29; 16]).expect("trace");
     let time = now() - 120_000_000_000;
     let rows = (0..128)
@@ -392,12 +408,17 @@ fn cold_log_query_refuses_compressed_control_expansion_before_payload_read() {
             )]);
             row
         })
-        .collect();
+        .collect::<Vec<_>>();
     let store = open(&config);
-    let acknowledgement = store
-        .append_log_events("tenant-a", rows, true)
-        .expect("compressible indexed fields");
-    let partition = refs(&acknowledgement)[0].topic_partition;
+    let mut partition = None;
+    // Each real append repeats the valid tenant in the raw query index.
+    // Co-publishing them makes that expansion exceed surrounding controls.
+    for _ in 0..8 {
+        let acknowledgement = store
+            .append_log_events(&tenant, rows.clone(), true)
+            .expect("compressible indexed fields");
+        partition = Some(refs(&acknowledgement)[0].topic_partition);
+    }
     store.flush(Duration::from_secs(30)).expect("cold group");
     drop(store);
     let (encoded, decoded) = query_index_lengths(&config.store.data_directory)
@@ -408,8 +429,19 @@ fn cold_log_query_refuses_compressed_control_expansion_before_payload_read() {
         encoded < decoded - 1,
         "fixture must compress the query index"
     );
-    let query = LogQuery::new(partition)
-        .with_field("resource.loki.tenant", "tenant-a")
+    let control_bytes = maximum_control_file_bytes(
+        config
+            .store
+            .object_store_directory
+            .as_ref()
+            .expect("actual local object store"),
+    );
+    assert!(
+        control_bytes > 0 && control_bytes < decoded - 1,
+        "fixture must reach decoded-index admission: controls={control_bytes}, decoded={decoded}"
+    );
+    let query = LogQuery::new(partition.expect("actual append partition"))
+        .with_field("resource.loki.tenant", tenant)
         .with_limit(1);
     let baseline = open(&config);
     assert_eq!(
