@@ -222,7 +222,7 @@ fn provider_status_keeps_applied_prefix_distinct_from_expired_query_data() {
     let directory = Directory::new("retention");
     let mut config = config(&directory);
     config.object_store_directory = Some(directory.0.join("objects"));
-    let store = DurableTelemetryStore::open(config).expect("tiered real store");
+    let store = DurableTelemetryStore::open(config.clone()).expect("tiered real store");
     let mut request = all_signal_request();
     request.partitions.truncate(1);
     let mut batch = native_batch();
@@ -231,9 +231,6 @@ fn provider_status_keeps_applied_prefix_distinct_from_expired_query_data() {
         .append_telemetry_batch(&batch, true)
         .expect("offset zero");
     LokiStore::flush(&store, Duration::from_secs(10)).expect("publish real payload");
-    store
-        .compact_retention_before(1_000)
-        .expect("expire payload and reclaim WAL");
     let query = NativeQuery {
         tenant: "tenant-a".into(),
         labels: BTreeMap::new(),
@@ -243,6 +240,31 @@ fn provider_status_keeps_applied_prefix_distinct_from_expired_query_data() {
         limit: 10,
         direction: NativeQueryDirection::OldestFirst,
     };
+    let present = store
+        .query_native(&query)
+        .expect("source visible without a finite retention policy");
+    assert_eq!(present.len(), 1);
+    assert_eq!(present[0].timestamp_unix_nanos, 25);
+    assert_eq!(
+        store
+            .local_provider_status(&request)
+            .expect("applied before expiry")
+            .partitions[0]
+            .progress
+            .expect("previously applied checkpoint")
+            .indexed_end,
+        Some(1)
+    );
+    drop(store);
+    // Maintenance alone does not install a query cutoff. Reopen the same
+    // authoritative store with an actual finite policy, then maintain it.
+    config.retention = Some(Duration::from_secs(60));
+    let store = DurableTelemetryStore::open(config)
+        .expect("same store with finite retention after recovery");
+    let retention = store
+        .compact_retention()
+        .expect("configured policy expires payload and reclaims WAL");
+    assert_eq!(retention.retired_object_groups, 1);
     assert!(
         store
             .query_native(&query)
