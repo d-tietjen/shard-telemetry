@@ -15,6 +15,9 @@ cargo build --workspace --all-targets --all-features --release --locked
 scripts/release-gate.sh
 ```
 
+The repository's `rustfmt.toml` fixes the existing 100-column Rust style so
+formatting does not inherit unrelated configuration from a parent directory.
+
 Add regression tests for behavioral changes. Storage-format, recovery, query,
 and protocol changes require malformed-input and restart-boundary coverage.
 Benchmark claims must follow BENCHMARKS.md: include the command, corpus
