@@ -34,6 +34,25 @@ use super::*;
 pub(super) struct TempDir(pub(super) PathBuf);
 
 #[test]
+fn manual_native_query_work_rejects_retained_navigation_before_factory_allocation() {
+    let config = OtlpSinkConfig {
+        native_query_work: Some(crate::NativeQueryWorkLimits::for_ram_budget(
+            8 * 1024 * 1024,
+            1,
+        )),
+        ..OtlpSinkConfig::default()
+    };
+    let error = TelemetrySinkFactory::new([ShardId::new(0)], config)
+        .err()
+        .expect("explicit work policy cannot enable unbounded posting materialization");
+    assert!(
+        error
+            .to_string()
+            .contains("disabled retained correlation navigation")
+    );
+}
+
+#[test]
 fn bounded_correlation_top_k_handles_late_earlier_offsets_in_real_groups() {
     let directory = TempDir::new("late-native-query-groups");
     let signals = ShardTelemetryConfig::default();
@@ -101,7 +120,7 @@ fn bounded_correlation_top_k_handles_late_earlier_offsets_in_real_groups() {
                 let span =
                     event.into_durable(ShardId::new(0), partition, LogicalOffset::new(offset));
                 let payload = SignalTierPayload {
-                    resident_id: sequence,
+                    resident_id: sequence + 1,
                     topic_partition: partition,
                     min_signal_identity: u128::from_be_bytes(*trace.as_bytes()),
                     max_signal_identity: u128::from_be_bytes(*trace.as_bytes()),
