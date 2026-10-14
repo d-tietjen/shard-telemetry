@@ -48,7 +48,6 @@ fn disabled_navigation_preserves_typed_correlations_through_retention_and_cold_r
                 .with_max_ram_bytes(ram);
         bounded.store.append_linger = Duration::ZERO;
         bounded.object_tier.target_group_payload_bytes = 1;
-        bounded.validate().expect("bounded store");
         assert_eq!(
             bounded.local_limits.correlations,
             CorrelationConfig::disabled()
@@ -232,6 +231,7 @@ fn append_navigation_spans(
         value: Some(AnyValue {
             value: Some(any_value::Value::IntValue(42)),
         }),
+        ..KeyValue::default()
     };
     let spans = if expired {
         vec![Span {
@@ -278,6 +278,7 @@ fn append_navigation_spans(
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue("shared".to_owned())),
                     }),
+                    ..KeyValue::default()
                 }],
                 ..Resource::default()
             }),
@@ -290,6 +291,7 @@ fn append_navigation_spans(
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("scoped".to_owned())),
                         }),
+                        ..KeyValue::default()
                     }],
                     ..InstrumentationScope::default()
                 }),

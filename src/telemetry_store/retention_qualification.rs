@@ -69,6 +69,7 @@ fn unequal_signal_retention_survives_recovery_and_maintenance() {
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("retention".to_owned())),
                         }),
+                        ..KeyValue::default()
                     }],
                     ..Default::default()
                 }),
