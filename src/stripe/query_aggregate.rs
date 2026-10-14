@@ -1029,11 +1029,15 @@ impl LogStripe {
     /// The directory is reconstructed from hot postings, compressed-frame
     /// append metadata, and object-tier catalogs, so callers do not need to
     /// enumerate every configured logical partition after restart or offload.
+    /// A native work policy bypasses retained directories and admits each cold
+    /// control object before decoding; capacity failures remain query errors.
     pub(crate) fn tenant_partitions(
         &mut self,
         tenant: &str,
     ) -> TelemetryResult<Vec<TopicPartition>> {
-        if let Some(partitions) = self.active_partition_cache.get(tenant) {
+        if self.native_query_work.is_none()
+            && let Some(partitions) = self.active_partition_cache.get(tenant)
+        {
             return Ok(partitions.clone());
         }
         let mut candidates = self.partitions.keys().copied().collect::<Vec<_>>();
@@ -1050,8 +1054,10 @@ impl LogStripe {
                 matches.push(partition);
             }
         }
-        self.active_partition_cache
-            .insert(Arc::from(tenant), matches.clone());
+        if self.native_query_work.is_none() {
+            self.active_partition_cache
+                .insert(Arc::from(tenant), matches.clone());
+        }
         Ok(matches)
     }
 
@@ -1105,6 +1111,42 @@ impl LogStripe {
         let Some(tier) = state.tiers.get(&topic_partition) else {
             return Ok(0);
         };
+        if let Some(work) = self.native_query_work {
+            let mut total = 0_u64;
+            tier.for_each_query_group_cached(
+                TierQueryRange {
+                    first_offset: None,
+                    last_offset: None,
+                    min_timestamp_unix_nanos: None,
+                    max_timestamp_unix_nanos: None,
+                    signal_identity: None,
+                },
+                &state.control_cache,
+                None,
+                Some(work),
+                |group| {
+                    let manifest = tier.load_group_cached(group, &state.control_cache)?;
+                    let query_artifact = manifest
+                        .artifact(TierArtifactKind::QueryIndex)
+                        .ok_or_else(|| {
+                            TelemetryError::CorruptTier("group has no query index".into())
+                        })?;
+                    let appends = self.read_tier_ingest_group_cached(
+                        tier,
+                        query_artifact,
+                        &manifest.blocks,
+                        &state.control_cache,
+                    )?;
+                    for append in appends.iter().filter(|append| append.tenant == tenant) {
+                        total = total
+                            .checked_add(u64::from(append.record_count))
+                            .ok_or(TelemetryError::RecordTooLarge)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            return Ok(total);
+        }
         let groups = tier.candidate_groups_cached(
             TierQueryRange {
                 first_offset: None,

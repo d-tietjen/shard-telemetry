@@ -166,6 +166,9 @@ and avoid retaining parsed log frames or posting caches. Exact typed correlation
 filters continue across bounded pages, so a string identity cannot consume the
 limit for an integer identity. Compatibility-field lookups propagate the same
 capacity errors.
+Native tenant-partition discovery follows the same lazy control admission and
+does not retain tenant-partition caches under the work policy. Its aggregate
+counts remain exact and independent of a response page's winner limit.
 
 Winner accounting streams MessagePack into a byte counter rather than creating
 another encoded payload. It charges serialized deep payloads and concrete

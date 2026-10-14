@@ -451,3 +451,154 @@ fn cold_log_query_refuses_compressed_control_expansion_before_payload_read() {
     drop(store);
     fs::remove_dir_all(config.store.data_directory).expect("remove owned fixture");
 }
+
+#[test]
+fn native_log_pages_discover_lazily_and_recheck_capacity_after_cold_reopen() {
+    let mut config = fixture("bounded-native-log-discovery");
+    config
+        .local_limits
+        .native_query_work
+        .as_mut()
+        .expect("work limits")
+        .max_decoded_records = 2;
+    let time = now() - 120_000_000_000;
+    let trace = TraceId::from_bytes([30; 16]).expect("trace");
+    let store = open(&config);
+    let mut expected = Vec::new();
+    let mut partition = None;
+    for ordinal in 0..48 {
+        let timestamp = time + ((ordinal * 17) % 53) * 1_000_000;
+        for tenant in ["tenant-a", "tenant-b"] {
+            let message = format!("{tenant}-{ordinal}");
+            let mut row = event(timestamp, trace, TelemetryValue::Integer(42));
+            row.message = Arc::from(message.as_str());
+            let acknowledgement = store
+                .append_log_events(tenant, vec![row], true)
+                .expect("shared partition append");
+            partition = Some(refs(&acknowledgement)[0].topic_partition);
+            if tenant == "tenant-a" {
+                expected.push((timestamp, message));
+            }
+        }
+        store
+            .flush(Duration::from_secs(30))
+            .expect("many cold groups");
+    }
+    expected.sort_unstable();
+    let request = crate::NativeLogPageQuery {
+        query: crate::NativeQuery {
+            tenant: "tenant-a".to_owned(),
+            labels: BTreeMap::new(),
+            terms: Vec::new(),
+            start_timestamp_unix_nanos: Some(time),
+            end_timestamp_unix_nanos: Some(time + 1_000_000_000),
+            limit: 1,
+            direction: crate::NativeQueryDirection::OldestFirst,
+        },
+        max_bytes: 4 * 1024,
+        cursor: None,
+    };
+    let verify = |store: &DurableTelemetryStore| {
+        let mut page = request.clone();
+        let mut actual = Vec::new();
+        loop {
+            let result = store
+                .query_native_page(&page)
+                .expect("end-to-end native page");
+            assert!(result.entries.len() <= 1);
+            actual.extend(result.entries.into_iter().map(|entry| entry.line));
+            let Some(cursor) = result.next_cursor else {
+                break;
+            };
+            page.cursor = Some(cursor);
+        }
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|(_, message)| message.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store
+                .service
+                .count_log_records(
+                    Arc::from("tenant-a"),
+                    vec![partition.expect("shared partition")]
+                )
+                .expect("aggregate tenant count"),
+            48,
+            "discovery counts remain exact beyond the page/retained-winner limit"
+        );
+    };
+    verify(&store);
+    drop(store);
+    let store = open(&config);
+    assert_eq!(
+        store
+            .service
+            .retained_payload_bytes()
+            .expect("cold payloads"),
+        0
+    );
+    verify(&store);
+
+    // This unrelated tenant's frame is outside the requested time window.
+    // Tenant discovery reads it even though the match traversal would skip
+    // it, demonstrating admission before producing a native response page.
+    let rows = (0..3)
+        .map(|_| event(time + 2_000_000_000, trace, TelemetryValue::Integer(42)))
+        .collect();
+    store
+        .append_log_events("tenant-c", rows, true)
+        .expect("valid ingestion beyond query work");
+    store
+        .flush(Duration::from_secs(30))
+        .expect("new independent cold group");
+    let assert_refusal = |store: &DurableTelemetryStore| {
+        let before = store
+            .service
+            .object_tier_cache_stats()
+            .expect("cache stats");
+        let error = store
+            .query_native_page(&request)
+            .expect_err("discovery refuses new work");
+        assert!(
+            error.to_string().contains("decoded block rows: 3 > 2"),
+            "{error}"
+        );
+        let after = store
+            .service
+            .object_tier_cache_stats()
+            .expect("refused stats");
+        assert_eq!(
+            before.payload.hits + before.payload.misses,
+            after.payload.hits + after.payload.misses,
+            "discovery refuses before payload reads"
+        );
+    };
+    assert_refusal(&store);
+    drop(store);
+    let store = open(&config);
+    assert_refusal(&store);
+    drop(store);
+    let mut work = crate::NativeQueryWorkLimits::for_ram_budget(64 * 1024 * 1024, 1);
+    work.max_control_object_bytes = query_index_lengths(&config.store.data_directory)
+        .into_iter()
+        .map(|(encoded, decoded)| encoded.max(decoded))
+        .max()
+        .expect("actual query-index sizes");
+    config.local_limits.native_query_work = Some(work);
+    let store = open(&config);
+    let mut absent = request.clone();
+    absent.query.tenant = "absent".to_owned();
+    let error = store
+        .query_native_page(&absent)
+        .expect_err("catalog work refusal cannot become a successful absent-tenant page");
+    assert!(
+        error.to_string().contains("control object bytes"),
+        "{error}"
+    );
+    drop(store);
+    fs::remove_dir_all(config.store.data_directory).expect("remove owned fixture");
+}

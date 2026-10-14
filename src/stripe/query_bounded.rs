@@ -110,6 +110,7 @@ impl LogStripe {
             // A bounded query must not keep historical parsed frames/postings alive.
             self.indexed_frame_query_cache = Mutex::new(IndexedFrameQueryCache::default());
             self.exact_posting_cache = Mutex::new(ExactPostingCache::default());
+            self.active_partition_cache = HashMap::new();
         }
     }
 

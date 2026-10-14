@@ -641,12 +641,16 @@ impl TelemetryService {
         &self,
         tenant: Arc<str>,
     ) -> TelemetryResult<Vec<TopicPartition>> {
-        let mut cache = self.active_log_partition_cache.lock().map_err(|_| {
-            TelemetryError::QueryWorkerUnavailable(
-                "active log partition cache lock poisoned".into(),
-            )
-        })?;
-        if let Some(partitions) = cache.get(&tenant) {
+        let mut cache = if self.native_query_work.is_none() {
+            Some(self.active_log_partition_cache.lock().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "active log partition cache lock poisoned".into(),
+                )
+            })?)
+        } else {
+            None
+        };
+        if let Some(partitions) = cache.as_ref().and_then(|cache| cache.get(&tenant)) {
             return Ok(partitions.clone());
         }
         let workers = self.worker_senders()?;
@@ -676,7 +680,9 @@ impl TelemetryService {
         }
         partitions.sort_unstable();
         partitions.dedup();
-        cache.insert(tenant, partitions.clone());
+        if let Some(cache) = cache.as_mut() {
+            cache.insert(tenant, partitions.clone());
+        }
         Ok(partitions)
     }
 }
