@@ -29,6 +29,15 @@ fn bounded_resident_input_keeps_metadata_and_rejects_expansion_before_wal() {
     bounded.store.shard_count = 1;
     bounded.store.tenant_partitions = 256;
     bounded = bounded.with_max_ram_bytes(64 * 1024 * 1024);
+    // A stricter declared decoder ceiling proves compressed expansion refusal
+    // without spending the qualification run building a multi-megabyte token.
+    bounded
+        .local_limits
+        .native_resident
+        .as_mut()
+        .expect("resident policy")
+        .append_work
+        .max_decoded_sidecar_bytes = 64 * 1024;
     let resident = bounded
         .local_limits
         .native_resident
