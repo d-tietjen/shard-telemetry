@@ -103,7 +103,7 @@ impl Fixture {
             replication_factor: 1,
             min_in_sync_replicas: 1,
             queue_slots_per_shard: 64,
-            queue_bytes_per_shard: 1024 * 1024,
+            queue_bytes_per_shard: 2 * 1024 * 1024,
             target_pack_bytes: 64 * 1024,
             max_pack_age: Duration::from_secs(1),
             max_batch_bytes: 1024 * 1024,
