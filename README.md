@@ -38,6 +38,14 @@ process, and contributor expectations are public and linked below.
 Unsupported protocol and query features are rejected explicitly; consult the
 compatibility documents instead of assuming API parity with another system.
 
+Attached hosts with a stream write fence must implement
+`TelemetryAppendGate::append_leader_epoch` using trusted current host authority.
+Every ingestion path supplies that token at its final engine submission; native
+client envelopes cannot override it. The engine checks the token before WAL
+reservation. Existing gates default to no token for unfenced compatibility,
+which cannot authorize a fenced engine. This handoff does not establish HA
+query ownership, indexed quorum, source coverage or retained-query completeness.
+
 ## Related projects
 
 ShardTelemetry is standalone; it does not declare a runtime dependency on the

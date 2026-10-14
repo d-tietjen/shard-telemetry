@@ -46,6 +46,8 @@ use crate::{
 
 mod analytics_signals;
 mod append;
+#[cfg(test)]
+mod append_epoch_qualification;
 mod append_helpers;
 #[cfg(test)]
 mod capacity_qualification;
@@ -442,6 +444,20 @@ pub trait TelemetryAppendGate: Send + Sync + std::fmt::Debug + 'static {
         &self,
         partitions: &[crate::NativePartitionAppend],
     ) -> Result<(), String>;
+
+    /// Supplies the current writer epoch from trusted host authority immediately
+    /// before submitting this partition to the engine.
+    ///
+    /// Hosts with an installed write fence must recheck readiness and leadership
+    /// here and return that authority's epoch. Client envelope fields cannot
+    /// supply it. The engine independently validates the token before reserving
+    /// or writing WAL; a stale token is not an append acknowledgement.
+    ///
+    /// The default preserves existing unfenced gates. Returning `None` cannot
+    /// bypass an engine that requires a writer epoch.
+    fn append_leader_epoch(&self, _topic_partition: TopicPartition) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
 }
 
 /// Durability required before ShardTelemetry acknowledges a WAL append.

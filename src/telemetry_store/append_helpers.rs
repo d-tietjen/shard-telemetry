@@ -45,6 +45,10 @@ impl DurableTelemetryStore {
         wait_for_index: bool,
     ) -> Result<crate::NativePartitionAck, LokiApiError> {
         self.check_append_encoded_sizes(std::iter::once(payload.len()))?;
+        let leader_epoch = self.append_gate.as_ref().map_or(Ok(None), |gate| {
+            gate.append_leader_epoch(topic_partition)
+                .map_err(LokiApiError::unavailable)
+        })?;
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = AppendRequest {
             request_id: u128::from(request_id),
@@ -55,7 +59,7 @@ impl DurableTelemetryStore {
             durability: self.append_durability,
             producer: None,
             atomic_group: None,
-            leader_epoch: None,
+            leader_epoch,
             extension_context: None,
         };
         let appended = if let Some(transient_context) = transient_context {

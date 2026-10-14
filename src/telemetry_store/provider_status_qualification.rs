@@ -71,7 +71,7 @@ pub(crate) fn all_signal_request() -> ProviderStatusRequest {
     }
 }
 
-fn native_batch() -> crate::NativeTelemetryBatch {
+pub(super) fn native_batch() -> crate::NativeTelemetryBatch {
     let decoder = crate::OtlpTelemetryDecoder;
     let trace_partition = TopicPartition::new(crate::TRACES_TOPIC_ID, LogicalPartitionId::new(0));
     let metric_partition = TopicPartition::new(crate::METRICS_TOPIC_ID, LogicalPartitionId::new(0));
