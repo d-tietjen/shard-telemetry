@@ -65,7 +65,7 @@ fn refs(ack: &NativeTelemetryAppendAck) -> Vec<TelemetryRecordRef> {
     ack.partitions
         .iter()
         .flat_map(|part| {
-            (part.first_offset.get()..=part.last_offset.get()).map(|offset| {
+            (part.first_offset..=part.last_offset).map(|offset| {
                 TelemetryRecordRef::for_signal(
                     TelemetrySignal::Logs,
                     part.topic_partition,
@@ -185,7 +185,7 @@ fn bounded_logs_scan_unsorted_groups_and_exact_typed_cursor_pages_after_reopen()
             timed.sort_unstable();
             let chronological_page = store
                 .service
-                .query_all(&offset_query.sort_by_timestamp())
+                .query_all(&offset_query.clone().sort_by_timestamp())
                 .expect("bounded timestamp page");
             assert_eq!(
                 chronological_page
