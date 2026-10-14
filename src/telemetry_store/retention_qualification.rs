@@ -46,8 +46,16 @@ fn unequal_signal_retention_survives_recovery_and_maintenance() {
     limits.signals.logs.retention = Some(Duration::from_secs(60));
     limits.signals.traces.retention = Some(Duration::from_secs(120));
     limits.signals.metrics.retention = Some(Duration::from_secs(180));
-    let store = DurableTelemetryStore::open_with_local_limits(config.clone(), limits.clone())
-        .expect("store");
+    let tier = ObjectTierConfig {
+        target_group_payload_bytes: 1,
+        ..ObjectTierConfig::default()
+    };
+    let store = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+        config.clone(),
+        tier,
+        limits.clone(),
+    )
+    .expect("store");
     let timestamps = [240, 150, 90, 10].map(|seconds| now - seconds * 1_000_000_000);
     for (index, timestamp) in timestamps.into_iter().enumerate() {
         store
@@ -133,6 +141,12 @@ fn unequal_signal_retention_survives_recovery_and_maintenance() {
         store
             .append_metric_points(points, true)
             .expect("metric append");
+        // Physical retention removes whole published groups. Keep each age
+        // cohort separate so expired objects can retire without removing a
+        // group containing a retained span or point.
+        store
+            .flush(Duration::from_secs(30))
+            .expect("age cohort flush");
     }
     store.flush(Duration::from_secs(30)).expect("flush");
     let historical_crossing_query = crate::TraceQuery {
@@ -156,8 +170,12 @@ fn unequal_signal_retention_survives_recovery_and_maintenance() {
     );
     assert_signal_windows(&store);
     drop(store);
-    let recovered = DurableTelemetryStore::open_with_local_limits(config.clone(), limits.clone())
-        .expect("recover");
+    let recovered = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+        config.clone(),
+        tier,
+        limits.clone(),
+    )
+    .expect("recover");
     assert_signal_windows(&recovered);
     assert_eq!(
         recovered
@@ -169,8 +187,9 @@ fn unequal_signal_retention_survives_recovery_and_maintenance() {
     drop(recovered);
     let mut global = config;
     global.retention = Some(Duration::from_secs(60));
-    let overridden = DurableTelemetryStore::open_with_local_limits(global, limits)
-        .expect("explicit global override");
+    let overridden =
+        DurableTelemetryStore::open_with_object_tier_config_and_local_limits(global, tier, limits)
+            .expect("explicit global override");
     assert_eq!(
         overridden.signal_retention,
         [Some(Duration::from_secs(60)); 3]
