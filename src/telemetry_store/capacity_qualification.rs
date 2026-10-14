@@ -86,7 +86,7 @@ fn bounded_native_queries_scan_many_groups_with_exact_types_cursors_and_restart(
                 }
             }
             store
-                .flush_object_tiers()
+                .flush(Duration::from_secs(30))
                 .expect("independent real age/group publication");
         }
         for tenant in ["tenant-a", "tenant-b"] {
@@ -128,7 +128,7 @@ fn bounded_native_queries_scan_many_groups_with_exact_types_cursors_and_restart(
             );
         }
         store
-            .flush_object_tiers()
+            .flush(Duration::from_secs(30))
             .expect("newer version publication");
         for records in expected.values_mut() {
             records.sort_unstable();
@@ -306,7 +306,7 @@ fn native_query_capacity_rejects_oversized_work_without_returning_partial_succes
         )
         .expect("eight actual large-payload points");
     store
-        .flush_object_tiers()
+        .flush(Duration::from_secs(30))
         .expect("published native metric groups");
     drop(store);
     for kind in ["encoded", "rows", "sidecars", "winners", "winner_bytes"] {
@@ -426,7 +426,9 @@ fn bounded_native_histogram_value_lane_is_rejected_before_decompression() {
     store
         .append_metric_points(vec![point.clone()], true)
         .expect("real histogram");
-    store.flush_object_tiers().expect("histogram publication");
+    store
+        .flush(Duration::from_secs(30))
+        .expect("histogram publication");
     drop(store);
     let mut restricted = limits.clone();
     restricted

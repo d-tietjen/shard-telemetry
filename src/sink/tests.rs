@@ -24,9 +24,9 @@ use shard_stream_engine::{
 use shard_stream_protocol::{AppendRequest, Durability};
 
 use crate::{
-    LocalObjectStore, MetricExemplar, MetricIdentity, MetricKind, MetricValue, NumberValue,
-    OtlpMetricEvent, OtlpTelemetryDecoder, ResourceContext, ScopeContext,
-    SharedTelemetryObjectStore, TelemetryRecordRef,
+    CorrelationBlockFilter, LocalObjectStore, MetricExemplar, MetricIdentity, MetricKind,
+    MetricValue, NumberValue, OtlpMetricEvent, OtlpTelemetryDecoder, ResourceContext, ScopeContext,
+    SharedTelemetryObjectStore, SignalTierPayload, TelemetryRecordRef,
 };
 
 use super::*;

@@ -153,6 +153,7 @@ fn trace_publication_outage_retries_keep_resident_bytes_and_checkpoint_stable() 
                                 value: Some(AnyValue {
                                     value: Some(Value::StringValue(noise(index))),
                                 }),
+                                ..KeyValue::default()
                             }],
                             ..Span::default()
                         }
