@@ -152,7 +152,7 @@ impl Fixture {
         .expect("actual host attachment");
         for partition in store.telemetry_partitions() {
             engine
-                .resume_durable_sink(partition)
+                .resume_durable_sink(&[partition])
                 .expect("resume actual leader sink");
         }
         Self {
