@@ -279,6 +279,9 @@ pub struct DurableTelemetryLimits {
     /// [`crate::CorrelationConfig::disabled`] allocates no navigation postings
     /// or identity caches; exact signal storage supplies correlation results.
     pub correlations: crate::CorrelationConfig,
+    /// Optional per-owner native-query input, decoding and winner ceilings.
+    /// Exhaustion returns an error, never an incomplete successful result.
+    pub native_query_work: Option<crate::NativeQueryWorkLimits>,
     /// Maximum bytes retained in each recovery index journal.
     pub max_index_journal_bytes: u64,
     /// Enables the local lifetime rollup with this distinct-series bound.
@@ -324,6 +327,7 @@ impl Default for DurableTelemetryLimits {
         Self {
             signals: crate::ShardTelemetryConfig::default(),
             correlations: crate::CorrelationConfig::default(),
+            native_query_work: None,
             max_index_journal_bytes: 64 * 1024 * 1024 * 1024,
             max_lifetime_rollup_series: None,
             max_lifetime_rollup_bytes: 512 * 1024 * 1024,

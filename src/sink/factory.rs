@@ -145,15 +145,19 @@ impl TelemetrySinkFactory {
             for recovery_state in metric_recovery_states {
                 metrics.restore_accumulator_checkpoints(&recovery_state)?;
             }
+            let mut traces = TraceStripe::new(config.signals.traces.head_memory_bytes_per_stripe)?;
+            traces.set_query_work_limits(config.native_query_work);
+            metrics.set_query_work_limits(config.native_query_work);
             let stripe = TelemetryStripeState {
                 stream_shard_id: shard_id,
                 logs,
-                traces: TraceStripe::new(config.signals.traces.head_memory_bytes_per_stripe)?,
+                traces,
                 metrics,
                 correlations: CorrelationIndex::new(config.correlations),
                 log_partitions: config.signals.logs.logical_partitions.get(),
                 signal_tiers,
                 router: TelemetryRouter::from_config(&config.signals),
+                native_query_work: config.native_query_work,
             };
             if available.insert(shard_id, stripe).is_some() {
                 return Err(TelemetryError::DuplicateStripe(shard_id));
@@ -224,6 +228,7 @@ impl TelemetrySinkFactory {
     pub fn service(&self) -> TelemetryService {
         TelemetryService {
             max_ingest_bytes: self.config.signals.max_otlp_request_bytes,
+            native_query_work: self.config.native_query_work,
             workers: Arc::clone(&self.query_workers),
             correlation_buffers: Arc::clone(&self.correlation_buffers),
             active_log_partition_cache: Arc::clone(&self.active_log_partition_cache),

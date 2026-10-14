@@ -1,6 +1,67 @@
 use super::*;
 
 impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
+    /// Visits cached candidates lazily, retaining only one catalog page.
+    pub(crate) fn for_each_query_group_cached(
+        &self,
+        range: TierQueryRange,
+        cache: &SsdObjectCache,
+        correlation: Option<(&CorrelationQuery, TelemetrySignal)>,
+        work: Option<crate::NativeQueryWorkLimits>,
+        mut visit: impl FnMut(&CatalogGroupEntry) -> TelemetryResult<()>,
+    ) -> TelemetryResult<()> {
+        range.validate()?;
+        for page_ref in &self.root.pages {
+            if !range.overlaps(
+                page_ref.first_offset,
+                page_ref.last_offset,
+                page_ref.min_timestamp_unix_nanos,
+                page_ref.max_timestamp_unix_nanos,
+                page_ref.min_signal_identity,
+                page_ref.max_signal_identity,
+            ) || correlation.is_some_and(|(query, signal)| {
+                !catalog_correlation_may_match(
+                    page_ref.correlation_filter.as_ref(),
+                    page_ref.min_signal_identity,
+                    page_ref.max_signal_identity,
+                    query,
+                    signal,
+                )
+            }) {
+                continue;
+            }
+            if let Some(work) = work {
+                work.control(page_ref.page_bytes)?;
+            }
+            let page = self.load_page_cached(page_ref, cache)?;
+            for group in &page.groups {
+                if !range.overlaps(
+                    group.first_offset,
+                    group.last_offset,
+                    group.min_timestamp_unix_nanos,
+                    group.max_timestamp_unix_nanos,
+                    group.min_signal_identity,
+                    group.max_signal_identity,
+                ) || correlation.is_some_and(|(query, signal)| {
+                    !catalog_correlation_may_match(
+                        group.correlation_filter.as_ref(),
+                        group.min_signal_identity,
+                        group.max_signal_identity,
+                        query,
+                        signal,
+                    )
+                }) {
+                    continue;
+                }
+                if let Some(work) = work {
+                    work.control(group.manifest_bytes)?;
+                }
+                visit(group)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns group entries whose coarse bounds overlap the query.
     ///
     /// Only overlapping catalog pages are loaded. This never lists objects.

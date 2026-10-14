@@ -37,7 +37,7 @@ pub(super) fn estimated_span_links_bytes(links: &Arc<Vec<SpanLink>>) -> usize {
 
 /// Lightweight span result used when an analytical projection does not need
 /// the full resource, scope, attributes, events, or links.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TraceProjection {
     /// Durable record identity.
     pub(crate) record_ref: TelemetryRecordRef,
@@ -195,6 +195,17 @@ pub(super) fn decode_trace_block_filtered(
     encoded: &[u8],
     query: Option<&TraceQuery>,
 ) -> TelemetryResult<Vec<DurableSpan>> {
+    decode_trace_block_with_work_limits(encoded, query, None)
+}
+
+pub(crate) fn decode_trace_block_with_work_limits(
+    encoded: &[u8],
+    query: Option<&TraceQuery>,
+    limits: Option<crate::NativeQueryWorkLimits>,
+) -> TelemetryResult<Vec<DurableSpan>> {
+    if let Some(limits) = limits {
+        limits.encoded(encoded.len())?;
+    }
     const FIXED_HEADER: usize = 36;
     if encoded.len() < FIXED_HEADER + 32 || encoded[..4] != TRACE_BLOCK_MAGIC {
         return Err(TelemetryError::InvalidBlockEncoding(
@@ -235,6 +246,9 @@ pub(super) fn decode_trace_block_filtered(
         ));
     }
     let count = u32::from_le_bytes(encoded[32..36].try_into().expect("fixed range")) as usize;
+    if let Some(limits) = limits {
+        limits.rows(count)?;
+    }
     if count == 0 {
         return Err(TelemetryError::InvalidBlockEncoding(
             "trace block has no spans",
@@ -251,9 +265,12 @@ pub(super) fn decode_trace_block_filtered(
             "trailing trace block sections",
         ));
     }
+    let sidecar_limit = limits.map_or(Ok(256 * 1024 * 1024), |limits| {
+        limits.sidecar(compressed_sidecars, 256 * 1024 * 1024)
+    })?;
     let sidecar_bytes = TRACE_DECOMPRESSOR.with_borrow_mut(|decompressor| {
         decompressor
-            .decompress(compressed_sidecars, 256 * 1024 * 1024)
+            .decompress(compressed_sidecars, sidecar_limit)
             .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid trace sidecar compression"))
     })?;
     let sidecars: TraceBlockSidecars = rmp_serde::from_slice(&sidecar_bytes)

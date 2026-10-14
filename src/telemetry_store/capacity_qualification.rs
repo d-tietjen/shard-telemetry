@@ -18,6 +18,449 @@ use crate::{
 };
 
 #[test]
+fn bounded_native_queries_scan_many_groups_with_exact_types_cursors_and_restart() {
+    let now = unix_nanos_now();
+    let trace = TraceId::from_bytes([17; 16]).expect("trace");
+    let integer = TelemetryAttribute::new("typed", TelemetryValue::Integer(42));
+    let string = TelemetryAttribute::new("typed", TelemetryValue::String(Arc::from("42")));
+    let resource = Arc::new(ResourceContext::default());
+    let scope = Arc::new(ScopeContext::default());
+    for ram in [8 * 1024 * 1024, 64 * 1024 * 1024] {
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-query-work-{}-{now}-{ram}",
+            std::process::id()
+        ));
+        let mut bounded =
+            EmbeddedTelemetryConfig::bounded_local(&directory, Duration::from_secs(3_600));
+        bounded.store.shard_count = 2;
+        bounded.store.tenant_partitions = 4;
+        bounded = bounded.with_max_ram_bytes(ram);
+        bounded.store.append_linger = Duration::ZERO;
+        bounded.object_tier.target_group_payload_bytes = 1;
+        let work = bounded
+            .local_limits
+            .native_query_work
+            .as_mut()
+            .expect("declared work");
+        work.max_encoded_block_bytes = 2_048;
+        bounded.local_limits.payload_cache.chunk_bytes = 2_048;
+        bounded.local_limits.payload_cache.max_read_bytes = 2_048;
+        let config = bounded.store;
+        let tier = bounded.object_tier;
+        let limits = bounded.local_limits;
+        let store = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+            config.clone(),
+            tier,
+            limits.clone(),
+        )
+        .expect("real bounded store");
+        let mut expected = BTreeMap::<&str, Vec<TelemetryRecordRef>>::new();
+        for ordinal in 0..88_u64 {
+            let attribute = if ordinal < 72 { &string } else { &integer };
+            for tenant in ["tenant-a", "tenant-b"] {
+                let events = work_span_events(
+                    tenant,
+                    trace,
+                    ordinal + 1,
+                    now - 120_000_000_000 + ordinal,
+                    ordinal >= 72,
+                );
+                let span_refs =
+                    acknowledgement_refs(&store.append_trace_events(events, true).expect("span"));
+                let point = navigation_metric(
+                    tenant,
+                    now - 120_000_000_000 + ordinal,
+                    trace,
+                    attribute,
+                    &resource,
+                    &scope,
+                );
+                let metric_refs = acknowledgement_refs(
+                    &store
+                        .append_metric_points(vec![point], true)
+                        .expect("metric"),
+                );
+                if ordinal >= 72 {
+                    expected.entry(tenant).or_default().extend(span_refs);
+                    expected.entry(tenant).or_default().extend(metric_refs);
+                }
+            }
+            store
+                .flush_object_tiers()
+                .expect("independent real age/group publication");
+        }
+        for tenant in ["tenant-a", "tenant-b"] {
+            let mut replacement = navigation_metric(
+                tenant,
+                now - 120_000_000_000 + 75,
+                trace,
+                &integer,
+                &resource,
+                &scope,
+            );
+            replacement.value = MetricValue::Gauge(NumberValue::Integer(9));
+            expected
+                .entry(tenant)
+                .or_default()
+                .extend(acknowledgement_refs(
+                    &store
+                        .append_metric_points(vec![replacement], true)
+                        .expect("later exact timestamp version"),
+                ));
+        }
+        // Check resident/cold duplicates before publishing the newer version.
+        for tenant in ["tenant-a", "tenant-b"] {
+            let points = store
+                .query_metrics(&crate::MetricQuery {
+                    tenant: Arc::from(tenant),
+                    limit: 100,
+                    ..crate::MetricQuery::default()
+                })
+                .expect("resident/cold latest winners");
+            assert_eq!(points.len(), 88);
+            assert_eq!(
+                points
+                    .iter()
+                    .find(|point| point.timestamp_unix_nanos == now - 120_000_000_000 + 75)
+                    .expect("replacement timestamp")
+                    .value,
+                MetricValue::Gauge(NumberValue::Integer(9))
+            );
+        }
+        store
+            .flush_object_tiers()
+            .expect("newer version publication");
+        for records in expected.values_mut() {
+            records.sort_unstable();
+        }
+        let verify = |store: &DurableTelemetryStore| {
+            for tenant in ["tenant-a", "tenant-b"] {
+                let query = CorrelationQuery::new(tenant)
+                    .with_trace_id(trace)
+                    .with_attribute(&integer)
+                    .with_limit(2);
+                let mut page = query.clone();
+                let mut actual = Vec::new();
+                loop {
+                    let records = store
+                        .query_correlations(&page)
+                        .expect("bounded complete cursor page");
+                    let Some(last) = records.last().copied() else {
+                        break;
+                    };
+                    assert!(records.len() <= 2);
+                    page = query.clone().after(last);
+                    actual.extend(records);
+                }
+                assert_eq!(actual, expected[tenant]);
+                let absent = CorrelationQuery::new("tenant-absent")
+                    .with_trace_id(trace)
+                    .with_attribute(&integer)
+                    .with_limit(1);
+                assert!(
+                    store
+                        .query_correlations(&absent)
+                        .expect("foreign tenant")
+                        .is_empty()
+                );
+                assert_eq!(
+                    store
+                        .query_traces(&crate::TraceQuery {
+                            tenant: Arc::from(tenant),
+                            limit: 100,
+                            ..crate::TraceQuery::default()
+                        })
+                        .expect("native trace winner scan")
+                        .len(),
+                    88
+                );
+                let points = store
+                    .query_metrics(&crate::MetricQuery {
+                        tenant: Arc::from(tenant),
+                        limit: 100,
+                        ..crate::MetricQuery::default()
+                    })
+                    .expect("native metric winner scan");
+                assert_eq!(points.len(), 88);
+                assert_eq!(
+                    points
+                        .iter()
+                        .find(|point| point.timestamp_unix_nanos == now - 120_000_000_000 + 75)
+                        .expect("cold replacement")
+                        .value,
+                    MetricValue::Gauge(NumberValue::Integer(9))
+                );
+            }
+        };
+        verify(&store);
+        drop(store);
+        let recovered = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+            config, tier, limits,
+        )
+        .expect("real bounded recovery");
+        let before = recovered
+            .service
+            .object_tier_cache_stats()
+            .expect("cache stats");
+        verify(&recovered);
+        let after = recovered
+            .service
+            .object_tier_cache_stats()
+            .expect("cache stats");
+        assert!(
+            after.payload.hits + after.payload.misses > before.payload.hits + before.payload.misses
+        );
+        assert!(
+            after.payload.source_bytes > 2_048,
+            "a corpus larger than one-block ceiling remains queryable"
+        );
+        drop(recovered);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+}
+
+fn work_span_events(
+    tenant: &str,
+    trace: TraceId,
+    id: u64,
+    timestamp: u64,
+    integer: bool,
+) -> Vec<crate::OtlpSpanEvent> {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: trace.as_bytes().to_vec(),
+                    span_id: id.to_be_bytes().to_vec(),
+                    name: "work".into(),
+                    start_time_unix_nano: timestamp,
+                    end_time_unix_nano: timestamp + 1,
+                    attributes: vec![KeyValue {
+                        key: "typed".into(),
+                        value: Some(AnyValue {
+                            value: Some(if integer {
+                                any_value::Value::IntValue(42)
+                            } else {
+                                any_value::Value::StringValue("42".into())
+                            }),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    };
+    OtlpTelemetryDecoder
+        .decode_traces(tenant, &request.encode_to_vec())
+        .expect("trace fixture")
+}
+
+#[test]
+fn native_query_capacity_rejects_oversized_work_without_returning_partial_success() {
+    let now = unix_nanos_now();
+    let directory = std::env::temp_dir().join(format!(
+        "shard-telemetry-query-reject-{}-{now}",
+        std::process::id()
+    ));
+    let mut bounded =
+        EmbeddedTelemetryConfig::bounded_local(&directory, Duration::from_secs(3_600))
+            .with_max_ram_bytes(8 * 1024 * 1024);
+    bounded.store.append_linger = Duration::ZERO;
+    bounded.object_tier.target_group_payload_bytes = 1;
+    let config = bounded.store;
+    let tier = bounded.object_tier;
+    let limits = bounded.local_limits;
+    let trace = TraceId::from_bytes([19; 16]).expect("trace");
+    let attr = TelemetryAttribute::new("typed", TelemetryValue::Integer(42));
+    let resource = Arc::new(ResourceContext::default());
+    let scope = Arc::new(ScopeContext::default());
+    let store = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+        config.clone(),
+        tier,
+        limits.clone(),
+    )
+    .expect("store");
+    let large_description = (0..1_024)
+        .map(|index| format!("{index:08x}"))
+        .collect::<String>();
+    store
+        .append_metric_points(
+            (0..8)
+                .map(|ordinal| {
+                    let mut point = navigation_metric(
+                        "tenant-a",
+                        now - 1_000_000_000 + ordinal,
+                        trace,
+                        &attr,
+                        &resource,
+                        &scope,
+                    );
+                    point.description = Arc::from(format!("{ordinal}:{large_description}"));
+                    point
+                })
+                .collect(),
+            true,
+        )
+        .expect("eight actual large-payload points");
+    store
+        .flush_object_tiers()
+        .expect("published native metric groups");
+    drop(store);
+    for kind in ["encoded", "rows", "sidecars", "winners", "winner_bytes"] {
+        let mut restricted = limits.clone();
+        let work = restricted
+            .native_query_work
+            .as_mut()
+            .expect("work ceilings");
+        match kind {
+            "encoded" => {
+                work.max_encoded_block_bytes = 1;
+                restricted.payload_cache.chunk_bytes = 1;
+                restricted.payload_cache.max_read_bytes = 1;
+            }
+            "rows" => work.max_decoded_records = 1,
+            "sidecars" => work.max_decoded_sidecar_bytes = 1,
+            "winners" => work.max_winner_records = 1,
+            "winner_bytes" => work.max_winner_bytes = 16 * 1_024,
+            _ => unreachable!(),
+        }
+        let store = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+            config.clone(),
+            tier,
+            restricted,
+        )
+        .expect("restricted store");
+        let before = store.service.object_tier_cache_stats().expect("cache");
+        let error = store
+            .query_metrics(&crate::MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                limit: 1,
+                ..crate::MetricQuery::default()
+            })
+            .expect_err("capacity must fail the query, not return a partial page");
+        assert!(
+            error.to_string().contains("native query capacity"),
+            "{kind}: {error}"
+        );
+        let after = store.service.object_tier_cache_stats().expect("cache");
+        if kind == "encoded" || kind == "rows" {
+            assert_eq!(
+                before.payload.source_bytes, after.payload.source_bytes,
+                "reject before payload read"
+            );
+            assert_eq!(before.payload.hits, after.payload.hits);
+        }
+        drop(store);
+    }
+    let store =
+        DurableTelemetryStore::open_with_object_tier_config_and_local_limits(config, tier, limits)
+            .expect("original work policy");
+    assert_eq!(
+        store
+            .query_metrics(&crate::MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                limit: 100,
+                ..crate::MetricQuery::default()
+            })
+            .expect("query errors preserve durable points")
+            .len(),
+        8
+    );
+    drop(store);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn bounded_native_histogram_value_lane_is_rejected_before_decompression() {
+    let now = unix_nanos_now();
+    let directory = std::env::temp_dir().join(format!(
+        "shard-telemetry-query-histogram-{}-{now}",
+        std::process::id()
+    ));
+    let mut bounded =
+        EmbeddedTelemetryConfig::bounded_local(&directory, Duration::from_secs(3_600))
+            .with_max_ram_bytes(8 * 1024 * 1024);
+    bounded.store.append_linger = Duration::ZERO;
+    bounded.object_tier.target_group_payload_bytes = 1;
+    let config = bounded.store;
+    let tier = bounded.object_tier;
+    let limits = bounded.local_limits;
+    let trace = TraceId::from_bytes([23; 16]).expect("trace");
+    let mut point = navigation_metric(
+        "tenant-a",
+        now,
+        trace,
+        &TelemetryAttribute::new("typed", TelemetryValue::Integer(42)),
+        &Arc::new(ResourceContext::default()),
+        &Arc::new(ScopeContext::default()),
+    );
+    point.identity = Arc::new(MetricIdentity {
+        kind: MetricKind::ExplicitHistogram { temporality: 2 },
+        ..point.identity.as_ref().clone()
+    });
+    point.value = MetricValue::ExplicitHistogram(crate::ExplicitHistogramValue {
+        count: crate::HistogramCount::Integer(1_025),
+        sum_bits: None,
+        bucket_counts: Arc::new(vec![crate::HistogramCount::Integer(1); 1_025]),
+        explicit_bounds_bits: Arc::new((0..1_024).map(|value| (value as f64).to_bits()).collect()),
+        min_bits: None,
+        max_bits: None,
+        reset_hint: 0,
+    });
+    let series = point.series_fingerprint();
+    let query = crate::MetricQuery {
+        tenant: Arc::from("tenant-a"),
+        series: Some(series),
+        limit: 1,
+        ..crate::MetricQuery::default()
+    };
+    let store = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+        config.clone(),
+        tier,
+        limits.clone(),
+    )
+    .expect("store");
+    store
+        .append_metric_points(vec![point.clone()], true)
+        .expect("real histogram");
+    store.flush_object_tiers().expect("histogram publication");
+    drop(store);
+    let mut restricted = limits.clone();
+    restricted
+        .native_query_work
+        .as_mut()
+        .expect("work")
+        .max_decoded_sidecar_bytes = 512;
+    let store = DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+        config.clone(),
+        tier,
+        restricted,
+    )
+    .expect("bounded reader");
+    let error = store
+        .query_metrics(&query)
+        .expect_err("one row cannot hide an oversized variable value lane");
+    assert!(
+        error.to_string().contains("decoded metric value bytes"),
+        "{error}"
+    );
+    drop(store);
+    let store =
+        DurableTelemetryStore::open_with_object_tier_config_and_local_limits(config, tier, limits)
+            .expect("original reader");
+    let actual = store
+        .query_metrics(&query)
+        .expect("original policy preserves histogram");
+    assert_eq!(actual.len(), 1);
+    assert_eq!(actual[0].value, point.value);
+    drop(store);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
 fn disabled_navigation_preserves_typed_correlations_through_retention_and_cold_restart() {
     let now = unix_nanos_now();
     let trace = TraceId::from_bytes([1; 16]).expect("trace ID");

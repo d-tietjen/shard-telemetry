@@ -10,6 +10,7 @@ impl TraceStripe {
         }
         Ok(Self {
             head_budget_bytes,
+            query_work_limits: None,
             head_bytes: 0,
             idle_nanos: DEFAULT_TRACE_IDLE_NANOS,
             late_grace_nanos: DEFAULT_LATE_TRACE_NANOS,
@@ -538,6 +539,9 @@ impl TraceStripe {
 
     /// Queries current hot spans after trace/time pushdown.
     pub fn query(&self, query: &TraceQuery) -> TelemetryResult<Vec<DurableSpan>> {
+        if let Some(limits) = self.query_work_limits {
+            return self.query_bounded(query, limits);
+        }
         let limit = query.limit.max(1);
         if let Some(trace_id) = query.trace_id {
             return self.query_exact_trace(query, trace_id, limit);
@@ -604,7 +608,8 @@ impl TraceStripe {
         &self,
         query: &TraceQuery,
     ) -> TelemetryResult<Vec<TraceProjection>> {
-        if query.trace_id.is_some()
+        if self.query_work_limits.is_some()
+            || query.trace_id.is_some()
             || query.partition.is_some()
             || query.exact_resource_attributes.is_empty()
             || !self.analytical_index_complete

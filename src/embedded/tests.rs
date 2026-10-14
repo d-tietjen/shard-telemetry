@@ -113,6 +113,46 @@ fn ram_budgets_disable_retained_correlation_navigation_and_reject_overrides() {
 }
 
 #[test]
+fn native_query_work_limits_scale_across_physical_owners_and_reject_unsafe_overrides() {
+    for ram in [8 * 1024 * 1024, 64 * 1024 * 1024] {
+        let mut config = EmbeddedTelemetryConfig::bounded_local(
+            std::env::temp_dir().join("shard-telemetry-unused-query-work-budget"),
+            Duration::from_secs(60),
+        );
+        config.store.shard_count = 4;
+        config.store.tenant_partitions = 1;
+        let bounded = config.with_max_ram_bytes(ram);
+        bounded.validate().expect("physical-owner work policy");
+        let work = bounded.local_limits.native_query_work.expect("finite work");
+        assert_eq!(work.max_winner_bytes as u64 * 4, ram / 16);
+        assert_eq!(work.max_encoded_block_bytes as u64 * 4, ram / 16);
+        assert!(work.max_winner_records > 0);
+        for kind in ["missing", "rows", "bytes", "zero"] {
+            let mut local_limits = bounded.local_limits.clone();
+            if kind == "missing" {
+                local_limits.native_query_work = None;
+            } else {
+                let limits = local_limits.native_query_work.as_mut().expect("work");
+                match kind {
+                    "rows" => limits.max_winner_records += 1,
+                    "bytes" => limits.max_winner_bytes += 1,
+                    "zero" => limits.max_decoded_records = 0,
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                bounded
+                    .clone()
+                    .with_local_limits(local_limits)
+                    .validate()
+                    .is_err(),
+                "{kind}"
+            );
+        }
+    }
+}
+
+#[test]
 fn direct_embedded_log_path_is_lifecycle_checked_and_avoids_the_native_listener() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -10,6 +10,7 @@ impl MetricStripe {
         }
         Ok(Self {
             head_budget_bytes,
+            query_work_limits: None,
             head_bytes: 0,
             out_of_order_nanos: DEFAULT_OUT_OF_ORDER_NANOS,
             chunk_bytes: DEFAULT_CHUNK_BYTES,
@@ -338,6 +339,9 @@ impl MetricStripe {
 
     /// Queries exact raw hot and immutable-chunk points with index pushdown.
     pub fn query(&self, query: &MetricQuery) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        if let Some(limits) = self.query_work_limits {
+            return self.query_bounded(query, limits, None);
+        }
         let limit = query.limit.max(1);
         if let Some(series) = query.series {
             return self.query_exact_series(query, series, limit);
@@ -394,6 +398,12 @@ impl MetricStripe {
         query: &MetricQuery,
         timestamps: &[u64],
     ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        if query.series.is_none() || timestamps.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(limits) = self.query_work_limits {
+            return self.query_bounded(query, limits, Some(timestamps));
+        }
         let Some(series) = query.series else {
             return Ok(Vec::new());
         };

@@ -95,6 +95,22 @@ impl EmbeddedTelemetryConfig {
                 .max(1),
         );
         let physical_shards = u64::from(self.store.shard_count.max(1));
+        let work = crate::NativeQueryWorkLimits::for_ram_budget(max_bytes, physical_shards);
+        self.local_limits.native_query_work = Some(work);
+        for (cache, ceiling) in [
+            (
+                &mut self.local_limits.payload_cache,
+                work.max_encoded_block_bytes,
+            ),
+            (
+                &mut self.local_limits.control_cache,
+                work.max_control_object_bytes,
+            ),
+        ] {
+            let ceiling = u64::try_from(ceiling).unwrap_or(u64::MAX);
+            cache.chunk_bytes = cache.chunk_bytes.min(ceiling).max(1);
+            cache.max_read_bytes = cache.max_read_bytes.min(ceiling).max(cache.chunk_bytes);
+        }
         let queue_total = (max_bytes / 16).max(1);
         self.local_limits.queue_bytes_per_shard =
             usize_from_u64((queue_total / physical_shards).max(1));
@@ -272,6 +288,32 @@ impl EmbeddedTelemetryConfig {
                     .min(self.store.tenant_partitions)
                     .max(1),
             );
+            let work = self.local_limits.native_query_work.ok_or_else(|| {
+                LokiApiError::configuration(
+                    "bounded embedded RAM requires native query work ceilings",
+                )
+            })?;
+            work.validate()
+                .map_err(|error| LokiApiError::configuration(error.to_string()))?;
+            let ceiling = crate::NativeQueryWorkLimits::for_ram_budget(
+                max_bytes,
+                u64::from(self.store.shard_count.max(1)),
+            );
+            if work.max_encoded_block_bytes > ceiling.max_encoded_block_bytes
+                || work.max_decoded_sidecar_bytes > ceiling.max_decoded_sidecar_bytes
+                || work.max_decoded_records > ceiling.max_decoded_records
+                || work.max_winner_records > ceiling.max_winner_records
+                || work.max_winner_bytes > ceiling.max_winner_bytes
+                || work.max_control_object_bytes > ceiling.max_control_object_bytes
+                || self.local_limits.payload_cache.chunk_bytes
+                    > u64::try_from(work.max_encoded_block_bytes).unwrap_or(u64::MAX)
+                || self.local_limits.control_cache.chunk_bytes
+                    > u64::try_from(work.max_control_object_bytes).unwrap_or(u64::MAX)
+            {
+                return Err(LokiApiError::configuration(
+                    "native query work ceilings exceed the per-stripe RAM policy",
+                ));
+            }
             let heads = [
                 self.local_limits.signals.logs.head_memory_bytes_per_stripe,
                 self.local_limits

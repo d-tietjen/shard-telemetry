@@ -37,6 +37,7 @@ mod prometheus_xor;
 mod promql;
 mod query;
 mod query_index;
+mod query_work;
 mod realtime_dictionary;
 mod remote_write;
 mod rollup;
@@ -133,6 +134,7 @@ pub use promql::{
     PromqlEngine, PromqlError, PromqlLimits, PromqlSample, PromqlSeries, PromqlValue,
 };
 pub use query_index::{BlockQueryIndex, PersistentQueryIndex, QueryBlockMetadata, QueryHit};
+pub use query_work::NativeQueryWorkLimits;
 pub use realtime_dictionary::{
     RealtimeDictionaryConfig, RealtimeDictionaryObserver, RealtimeDictionaryStats,
     RealtimeDictionaryTrainer,

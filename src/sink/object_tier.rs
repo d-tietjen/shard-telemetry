@@ -239,45 +239,41 @@ pub(super) fn add_retention_report(total: &mut TierRetentionReport, report: Tier
     total.retired_objects = total.retired_objects.saturating_add(report.retired_objects);
 }
 
-pub(super) fn read_signal_tier_payloads(
+pub(super) fn for_each_signal_tier_payload(
     state: &SignalTierState,
     partitions: &[TopicPartition],
     range: TierQueryRange,
     correlation: Option<&CorrelationQuery>,
-) -> TelemetryResult<Vec<CachedObjectRange>> {
-    let mut payloads = Vec::new();
+    work: Option<crate::NativeQueryWorkLimits>,
+    mut visit: impl FnMut(&[u8]) -> TelemetryResult<()>,
+) -> TelemetryResult<()> {
     let expected_codec = match state.signal {
         TelemetrySignal::Traces => "trace-native",
         TelemetrySignal::Metrics => "metric-native",
-        TelemetrySignal::Logs => return Ok(payloads),
+        TelemetrySignal::Logs => return Ok(()),
     };
     for partition in partitions {
         let Some(tier) = state.tiers.get(partition) else {
             continue;
         };
-        let groups = match correlation {
-            Some(query) => tier.candidate_groups_cached_for_correlation(
-                range,
-                &state.control_cache,
-                query,
-                state.signal,
-            )?,
-            None => tier.candidate_groups_cached(range, &state.control_cache)?,
-        };
-        for group in groups {
-            let manifest = tier.load_group_cached(&group, &state.control_cache)?;
-            let artifact = manifest
-                .artifact(TierArtifactKind::PayloadPack)
-                .ok_or_else(|| TelemetryError::CorruptTier("group has no payload pack".into()))?;
-            let metadata = ObjectMetadata {
-                bytes: artifact.bytes,
-                version_token: artifact.checksum.clone(),
-                content_digest: artifact.checksum.clone(),
-            };
-            let blocks = manifest
-                .blocks
-                .iter()
-                .filter(|block| {
+        tier.for_each_query_group_cached(
+            range,
+            &state.control_cache,
+            correlation.map(|query| (query, state.signal)),
+            work,
+            |group| {
+                let manifest = tier.load_group_cached(group, &state.control_cache)?;
+                let artifact = manifest
+                    .artifact(TierArtifactKind::PayloadPack)
+                    .ok_or_else(|| {
+                        TelemetryError::CorruptTier("group has no payload pack".into())
+                    })?;
+                let metadata = ObjectMetadata {
+                    bytes: artifact.bytes,
+                    version_token: artifact.checksum.clone(),
+                    content_digest: artifact.checksum.clone(),
+                };
+                for block in manifest.blocks.iter().filter(|block| {
                     block.compression_codec == expected_codec
                         && range.signal_identity.is_none_or(|identity| {
                             block
@@ -307,34 +303,36 @@ pub(super) fn read_signal_tier_payloads(
                                 }
                             })
                         })
-                })
-                .collect::<Vec<_>>();
-            let ranges = blocks
-                .iter()
-                .map(|block| {
+                }) {
+                    if let Some(work) = work {
+                        work.encoded(usize::try_from(block.payload_bytes).unwrap_or(usize::MAX))?;
+                        work.rows(usize::try_from(block.record_count).unwrap_or(usize::MAX))?;
+                    }
                     let end = block
                         .payload_offset
                         .checked_add(block.payload_bytes)
                         .ok_or(TelemetryError::RecordTooLarge)?;
-                    Ok(block.payload_offset..end)
-                })
-                .collect::<TelemetryResult<Vec<_>>>()?;
-            let encoded = state.payload_cache.read_shared_ranges_with_metadata(
-                tier.object_store(),
-                &artifact.object_key,
-                &metadata,
-                &ranges,
-            )?;
-            for (block, payload) in blocks.into_iter().zip(encoded) {
-                if blake3::hash(payload.as_ref()).to_hex().as_str() != block.payload_checksum {
-                    return Err(TelemetryError::CorruptTier(format!(
-                        "signal block {} payload checksum failed",
-                        block.block_id
-                    )));
+                    let encoded = state.payload_cache.read_shared_ranges_with_metadata(
+                        tier.object_store(),
+                        &artifact.object_key,
+                        &metadata,
+                        &[block.payload_offset..end],
+                    )?;
+                    for payload in encoded {
+                        if blake3::hash(payload.as_ref()).to_hex().as_str()
+                            != block.payload_checksum
+                        {
+                            return Err(TelemetryError::CorruptTier(format!(
+                                "signal block {} payload checksum failed",
+                                block.block_id
+                            )));
+                        }
+                        visit(payload.as_ref())?;
+                    }
                 }
-                payloads.push(payload);
-            }
-        }
+                Ok(())
+            },
+        )?;
     }
-    Ok(payloads)
+    Ok(())
 }

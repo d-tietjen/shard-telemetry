@@ -150,6 +150,30 @@ and decoding work for lower retained memory. Stores without a RAM budget keep
 the default navigation policy; `DurableTelemetryLimits.correlations` can select
 an explicit policy or disable navigation independently.
 
+RAM-budget mode also supplies `DurableTelemetryLimits.native_query_work`.
+Its `NativeQueryWorkLimits` declare per-owner ceilings for encoded blocks,
+decoded sidecar/variable-value bytes and rows, control objects, distinct winners, and cumulative
+winner materialization. Each byte fragment is derived from one sixteenth of
+the configured RAM allowance divided across configured physical owner stripes; adding
+logical partitions does not multiply that allowance. Cache chunks/read bounds
+follow these ceilings. Cold native queries visit one catalog page, manifest and
+block at a time. Correlation pages retain the smallest exact references across
+all candidates, including later-published groups with earlier offsets.
+
+Winner accounting streams MessagePack into a byte counter rather than creating
+another encoded payload. It charges serialized deep payloads and concrete
+row/key headers before insertion, including replacing older logical versions;
+shared payloads are deliberately charged repeatedly. The merged owner results
+have an aggregate ceiling derived from the owner count. These are conservative
+work/materialization limits, not allocator measurements or a process RSS quota.
+A block, sidecar, winner set or result that exceeds its declared ceiling fails
+with a query-capacity error instead of returning an incomplete successful page.
+Bounded decoding also rejects sidecar frames whose content size cannot be
+verified. Stores with no work policy preserve their existing decoding and query
+behavior. An explicit work policy requires disabled retained correlation
+navigation. Additional scan latency, startup/publication state, allocator
+overhead and process memory still require operational qualification.
+
 Normalized in-process calls reject oversized input with `LokiApiError::is_bad_request()`
 before dispatching any partition or reserving a retry identity. Each exact encoded
 STEL envelope must fit the engine's append ceiling, and their combined bytes must

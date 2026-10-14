@@ -226,6 +226,7 @@ impl DurableTelemetryStore {
             stripe: config.stripe,
             signals,
             correlations: limits.correlations,
+            native_query_work: limits.native_query_work,
             state_directory: config
                 .recovery_journal
                 .then(|| config.data_directory.join("index-journal")),

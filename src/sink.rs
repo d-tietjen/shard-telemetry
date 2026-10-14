@@ -25,11 +25,11 @@ use crate::correlation::{
     span_matches_correlation,
 };
 use crate::ingest_pack::validate_ingest_pack;
+use crate::metric::decode_metric_chunk_with_work_limits;
 use crate::metric::{metric_exact_series_point_matches, metric_query_matches};
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
 use crate::stripe::LogMessageMatch;
-use crate::tier::CachedObjectRange;
-use crate::trace::{TraceProjection, decode_trace_block_matching};
+use crate::trace::{TraceProjection, decode_trace_block_with_work_limits};
 use crate::{
     CorrelationConfig, CorrelationIndex, CorrelationQuery, DictionaryCatalog, DurableMetricPoint,
     DurableSpan, LogMatch, LogPredicate, LogQuery, LogStripe, MetricApplyOutcome,
@@ -113,6 +113,8 @@ pub struct OtlpSinkConfig {
     pub signals: ShardTelemetryConfig,
     /// Bounded stripe-local links across signal metadata and labels.
     pub correlations: CorrelationConfig,
+    /// Optional native query working-set ceilings on each owner.
+    pub native_query_work: Option<crate::NativeQueryWorkLimits>,
     /// Number of durable append batches waiting to be indexed per shard.
     pub queue_slots: usize,
     /// Directory containing crash-safe stripe-local sink journals.
@@ -135,6 +137,7 @@ impl Default for OtlpSinkConfig {
             stripe: StripeConfig::default(),
             signals: ShardTelemetryConfig::default(),
             correlations: CorrelationConfig::default(),
+            native_query_work: None,
             queue_slots: 256,
             state_directory: None,
             max_journal_bytes: 64 * 1024 * 1024 * 1024,
@@ -147,6 +150,24 @@ impl Default for OtlpSinkConfig {
 impl OtlpSinkConfig {
     fn validate(&self) -> TelemetryResult<()> {
         self.signals.validate()?;
+        if let Some(limits) = self.native_query_work {
+            limits.validate()?;
+            if self.correlations != CorrelationConfig::disabled() {
+                return Err(TelemetryError::InvalidConfig(
+                    "native query work limits require disabled retained correlation navigation",
+                ));
+            }
+            if self.object_tier.as_ref().is_some_and(|tier| {
+                tier.payload_cache.chunk_bytes
+                    > u64::try_from(limits.max_encoded_block_bytes).unwrap_or(u64::MAX)
+                    || tier.control_cache.chunk_bytes
+                        > u64::try_from(limits.max_control_object_bytes).unwrap_or(u64::MAX)
+            }) {
+                return Err(TelemetryError::InvalidConfig(
+                    "cache chunks exceed native query work ceilings",
+                ));
+            }
+        }
         if self.correlations != CorrelationConfig::disabled() && !self.correlations.is_enabled() {
             return Err(TelemetryError::InvalidConfig(
                 "correlation index bounds must be all nonzero or all zero to disable navigation",
@@ -438,6 +459,7 @@ struct TelemetryStripeState {
     log_partitions: u16,
     signal_tiers: HashMap<TelemetrySignal, SignalTierState>,
     router: TelemetryRouter,
+    native_query_work: Option<crate::NativeQueryWorkLimits>,
 }
 
 #[derive(Debug)]
@@ -728,4 +750,5 @@ pub struct TelemetryService {
     object_store: Option<SharedTelemetryObjectStore>,
     router: TelemetryRouter,
     max_ingest_bytes: usize,
+    native_query_work: Option<crate::NativeQueryWorkLimits>,
 }
