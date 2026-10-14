@@ -2432,9 +2432,9 @@ dependencies = [
 
 [[package]]
 name = "pco"
-version = "1.0.3"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "386342cad4c6e97f081568e5d910ea7d871314c843aa8fc564f2a6b64cab9456"
+checksum = "52f01ab51a847e7002371c2384b2c88f50dd45982cc2764e7997751971f1bfbf"
 dependencies = [
  "better_io",
  "dtype_dispatch",
