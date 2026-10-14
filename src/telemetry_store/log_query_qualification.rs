@@ -43,10 +43,23 @@ fn fixture(name: &str) -> EmbeddedTelemetryConfig {
 }
 
 fn open(config: &EmbeddedTelemetryConfig) -> DurableTelemetryStore {
+    let mut limits = config.local_limits.clone();
+    if let Some(work) = limits.native_query_work {
+        // Refusal cases tighten work after ingesting the original prefix.
+        // Their reopened caches must honor the same declared read ceilings.
+        for (cache, maximum) in [
+            (&mut limits.payload_cache, work.max_encoded_block_bytes),
+            (&mut limits.control_cache, work.max_control_object_bytes),
+        ] {
+            let maximum = u64::try_from(maximum).expect("work ceiling");
+            cache.chunk_bytes = cache.chunk_bytes.min(maximum).max(1);
+            cache.max_read_bytes = cache.max_read_bytes.min(maximum).max(cache.chunk_bytes);
+        }
+    }
     DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
         config.store.clone(),
         config.object_tier,
-        config.local_limits.clone(),
+        limits,
     )
     .expect("actual store")
 }
