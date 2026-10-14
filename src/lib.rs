@@ -35,6 +35,7 @@ mod prometheus_api;
 mod prometheus_protocol;
 mod prometheus_xor;
 mod promql;
+mod provider_status;
 mod query;
 mod query_index;
 mod query_work;
@@ -133,6 +134,14 @@ pub use production::{
 pub use prometheus_api::{PrometheusApiConfig, PrometheusService, prometheus_router};
 pub use promql::{
     PromqlEngine, PromqlError, PromqlLimits, PromqlSample, PromqlSeries, PromqlValue,
+};
+pub use provider_status::{
+    LocalPartitionPopulation, LocalPartitionProgress, LocalPartitionStatus,
+    MAX_PROVIDER_STATUS_PARTITIONS, MAX_PROVIDER_STATUS_REQUEST_BYTES,
+    MAX_PROVIDER_STATUS_RESPONSE_BYTES, ProviderCoverage, ProviderStatusPartition,
+    ProviderStatusRequest, ProviderStatusResponse, decode_native_provider_status_request,
+    decode_native_provider_status_response, encode_native_provider_status_request,
+    encode_native_provider_status_response,
 };
 pub use query_index::{BlockQueryIndex, PersistentQueryIndex, QueryBlockMetadata, QueryHit};
 pub use query_work::NativeQueryWorkLimits;

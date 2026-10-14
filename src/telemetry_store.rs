@@ -55,6 +55,9 @@ mod correlation_qualification;
 mod log_query_qualification;
 mod loki;
 mod native_query;
+mod provider_status;
+#[cfg(test)]
+mod provider_status_qualification;
 mod remote_write;
 mod retention;
 #[cfg(test)]

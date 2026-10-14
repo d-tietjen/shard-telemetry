@@ -10,7 +10,7 @@ Every request and response begins with a fixed 32-byte little-endian header:
 | ---: | ---: | --- |
 | 0 | 4 | Magic `STNP` |
 | 4 | 1 | Version `1` |
-| 5 | 1 | Opcode: append `1`, query `2`, ping `3`, authenticate `4`, metric query `5`, trace query `6`, describe `7`, untracked append `8`, log page query `9` |
+| 5 | 1 | Opcode: append `1`, query `2`, ping `3`, authenticate `4`, metric query `5`, trace query `6`, describe `7`, untracked append `8`, log page query `9`, local provider status `10` |
 | 6 | 1 | Flags; bit 0 marks a response |
 | 7 | 1 | Status |
 | 8 | 16 | Caller-selected request ID |
@@ -100,6 +100,78 @@ raise the outbound window. A configured outbound cap can return
 `TooManyRequests` when the encoded page exceeds it.
 
 Full LogQL, PromQL, and TraceQL remain on the compatible HTTP APIs.
+
+## Local provider status
+
+Opcode `10` accepts a fixed-format `STP1` selection and returns `STP2` local
+partition observations. It preserves existing `Describe` fields and encoding;
+older servers can reject the unknown opcode or close the connection. Clients
+must preserve unknown coverage on every protocol, authentication, admission,
+timeout, or transport error. An old peer's failed exchange is not a successful
+empty status. Deploy a status-capable server before using the client API.
+
+`ProviderStatusRequest` selects 1–768 nonduplicate signal/partition pairs, in
+caller order. Its tenant is 1–1024 UTF-8 bytes; an optional plane is 1–64 bytes.
+An optional raw 16-byte organization UUID and inclusive-start/exclusive-end
+timestamps are echoed exactly. These optional fields are caller context, not
+authorization or proof. This opcode requires configured production controls;
+an anonymous/default listener refuses it even though older development
+operations keep their existing behavior. Production authenticates the existing
+single-tenant credential and requires the request tenant to match. The metadata describes
+whole native partitions, including other organizations that share them.
+
+The request has a 44-byte fixed header: `STP1`, one flags byte (UUID, plane,
+start, end), one reserved zero byte, little-endian u16 tenant length, plane
+length and count, raw UUID (zero when absent), and two little-endian u64
+timestamps (zero when absent). UTF-8 tenant and plane bytes follow, then one
+u8 signal and u32 partition ID per selection. Counts and exact byte lengths
+are checked before allocation. The native reader rejects requests larger than
+8 KiB before allocating or reading the body.
+
+The response contains `STP2`, a u32 encoded-request length and exact request,
+five zero bytes for the unknown proof dimensions below, a u16 status count,
+and fixed 63-byte partition observations. Each observation has signal and
+partition ID, a population byte (unknown, verified empty, allocated), progress
+flags, and seven u64 values: WAL retained start, allocated end, contiguous log
+end, last stable offset, replicated high watermark, applied index end, and
+applied next placement sequence. Flags distinguish unknown progress and absent
+checkpoints from observed zero. Unknown/absent values have zero wire storage,
+not a positive zero watermark. All offsets are exclusive ends except the WAL
+retained start; offset zero is a real first record. The response is at most
+64 KiB; the client checks this bound before allocation and rejects changed
+scope, order, counts, impossible frontiers, unsupported proof claims, malformed
+UTF-8, truncation or trailing bytes. Existing connection frame/outbound bounds
+can impose a smaller limit and refuse the response explicitly.
+
+`DurableTelemetryStore::local_provider_status` reads the actual per-partition
+StreamEngine watermarks, then its actual durable-sink checkpoint, then the same
+watermarks again. It performs no record query or whole-catalog enumeration.
+Concurrent frontier changes, metadata errors, impossible checkpoint coordinates
+or deadline exhaustion leave that partition unknown. Observed applied ends
+cannot exceed the sampled stable WAL frontier. The distinct placement sequence
+is not converted into a record offset. These are sequential per-partition
+observations, not a transaction across the selected partitions.
+
+Verified empty requires an SDK-owned standalone partition, a successfully
+loaded initial sink checkpoint, and coherent zero allocation/resolved/replica
+frontiers. Attached or HA zero-frontier partitions remain unknown. Allocated
+means an offset was assigned; resolved frontiers can include aborted slots and
+do not establish that a durable telemetry record or retained query row exists.
+An applied checkpoint records previously completed indexing/publication, and
+may remain advanced after query payloads expire. The WAL retained floor does
+not identify the earliest queryable object-tier row. This API therefore keeps
+query-retention coverage, requested source-interval coverage, scoped loss,
+HA assignment epoch, and indexed replica quorum explicitly **unknown**. It
+never reports full availability or an organization-scoped queryable watermark.
+
+Status uses the existing complete-query product gate, lifecycle/query admission,
+authentication, inbound/outbound reservations and production query deadline.
+One sampling budget stops additional metadata reads after expiration. An engine
+checkpoint operation already in progress can outlive that budget; its physical
+blocking worker retains the query permit until it finishes, including after a
+native timeout response. Direct Rust callers must provide equivalent physical
+admission and authorization. Remote receipt of this status is local evidence
+from that server, not indexed-quorum proof or a source/loss completeness claim.
 
 ## Ports and durability
 

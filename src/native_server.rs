@@ -3,6 +3,9 @@ mod server;
 pub use server::serve_native;
 mod dispatch;
 use dispatch::*;
+mod provider_status;
+#[cfg(test)]
+mod provider_status_qualification;
 #[cfg(test)]
 mod tests;
 

@@ -189,6 +189,14 @@ pub(super) async fn serve_connection(
                 "native frame exceeds the configured connection limit",
             ));
         }
+        if header.opcode == NativeOpcode::ProviderStatus
+            && header.payload_len as usize > crate::MAX_PROVIDER_STATUS_REQUEST_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native status request exceeds its fixed byte limit",
+            ));
+        }
         let inbound_permit = if header.payload_len == 0 {
             None
         } else {
@@ -257,6 +265,7 @@ pub(super) async fn serve_connection(
                     | NativeOpcode::QueryLogsPage
                     | NativeOpcode::QueryMetrics
                     | NativeOpcode::QueryTraces
+                    | NativeOpcode::ProviderStatus
             ) {
                 match outbound_budget
                     .clone()

@@ -13,12 +13,16 @@ pub(super) async fn dispatch(
             | NativeOpcode::QueryLogsPage
             | NativeOpcode::QueryMetrics
             | NativeOpcode::QueryTraces
+            | NativeOpcode::ProviderStatus
     ) && let Some(gate) = &config.request_gate
         && let Err(error) = gate.check_query()
     {
         return error_frame(header, NativeStatus::Unavailable, &error);
     }
     match header.opcode {
+        NativeOpcode::ProviderStatus => {
+            super::provider_status::dispatch_provider_status(header, payload, store, config).await
+        }
         NativeOpcode::Ping => ok_frame(header, payload),
         NativeOpcode::Describe => {
             if let Some(gate) = &config.request_gate

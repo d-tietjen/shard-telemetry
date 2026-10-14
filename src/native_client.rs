@@ -383,11 +383,39 @@ impl ShardTelemetryClient {
     }
 
     /// Returns the authenticated server's native protocol and signal support.
+    ///
+    /// Existing Describe encoding is independent of the provider-status extension.
     pub async fn describe(&self) -> Result<NativeCapabilities, NativeClientError> {
         let response = self
             .request(NativeOpcode::Describe, self.next_request_id(), Vec::new())
             .await?;
         decode_native_capabilities(&response).map_err(Into::into)
+    }
+
+    /// Observes local applied prefixes from a status-capable authenticated peer.
+    ///
+    /// Older peers fail the exchange; callers must retain unknown coverage on any
+    /// error. Success reports partition-wide local metadata, never organization,
+    /// source-interval, loss, query-retention, or indexed-quorum completeness.
+    pub async fn provider_status(
+        &self,
+        request: &crate::ProviderStatusRequest,
+    ) -> Result<crate::ProviderStatusResponse, NativeClientError> {
+        let payload = crate::encode_native_provider_status_request(request)?;
+        let bytes = self
+            .request(
+                NativeOpcode::ProviderStatus,
+                self.next_request_id(),
+                payload,
+            )
+            .await?;
+        let response = crate::decode_native_provider_status_response(&bytes)?;
+        if response.request != *request {
+            return Err(NativeClientError::new(
+                "native status response does not match the requested scope and selection",
+            ));
+        }
+        Ok(response)
     }
 
     /// Checks native listener health and verifies a reusable round trip.
@@ -425,7 +453,13 @@ impl ShardTelemetryClient {
         let exchange = exchange(
             connection.stream_mut(),
             request,
-            self.config.max_frame_bytes,
+            if opcode == NativeOpcode::ProviderStatus {
+                self.config
+                    .max_frame_bytes
+                    .min(crate::MAX_PROVIDER_STATUS_RESPONSE_BYTES)
+            } else {
+                self.config.max_frame_bytes
+            },
         );
         match tokio::time::timeout(self.config.request_timeout, exchange).await {
             Ok(Ok(response)) => {

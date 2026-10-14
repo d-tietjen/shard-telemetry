@@ -23,6 +23,8 @@ process, and contributor expectations are public and linked below.
 
 - Native STEL ingestion and query over TCP, with checksummed envelopes and
   durable acknowledgements.
+- Bounded authenticated native status for actual local WAL and applied-index
+  frontiers, with source, retention, scoped-loss and HA coverage explicitly unknown.
 - OTLP/gRPC and OTLP/HTTP ingestion for logs, traces, and metrics.
 - Signal-aware storage, immutable query-index artifacts, and a bounded local
   cache for object-tier reads.
