@@ -404,15 +404,17 @@ fn provider_status_attached_empty_partition_keeps_ownership_unknown() {
     let directory = Directory::new("attached");
     let standalone = DurableTelemetryStore::open(config(&directory))
         .expect("real externally owned engine and sink");
-    let attached = DurableTelemetryStore::attach(
-        directory.0.join("host-metadata"),
-        Arc::clone(&standalone.engine),
-        standalone.service.clone(),
-        1,
-        1,
-        Duration::from_secs(10),
-        None,
-    )
+    let attached = DurableTelemetryStore::attach_with_engine_handle(TelemetryEngineAttachment {
+        data_directory: directory.0.join("host-metadata"),
+        engine: standalone.engine.clone(),
+        service: standalone.service.clone(),
+        tenant_partitions: 1,
+        ingest_stripes_per_tenant: 1,
+        indexed_ack_timeout: Duration::from_secs(10),
+        retention: None,
+        append_durability: TelemetryAppendDurability::Leader,
+        append_gate: None,
+    })
     .expect("actual host attachment");
     let request = all_signal_request();
     let owned = standalone

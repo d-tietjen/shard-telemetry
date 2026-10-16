@@ -46,6 +46,14 @@ reservation. Existing gates default to no token for unfenced compatibility,
 which cannot authorize a fenced engine. This handoff does not establish HA
 query ownership, indexed quorum, source coverage or retained-query completeness.
 
+Hosts that recover an `EngineHandle` can attach it with
+`TelemetryEngineAttachment` and `DurableTelemetryStore::attach_with_engine_handle`.
+The store retains the complete engine owner, including recovered directory
+ownership, through ingestion and query work. The existing
+`TelemetryHostAttachment` API continues to accept `Arc<StreamEngine>` and uses
+the same attachment implementation. Hosts remain responsible for startup
+deadlines, sink installation, write fencing and readiness.
+
 ## Related projects
 
 ShardTelemetry is standalone; it does not declare a runtime dependency on the

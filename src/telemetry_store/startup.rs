@@ -282,7 +282,7 @@ impl DurableTelemetryStore {
         }
         Ok(Self {
             _data_directory_lease: data_directory_lease,
-            engine,
+            engine: engine.into(),
             service,
             append_durability: Durability::Leader,
             append_gate: None,
@@ -352,7 +352,19 @@ impl DurableTelemetryStore {
     pub fn attach_with_durability(
         attachment: TelemetryHostAttachment,
     ) -> Result<Self, LokiApiError> {
-        let TelemetryHostAttachment {
+        Self::attach_with_engine_handle(attachment.into())
+    }
+
+    /// Attaches the query and ingestion store to the host's complete engine owner.
+    ///
+    /// This uses the same validation, topic creation and durability behavior as
+    /// [`Self::attach_with_durability`]. It retains the supplied recovery wrapper
+    /// for every store operation; it never extracts or opens another engine.
+    /// The caller still owns startup deadlines, readiness and write permission.
+    pub fn attach_with_engine_handle(
+        attachment: TelemetryEngineAttachment,
+    ) -> Result<Self, LokiApiError> {
+        let TelemetryEngineAttachment {
             data_directory,
             engine,
             service,

@@ -22,7 +22,7 @@ use shard_stream_core::{
 };
 use shard_stream_engine::{
     DurableSinkCheckpoint, DurableSinkConfig, DurableSinkOptions, EngineConfig, EngineError,
-    StreamEngine, TopicConfig,
+    EngineHandle, StreamEngine, TopicConfig,
 };
 use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest};
 
@@ -57,6 +57,8 @@ mod correlation_qualification;
 mod log_query_qualification;
 mod loki;
 mod native_query;
+#[cfg(all(test, unix))]
+mod owned_engine_attachment_qualification;
 mod provider_status;
 #[cfg(test)]
 mod provider_status_qualification;
@@ -401,7 +403,7 @@ impl DurableTelemetryConfig {
 /// appends and whose reads execute on the owning ShardTelemetry stripe workers.
 pub struct DurableTelemetryStore {
     _data_directory_lease: DataDirectoryLease,
-    engine: Arc<StreamEngine>,
+    engine: EngineHandle,
     service: TelemetryService,
     append_durability: Durability,
     append_gate: Option<Arc<dyn TelemetryAppendGate>>,
@@ -507,6 +509,77 @@ impl std::fmt::Debug for TelemetryHostAttachment {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TelemetryHostAttachment")
+            .field("data_directory", &self.data_directory)
+            .field("tenant_partitions", &self.tenant_partitions)
+            .field("ingest_stripes_per_tenant", &self.ingest_stripes_per_tenant)
+            .field("indexed_ack_timeout", &self.indexed_ack_timeout)
+            .field("retention", &self.retention)
+            .field("append_durability", &self.append_durability)
+            .field("append_gate_configured", &self.append_gate.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A host attachment that retains the complete stream-engine owner.
+///
+/// Use this attachment when recovery returns an [`EngineHandle`]. Cloning the
+/// handle retains that same recovered engine and its directory ownership. The
+/// attachment creates no engine, write fence, readiness or startup permission.
+/// Hosts must install the matching sink and their actual assignment and fencing
+/// policy before attachment, as for [`TelemetryHostAttachment`].
+#[derive(Clone)]
+pub struct TelemetryEngineAttachment {
+    /// Product-owned directory for delete state, retry receipts and query metadata.
+    pub data_directory: PathBuf,
+    /// The host's already-opened engine, including its retained recovery owner.
+    pub engine: EngineHandle,
+    /// Query service from the exact sink factory installed in this engine.
+    pub service: TelemetryService,
+    /// Common logical signal partition count.
+    pub tenant_partitions: u32,
+    /// Number of physical sink-owner stripes selected by the host.
+    pub ingest_stripes_per_tenant: u32,
+    /// Bound for waiting on local query-index visibility.
+    pub indexed_ack_timeout: Duration,
+    /// Optional logical retention window.
+    pub retention: Option<Duration>,
+    /// WAL durability required before an append acknowledgement.
+    pub append_durability: TelemetryAppendDurability,
+    /// Actual host admission and leader-fencing check for every append path.
+    pub append_gate: Option<Arc<dyn TelemetryAppendGate>>,
+}
+
+impl From<TelemetryHostAttachment> for TelemetryEngineAttachment {
+    fn from(attachment: TelemetryHostAttachment) -> Self {
+        let TelemetryHostAttachment {
+            data_directory,
+            engine,
+            service,
+            tenant_partitions,
+            ingest_stripes_per_tenant,
+            indexed_ack_timeout,
+            retention,
+            append_durability,
+            append_gate,
+        } = attachment;
+        Self {
+            data_directory,
+            engine: engine.into(),
+            service,
+            tenant_partitions,
+            ingest_stripes_per_tenant,
+            indexed_ack_timeout,
+            retention,
+            append_durability,
+            append_gate,
+        }
+    }
+}
+
+impl std::fmt::Debug for TelemetryEngineAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TelemetryEngineAttachment")
             .field("data_directory", &self.data_directory)
             .field("tenant_partitions", &self.tenant_partitions)
             .field("ingest_stripes_per_tenant", &self.ingest_stripes_per_tenant)

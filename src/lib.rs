@@ -183,7 +183,7 @@ pub(crate) use telemetry::{
 pub use telemetry_store::{
     DurableTelemetryConfig, DurableTelemetryLimits, DurableTelemetryStore, FetchedTelemetryBatch,
     LifetimeRollupReport, RetentionReport, TelemetryAppendDurability, TelemetryAppendGate,
-    TelemetryHostAttachment,
+    TelemetryEngineAttachment, TelemetryHostAttachment,
 };
 pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};
 pub use tier::{
