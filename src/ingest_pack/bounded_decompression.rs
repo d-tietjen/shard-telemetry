@@ -33,8 +33,8 @@ pub(crate) struct FrameDecompressionLimits {
     pub(crate) max_work_bytes: usize,
 }
 #[derive(Debug)]
-pub(super) enum Failure {
-    Refused(NativeResumeRefusal),
+pub(super) enum Failure<R = NativeResumeRefusal> {
+    Refused(R),
     Limits,
     Allocation(TryReserveError),
     Native,
@@ -42,14 +42,48 @@ pub(super) enum Failure {
     Panic,
     State,
 }
-type Result<T> = std::result::Result<T, Failure>;
-fn add(a: usize, b: usize) -> Result<usize> {
+type Result<T, R = NativeResumeRefusal> = std::result::Result<T, Failure<R>>;
+
+/// Mandatory admission at the existing native codec boundaries. A concrete
+/// owner is monomorphized into the attempt; the native path gains no wrapper,
+/// trait object, storage field or alternative reservation policy.
+pub(super) trait FrameWork {
+    type Refusal: Error + 'static;
+    fn check(&mut self) -> std::result::Result<(), Self::Refusal>;
+    fn pay(
+        &mut self,
+        bytes: usize,
+        entries: usize,
+        work: usize,
+    ) -> std::result::Result<(), Self::Refusal>;
+    #[cfg(unix)]
+    fn original_expiry(&self) -> std::time::Instant;
+}
+impl FrameWork for NativeResumeWork {
+    type Refusal = NativeResumeRefusal;
+    fn check(&mut self) -> std::result::Result<(), Self::Refusal> {
+        NativeResumeWork::check(self)
+    }
+    fn pay(
+        &mut self,
+        bytes: usize,
+        entries: usize,
+        work: usize,
+    ) -> std::result::Result<(), Self::Refusal> {
+        self.reserve_values(bytes, 0, entries, work)
+    }
+    #[cfg(unix)]
+    fn original_expiry(&self) -> std::time::Instant {
+        self.absolute_expiry()
+    }
+}
+fn add<R>(a: usize, b: usize) -> Result<usize, R> {
     a.checked_add(b).ok_or(Failure::Limits)
 }
-fn mul(a: usize, b: usize) -> Result<usize> {
+fn mul<R>(a: usize, b: usize) -> Result<usize, R> {
     a.checked_mul(b).ok_or(Failure::Limits)
 }
-fn codec(message: &'static str) -> Failure {
+fn codec<R>(message: &'static str) -> Failure<R> {
     Failure::Codec(TelemetryError::InvalidBlockEncoding(message))
 }
 struct Step {
@@ -57,7 +91,7 @@ struct Step {
     read: usize,
     written: usize,
 }
-struct Attempt {
+struct Attempt<W: FrameWork = NativeResumeWork> {
     input: Bytes,
     expected_bytes: usize,
     expected_records: u32,
@@ -79,18 +113,51 @@ struct Attempt {
     work_bytes: usize,
     panic: Option<Box<dyn Any + Send>>,
     limits: FrameDecompressionLimits,
-    work: NativeResumeWork,
+    work: W,
     // Actual native state outlives its results and all produced bytes.
     context: Option<DCtx<'static>>,
 }
-pub(super) struct PreparedDecompressedFrame {
-    retained: Attempt,
+pub(super) struct PreparedDecompressedFrame<W: FrameWork = NativeResumeWork> {
+    retained: Attempt<W>,
 }
-pub(super) struct RetainedFrameDecompressionError {
-    pub(super) cause: Failure,
-    retained: Attempt,
+pub(super) struct RetainedFrameDecompressionError<W: FrameWork = NativeResumeWork> {
+    pub(super) cause: Failure<W::Refusal>,
+    retained: Attempt<W>,
 }
-impl PreparedDecompressedFrame {
+impl<W: FrameWork> PreparedDecompressedFrame<W> {
+    #[cfg(unix)]
+    pub(super) fn work(&self) -> &W {
+        &self.retained.work
+    }
+    #[cfg(unix)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain the original work and native outcomes inline without a refusal allocation"
+    )]
+    pub(super) fn next_until(
+        self,
+        input: Bytes,
+        expected_bytes: usize,
+        expected_records: u32,
+        limits: FrameDecompressionLimits,
+    ) -> std::result::Result<Self, RetainedFrameDecompressionError<W>> {
+        // Only a successful, physically completed frame can continue. Release
+        // its completed native/data owners before entering the next frame;
+        // move the exact cumulative work owner without an extractor or reset.
+        let Attempt {
+            work,
+            context,
+            input: previous,
+            output,
+            structural,
+            section,
+            steps,
+            panic,
+            ..
+        } = self.retained;
+        drop((previous, output, structural, section, steps, panic, context));
+        decompress_frame_with_work(input, expected_bytes, expected_records, limits, work)
+    }
     pub(super) fn structural(&self) -> Option<&Bytes> {
         self.retained.structural.as_ref()
     }
@@ -117,7 +184,7 @@ impl PreparedDecompressedFrame {
         self.retained.work_bytes
     }
 }
-impl fmt::Debug for PreparedDecompressedFrame {
+impl<W: FrameWork> fmt::Debug for PreparedDecompressedFrame<W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PreparedDecompressedFrame")
             .field("produced", &self.retained.produced)
@@ -125,7 +192,11 @@ impl fmt::Debug for PreparedDecompressedFrame {
             .finish_non_exhaustive()
     }
 }
-impl RetainedFrameDecompressionError {
+impl<W: FrameWork> RetainedFrameDecompressionError<W> {
+    #[cfg(unix)]
+    pub(super) fn work(&self) -> &W {
+        &self.retained.work
+    }
     #[allow(
         dead_code,
         reason = "preserve read-only decoder custody diagnostics without a mutable owner extractor"
@@ -182,7 +253,7 @@ impl RetainedFrameDecompressionError {
         self.retained.panic.is_some()
     }
 }
-impl fmt::Debug for RetainedFrameDecompressionError {
+impl<W: FrameWork> fmt::Debug for RetainedFrameDecompressionError<W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RetainedFrameDecompressionError")
             .field("cause", &self.cause)
@@ -194,12 +265,12 @@ impl fmt::Debug for RetainedFrameDecompressionError {
             .finish_non_exhaustive()
     }
 }
-impl fmt::Display for RetainedFrameDecompressionError {
+impl<W: FrameWork> fmt::Display for RetainedFrameDecompressionError<W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
 }
-impl Error for RetainedFrameDecompressionError {
+impl<W: FrameWork> Error for RetainedFrameDecompressionError<W> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.cause {
             Failure::Refused(e) => Some(e),
@@ -223,6 +294,26 @@ pub(super) fn decompress_structural_frame_until(
     limits: FrameDecompressionLimits,
     work: &NativeResumeWork,
 ) -> std::result::Result<PreparedDecompressedFrame, RetainedFrameDecompressionError> {
+    decompress_frame_with_work(
+        input,
+        expected_bytes,
+        expected_records,
+        limits,
+        work.clone(),
+    )
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "retain complete original owners and native outcomes inline without a refusal allocation"
+)]
+pub(super) fn decompress_frame_with_work<W: FrameWork>(
+    input: Bytes,
+    expected_bytes: usize,
+    expected_records: u32,
+    limits: FrameDecompressionLimits,
+    work: W,
+) -> std::result::Result<PreparedDecompressedFrame<W>, RetainedFrameDecompressionError<W>> {
     let mut retained = Attempt {
         input,
         expected_bytes,
@@ -245,7 +336,7 @@ pub(super) fn decompress_structural_frame_until(
         work_bytes: 0,
         panic: None,
         limits,
-        work: work.clone(),
+        work,
         context: None,
     };
     let actual = catch_unwind(AssertUnwindSafe(|| retained.run()));
@@ -259,8 +350,8 @@ pub(super) fn decompress_structural_frame_until(
     };
     Err(RetainedFrameDecompressionError { cause, retained })
 }
-impl Attempt {
-    fn pay(&mut self, bytes: usize, entries: usize, work: usize) -> Result<()> {
+impl<W: FrameWork> Attempt<W> {
+    fn pay(&mut self, bytes: usize, entries: usize, work: usize) -> Result<(), W::Refusal> {
         let d = add(self.declared, bytes)?;
         let e = add(self.entries, entries)?;
         let w = add(self.work_bytes, work)?;
@@ -271,25 +362,25 @@ impl Attempt {
             return Err(Failure::Limits);
         }
         self.work
-            .reserve_values(bytes, 0, entries, work)
+            .pay(bytes, entries, work)
             .map_err(Failure::Refused)?;
         self.declared = d;
         self.entries = e;
         self.work_bytes = w;
         Ok(())
     }
-    fn observed(&self, phase: &'static str) -> Result<()> {
+    fn observed(&mut self, phase: &'static str) -> Result<(), W::Refusal> {
         #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
-        super::bounded_frames::observe_decompression(self.work.absolute_expiry(), phase);
+        super::bounded_frames::observe_decompression(self.work.original_expiry(), phase);
         #[cfg(not(all(test, any(target_os = "linux", target_os = "android"))))]
         let _ = phase;
         self.work.check().map_err(Failure::Refused)
     }
-    fn capture_context_size(&mut self) -> Result<()> {
+    fn capture_context_size(&mut self) -> Result<(), W::Refusal> {
         self.observed_decoder_bytes = self.context.as_ref().ok_or(Failure::State)?.sizeof();
         Ok(())
     }
-    fn admit_context_size(&mut self) -> Result<()> {
+    fn admit_context_size(&mut self) -> Result<(), W::Refusal> {
         let extra = self
             .observed_decoder_bytes
             .saturating_sub(self.prepaid_decoder_bytes);
@@ -302,7 +393,7 @@ impl Attempt {
         }
         Ok(())
     }
-    fn run(&mut self) -> Result<()> {
+    fn run(&mut self) -> Result<(), W::Refusal> {
         self.work.check().map_err(Failure::Refused)?;
         let l = self.limits;
         if [
@@ -338,8 +429,8 @@ impl Attempt {
         let fixed = add(
             size_of::<Self>(),
             add(
-                size_of::<PreparedDecompressedFrame>(),
-                size_of::<RetainedFrameDecompressionError>(),
+                size_of::<PreparedDecompressedFrame<W>>(),
+                size_of::<RetainedFrameDecompressionError<W>>(),
             )?,
         )?;
         self.pay(add(self.input.len(), fixed)?, 3, fixed)?;

@@ -90,6 +90,19 @@ thread before reporting late failure. The host registry contract remains
 responsible for every actual entered native handle. The worker captures only
 shared state, avoiding a worker/registry strong-reference cycle.
 
+The recovery-ledger decoder entry point consumes the original already-spent
+setup ledger and uses the same retained streaming decoder as native resume.
+Only recovery retained/work axes are charged; decoder entries keep their
+explicit child ceiling and are not JSON records or filesystem reads. A success
+can consume itself to reconstruct the next real frame on the same cumulative
+ledger and original E, releasing the completed previous decoder first. A
+failure retains the real native context, results, output prefix and ledger
+without a retry or mutable native/work extractor. The native resume adapter
+keeps its actual work owner, field layout and sized admission formula. This
+is structural-frame decoder substrate; bounded typed-row reconstruction, the
+owned query worker/facade and host/HA query ownership remain separate gates.
+The new adapter regressions require actual qualification on their own source.
+
 Existing fixture groups define actual filesystem/WAL/constructor/worker coverage.
 The positive group calls a real recovered engine's complete bounded resume
 through this actual factory and asserts native Applied observation, job debit,

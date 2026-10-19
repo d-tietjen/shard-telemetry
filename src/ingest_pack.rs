@@ -5,10 +5,16 @@ use std::sync::Arc;
 
 mod bounded_decompression;
 mod bounded_frames;
+#[cfg(unix)]
+mod recovery_decompression;
 pub(crate) use bounded_decompression::FrameDecompressionLimits;
 pub(crate) use bounded_frames::{
     IndexedFramePreparationLimits, PreparedIndexedIngestFrames, RetainedIndexedFrameError,
     prepare_indexed_ingest_frames_until,
+};
+#[cfg(unix)]
+pub use recovery_decompression::{
+    PreparedRecoveredLogFrame, RetainedRecoveredLogFrameError, decompress_recovered_log_frame_until,
 };
 
 use bytes::Bytes;

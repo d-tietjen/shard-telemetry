@@ -85,6 +85,10 @@ pub use envelope::{MAX_TELEMETRY_ENVELOPE_BYTES, TelemetryEnvelope};
 pub use error::{TelemetryError, TelemetryResult};
 #[cfg(feature = "fast-telemetry")]
 pub use fast_telemetry::{FastTelemetryConfig, FastTelemetryExportReport, FastTelemetryExporter};
+#[cfg(unix)]
+pub use ingest_pack::{
+    PreparedRecoveredLogFrame, RetainedRecoveredLogFrameError, decompress_recovered_log_frame_until,
+};
 pub use locality::{
     CompressionBlockAssignment, CompressionBlockCollator, CompressionBlockScore,
     CompressionLocalityConfig, CompressionLocalityRecord, CompressionLocalityStats,

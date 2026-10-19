@@ -1142,3 +1142,295 @@ fn actual_child_failure_and_same_cumulative_work_refusal_keep_whole_sources() {
         assert!(work.check().is_err());
     });
 }
+
+fn recovery_decompression_policy() -> crate::OwnedLogDecompressionLimits {
+    let p = decompression_policy();
+    crate::OwnedLogDecompressionLimits {
+        max_input_bytes: p.max_input_bytes,
+        max_output_bytes: p.max_output_bytes,
+        input_chunk_bytes: p.input_chunk_bytes,
+        output_chunk_bytes: p.output_chunk_bytes,
+        max_stream_calls: p.max_stream_calls,
+        max_window_log: p.max_window_log,
+        max_decoder_bytes: p.max_decoder_bytes,
+        max_declared_bytes: p.max_declared_bytes,
+        max_entries: p.max_entries,
+        max_work_bytes: p.max_work_bytes,
+    }
+}
+
+fn recovery_decompression_budget_limits() -> crate::TelemetryRecoveryLimits {
+    crate::TelemetryRecoveryLimits {
+        max_path_bytes: 8192,
+        max_file_bytes: 1 << 20,
+        max_read_bytes: 1 << 20,
+        max_directory_entries: 1024,
+        max_records: 1024,
+        max_json_values: 4096,
+        max_string_bytes: 1 << 20,
+        max_retained_bytes: 32 << 20,
+        max_work_bytes: 128 << 20,
+    }
+}
+
+fn persisted_frame_setup_work(
+    compressed: &[u8],
+    expiry: Instant,
+) -> (
+    Bytes,
+    crate::TelemetryRecoveryBudget,
+    crate::TelemetryRecoveryUsage,
+) {
+    let directory = Directory::new();
+    let path = directory.0.join("actual-structural-frame.zst");
+    fs::write(&path, compressed).expect("persist actual producer frame");
+    let mut original =
+        crate::TelemetryRecoveryBudget::new(recovery_decompression_budget_limits(), expiry)
+            .expect("one original finite setup ledger before recovery");
+    let input = Bytes::from(original.read_file(&path).expect("real admitted frame read"));
+    let before = original.usage();
+    assert!(before.read_bytes > 0 && before.retained_bytes > 0 && before.work_bytes > 0);
+    (input, original, before)
+}
+
+#[test]
+fn recovery_decoder_continues_on_spent_setup_ledger_with_native_parity() {
+    with_work(Duration::from_secs(30), |native_work| {
+        let sample = original_pack(12, 1);
+        let mut cursor = IngestPackCursor::new(&sample.payload, 12).expect("actual wire cursor");
+        let group = cursor.next_group().expect("real original structural frame");
+        let native = decompress_structural_frame_until(
+            Bytes::copy_from_slice(group.compressed),
+            group.structural_bytes,
+            12,
+            decompression_policy(),
+            native_work,
+        )
+        .expect("original real-native adapter");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let (input, original, before) = persisted_frame_setup_work(group.compressed, expiry);
+        let first = crate::decompress_recovered_log_frame_until(
+            input.clone(),
+            group.structural_bytes,
+            12,
+            recovery_decompression_policy(),
+            original,
+        )
+        .expect("actual already-spent recovery ledger");
+        assert_eq!(first.original_expiry(), expiry);
+        assert_eq!(
+            first.structural_bytes(),
+            native.structural().map(Bytes::as_ref)
+        );
+        assert_eq!(first.stream_calls(), native.stream_calls());
+        assert!(first.stream_calls() > 1);
+        let used = first.recovery_usage();
+        assert!(used.retained_bytes > before.retained_bytes && used.work_bytes > before.work_bytes);
+        assert_eq!(used.read_bytes, before.read_bytes);
+        assert_eq!(used.records, before.records);
+        assert_eq!(used.json_values, before.json_values);
+        let mut exact = recovery_decompression_policy();
+        exact.max_work_bytes = first.decoder_work_bytes();
+        let second = first
+            .decompress_next_until(input.clone(), group.structural_bytes, 12, exact)
+            .expect("next actual frame uses the SAME spent ledger at exact measured child work");
+        assert_eq!(second.original_expiry(), expiry);
+        assert_eq!(
+            second.structural_bytes(),
+            native.structural().map(Bytes::as_ref)
+        );
+        assert!(second.recovery_usage().work_bytes > used.work_bytes);
+        let before_short = second.recovery_usage();
+        exact.max_work_bytes -= 1;
+        let short = second
+            .decompress_next_until(input, group.structural_bytes, 12, exact)
+            .expect_err("one less actual child work after two frames on the same ledger");
+        assert_eq!(short.original_expiry(), expiry);
+        assert!(short.has_native_context());
+        assert!(!short.output_prefix().is_empty());
+        assert!(short.recovery_usage().work_bytes > before_short.work_bytes);
+        assert_eq!(short.recovery_usage().read_bytes, before.read_bytes);
+        assert_eq!(short.recovery_usage().records, before.records);
+        assert_eq!(short.recovery_usage().json_values, before.json_values);
+
+        // Observe the parent cap from two real decodes, then create each
+        // independent original ledger before identical file-read setup. One
+        // fixed path prevents path-length drift from changing actual fees.
+        let directory = Directory::new();
+        let path = directory.0.join("same-cumulative-frame.zst");
+        fs::write(&path, group.compressed).expect("persist one fixed actual source");
+        let run_two = |max_work_bytes| {
+            let mut limits = recovery_decompression_budget_limits();
+            limits.max_work_bytes = max_work_bytes;
+            let mut original = crate::TelemetryRecoveryBudget::new(limits, expiry)
+                .expect("independent original parent ledger before identical recovery");
+            let input = Bytes::from(original.read_file(&path).expect("same actual setup read"));
+            let setup_usage = original.usage();
+            let first = crate::decompress_recovered_log_frame_until(
+                input.clone(),
+                group.structural_bytes,
+                12,
+                recovery_decompression_policy(),
+                original,
+            )
+            .expect("first real frame fits each original parent envelope");
+            let first_usage = first.recovery_usage();
+            let second = first.decompress_next_until(
+                input,
+                group.structural_bytes,
+                12,
+                recovery_decompression_policy(),
+            );
+            (setup_usage, first_usage, second)
+        };
+        let (observed_setup, observed_first, observed) =
+            run_two(recovery_decompression_budget_limits().max_work_bytes);
+        let observed = observed.expect("actual two-frame observation with ample child limits");
+        let observed_two = observed.recovery_usage();
+        assert!(observed_setup.work_bytes > 0);
+        assert!(observed_first.work_bytes > observed_setup.work_bytes);
+        assert!(observed_two.work_bytes > observed_first.work_bytes);
+        let exact_parent = observed_two.work_bytes;
+        drop(observed);
+        let (exact_setup, exact_first, exact) = run_two(exact_parent);
+        let exact = exact.expect("exact observed cumulative parent work succeeds");
+        assert_eq!(exact_setup, observed_setup);
+        assert_eq!(exact_first, observed_first);
+        assert_eq!(exact.recovery_usage(), observed_two);
+        assert_eq!(exact.original_expiry(), expiry);
+        assert_eq!(
+            exact.structural_bytes(),
+            native.structural().map(Bytes::as_ref)
+        );
+        drop(exact);
+        let (short_setup, short_first, short) = run_two(exact_parent - 1);
+        let short = short.expect_err("one less ORIGINAL parent work refuses the second frame");
+        assert_eq!(short_setup, observed_setup);
+        assert_eq!(short_first, observed_first);
+        assert_eq!(short.original_expiry(), expiry);
+        assert!(short.has_native_context());
+        assert!(!short.output_prefix().is_empty());
+        assert!(short.stream_calls() > 0);
+        assert!(short.recovery_usage().work_bytes > short_first.work_bytes);
+        assert!(short.recovery_usage().work_bytes < exact_parent);
+        assert_eq!(short.recovery_usage().read_bytes, observed_setup.read_bytes);
+        assert_eq!(short.recovery_usage().records, observed_setup.records);
+        assert_eq!(
+            short.recovery_usage().json_values,
+            observed_setup.json_values
+        );
+        let mut source = std::error::Error::source(&short);
+        let mut parent_limits = false;
+        while let Some(error) = source {
+            parent_limits |= matches!(
+                error.downcast_ref::<crate::TelemetryRecoveryError>(),
+                Some(crate::TelemetryRecoveryError::Limits)
+            );
+            source = error.source();
+        }
+        assert!(
+            parent_limits,
+            "actual original parent Limits remains in the error chain"
+        );
+    });
+}
+
+#[test]
+fn recovery_decoder_limits_and_native_errors_retain_original_ledger() {
+    let sample = original_pack(12, 1);
+    let mut cursor = IngestPackCursor::new(&sample.payload, 12).expect("actual wire cursor");
+    let group = cursor.next_group().expect("actual source frame");
+    for case in 0..3 {
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let (input, original, before) = persisted_frame_setup_work(group.compressed, expiry);
+        let mut limits = recovery_decompression_policy();
+        let input = match case {
+            0 => {
+                let mut corrupted = input.to_vec();
+                corrupted[4..].fill(0xFF);
+                Bytes::from(corrupted)
+            }
+            1 => {
+                limits.max_decoder_bytes = 1;
+                input
+            }
+            _ => {
+                limits.max_output_bytes = 1;
+                input
+            }
+        };
+        let error = crate::decompress_recovered_log_frame_until(
+            input,
+            group.structural_bytes,
+            12,
+            limits,
+            original,
+        )
+        .expect_err("genuine native error or exact finite child refusal");
+        assert_eq!(error.original_expiry(), expiry);
+        assert_eq!(error.recovery_usage().read_bytes, before.read_bytes);
+        assert_eq!(error.recovery_usage().records, before.records);
+        if case == 0 {
+            assert!(error.native_error().is_some());
+            assert!(error.stream_calls() > 0 && error.has_native_context());
+        } else if case == 1 {
+            assert!(error.has_native_context());
+            assert_eq!(error.stream_calls(), 0);
+            assert!(error.recovery_usage().work_bytes > before.work_bytes);
+        } else {
+            assert!(!error.has_native_context());
+            assert_eq!(error.stream_calls(), 0);
+            assert_eq!(error.recovery_usage(), before);
+        }
+    }
+}
+
+#[test]
+fn recovery_decoder_late_and_panic_keep_actual_native_outcomes() {
+    let sample = original_pack(12, 1);
+    let mut cursor = IngestPackCursor::new(&sample.payload, 12).expect("actual wire cursor");
+    let group = cursor.next_group().expect("actual producer frame");
+    for phase in [
+        "decompression-output",
+        "decompression-context",
+        "decompression-init",
+        "decompression-parameter",
+        "decompression-step",
+        "decompression-bytes",
+        "decompression-section",
+    ] {
+        for panic in [false, true] {
+            let expiry = Instant::now() + Duration::from_secs(if panic { 30 } else { 1 });
+            let (input, original, before) = persisted_frame_setup_work(group.compressed, expiry);
+            let _hook = Hook;
+            TARGET.set(Some((phase, 0, panic)));
+            let error = crate::decompress_recovered_log_frame_until(
+                input,
+                group.structural_bytes,
+                12,
+                recovery_decompression_policy(),
+                original,
+            )
+            .expect_err("actual entered codec result followed by original E or unwind");
+            assert!(OBSERVED.get(), "actual phase reached: {phase}");
+            assert_eq!(error.original_expiry(), expiry);
+            assert_eq!(error.has_panic(), panic);
+            assert_eq!(error.has_native_context(), phase != "decompression-output");
+            assert!(error.recovery_usage().work_bytes > before.work_bytes);
+            assert_eq!(error.recovery_usage().records, before.records);
+            assert_eq!(error.recovery_usage().json_values, before.json_values);
+            if [
+                "decompression-step",
+                "decompression-bytes",
+                "decompression-section",
+            ]
+            .contains(&phase)
+            {
+                assert!(error.stream_calls() > 0);
+            }
+            if ["decompression-bytes", "decompression-section"].contains(&phase) {
+                assert!(!error.output_prefix().is_empty());
+            }
+        }
+    }
+}
