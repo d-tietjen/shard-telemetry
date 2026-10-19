@@ -74,7 +74,7 @@ pub(super) async fn dispatch_provider_status(
         }
     };
     match result {
-        Ok(Ok(encoded)) => ok_frame(header, encoded),
+        Ok(Ok(encoded)) => query_ok_frame(header, encoded, config),
         Ok(Err(error)) => store_error_frame(header, error),
         Err(error) => error_frame(
             header,

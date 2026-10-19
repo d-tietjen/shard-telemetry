@@ -21,6 +21,15 @@ Frames are limited to 64 MiB. Unknown flags, versions, opcodes, oversized payloa
 
 In production mode the first frame must authenticate with the configured bearer token. Append and query tenants must match the authenticated single tenant.
 
+When a product request gate is configured, successful log, log-page, metric,
+trace and provider-status responses recheck that same query gate after response
+encoding and before returning success. Existing request and error handling
+remains in place. `Describe` performs that completion check only when its encoded
+capabilities advertise query support or queryable appends, so an HA node can
+still advertise append-only service. This check does not create indexed-replay
+ownership or a complete query replica; the product gate must validate those
+actual dependencies.
+
 ## Signal-aware append
 
 An append payload is one `STB1` batch containing 1–256 routed partitions. Its header contains the partition count and reserved zero bytes. Each partition stores:

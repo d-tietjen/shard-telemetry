@@ -647,3 +647,78 @@ async fn provider_status_native_client_authenticates_and_reader_rejects_oversize
         .expect("listener succeeds");
     drop(store);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_status_invalidated_during_real_checkpoint_refuses_encoded_success() {
+    #[derive(Debug)]
+    struct CurrentQuery {
+        valid: AtomicBool,
+        checks: std::sync::atomic::AtomicUsize,
+    }
+    impl NativeRequestGate for CurrentQuery {
+        fn check(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn check_query(&self) -> Result<(), String> {
+            self.checks.fetch_add(1, Ordering::AcqRel);
+            self.valid
+                .load(Ordering::Acquire)
+                .then_some(())
+                .ok_or_else(|| "fixture invalidated during actual checkpoint read".into())
+        }
+    }
+    let directory = Directory::new("completion-currentness");
+    let block = Arc::new(CheckpointBlock {
+        blocked: Mutex::new(true),
+        changed: Condvar::new(),
+        entered: AtomicBool::new(false),
+    });
+    let (store, _engine) = blocked_store(&directory, &block);
+    let lifecycle = Arc::new(ServiceLifecycle::new());
+    lifecycle.mark_ready();
+    let gate = Arc::new(CurrentQuery {
+        valid: AtomicBool::new(true),
+        checks: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let config = NativeServerConfig {
+        production: Some(runtime(lifecycle, Duration::from_secs(2))),
+        request_gate: Some(gate.clone()),
+        ..NativeServerConfig::default()
+    };
+    let request = request();
+    let _release = ReleaseCheckpoint(Arc::clone(&block));
+    let task_request = request.clone();
+    let task_store = Arc::clone(&store);
+    let task = tokio::spawn(async move { status(&task_request, &task_store, &config).await });
+    let started = Instant::now();
+    while !block.entered.load(Ordering::Acquire) {
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "actual checkpoint read enters"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(gate.checks.load(Ordering::Acquire), 1);
+    gate.valid.store(false, Ordering::Release);
+    *block.blocked.lock().expect("release actual checkpoint") = false;
+    block.changed.notify_all();
+    let response = task.await.expect("real status worker completes");
+    assert_eq!(response.header.status, NativeStatus::Unavailable);
+    assert_eq!(
+        response.payload,
+        b"fixture invalidated during actual checkpoint read"
+    );
+    assert_eq!(gate.checks.load(Ordering::Acquire), 2);
+    let actual = store
+        .local_provider_status(&request)
+        .expect("actual checkpoint settled");
+    assert_eq!(
+        actual.partitions[0]
+            .progress
+            .expect("real checkpoint")
+            .indexed_end,
+        Some(0)
+    );
+    // This verifies the SDK completion boundary using its actual store/provider;
+    // the fixture gate does not establish private engine or HA query ownership.
+}
