@@ -1824,3 +1824,433 @@ fn malformed_structural_wire_stays_a_real_parent_decoder_refusal() {
         assert!(parent_error.native_error().is_none());
     }
 }
+
+fn structural_offset_limits() -> crate::RecoveredStructuralOffsetLimits {
+    crate::RecoveredStructuralOffsetLimits {
+        max_input_bytes: 1 << 20,
+        max_records: 1 << 16,
+        max_declared_bytes: 1 << 20,
+        max_entries: 1 << 20,
+        max_work_bytes: 1 << 22,
+    }
+}
+
+fn actual_offset_frame(offsets: &[u64]) -> (Vec<u8>, Vec<u8>, u32) {
+    let records = offsets
+        .iter()
+        .enumerate()
+        .map(|(ordinal, offset)| {
+            let mut record = crate::DurableLog::new(
+                ShardId::new(7),
+                partition(),
+                shard_stream_core::LogicalOffset::new(*offset),
+                19 + ordinal as u64,
+                "actual retained offset fixture",
+                CompressionCohortId::new(4),
+            )
+            .with_field("original", "preserved");
+            record.body = Some(crate::TelemetryValue::Array(Arc::new(vec![
+                crate::TelemetryValue::Integer(-7),
+                crate::TelemetryValue::DoubleBits(0x7ff8_0000_0000_0042),
+            ])));
+            record.event_name = Arc::from("actual.offset.typed.metadata");
+            record
+        })
+        .collect::<Vec<_>>();
+    let raw = crate::encode_structural_block(&records)
+        .expect("actual canonical offset/Pco/metadata producer");
+    let compressed = zstd::bulk::compress(&raw, 1).expect("actual outer frame producer");
+    (
+        raw,
+        compressed,
+        u32::try_from(records.len()).expect("actual finite record count"),
+    )
+}
+
+fn actual_offset_sections(
+    compressed: &[u8],
+    expected_bytes: usize,
+    expected_records: u32,
+    expiry: Instant,
+) -> crate::PreparedRecoveredStructuralSections {
+    let (input, original, _) = persisted_frame_setup_work(compressed, expiry);
+    crate::decompress_recovered_log_frame_until(
+        input,
+        expected_bytes,
+        expected_records,
+        recovery_decompression_policy(),
+        original,
+    )
+    .expect("actual completed native parent")
+    .prepare_sections_until(structural_section_limits())
+    .expect("actual completed charged section parent")
+}
+
+#[test]
+fn recovered_offsets_match_ordinary_rows_and_keep_complete_section_parent() {
+    for values in [vec![0, 0, 127, 128, 16_384, u64::MAX], vec![u64::MAX]] {
+        let (raw, compressed, count) = actual_offset_frame(&values);
+        let ordinary =
+            crate::decode_structural_block(&raw).expect("actual full ordinary typed-row oracle");
+        let expected = ordinary.iter().map(|row| row.offset).collect::<Vec<_>>();
+        assert_eq!(
+            expected
+                .iter()
+                .map(|offset| offset.get())
+                .collect::<Vec<_>>(),
+            values
+        );
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let sections = actual_offset_sections(&compressed, raw.len(), count, expiry);
+        let pointer = sections
+            .structural_bytes()
+            .expect("complete original output")
+            .as_ptr();
+        let before = sections.recovery_usage();
+        let section_usage = sections.usage();
+        let calls = sections.parent_stream_calls();
+        let offsets = sections
+            .prepare_offsets_until(structural_offset_limits())
+            .expect("actual typed offset continuation");
+        assert_eq!(offsets.offsets(), expected);
+        assert_eq!(offsets.usage().decoded_records, values.len());
+        assert_eq!(offsets.parent_sections().usage(), section_usage);
+        assert!(
+            !offsets
+                .parent_sections()
+                .section_bytes(crate::RecoveredStructuralSection::Timestamps)
+                .expect("actual Pco timestamp payload remains encoded")
+                .is_empty()
+        );
+        assert!(
+            !offsets
+                .parent_sections()
+                .section_bytes(crate::RecoveredStructuralSection::TypedMetadata)
+                .expect("actual compressed typed metadata remains encoded")
+                .is_empty()
+        );
+        assert_eq!(
+            crate::decode_structural_block(
+                offsets
+                    .parent_sections()
+                    .structural_bytes()
+                    .expect("retained complete typed wire")
+            )
+            .expect("ordinary complete typed differential oracle"),
+            ordinary
+        );
+
+        assert_eq!(
+            offsets.parent_sections().structural_bytes(),
+            Some(raw.as_slice())
+        );
+        assert_eq!(
+            offsets
+                .parent_sections()
+                .structural_bytes()
+                .expect("same original allocation")
+                .as_ptr(),
+            pointer
+        );
+        assert!(offsets.parent_sections().parent_has_native_context());
+        assert_eq!(offsets.parent_sections().parent_stream_calls(), calls);
+        assert_eq!(offsets.original_expiry(), expiry);
+        assert!(offsets.recovery_usage().work_bytes > before.work_bytes);
+        assert_eq!(offsets.recovery_usage().read_bytes, before.read_bytes);
+        assert_eq!(offsets.recovery_usage().json_values, before.json_values);
+        assert_eq!(offsets.recovery_usage().records, before.records);
+        let after = offsets.recovery_usage();
+        let next = offsets
+            .decompress_next_until(
+                Bytes::from(compressed),
+                raw.len(),
+                count,
+                recovery_decompression_policy(),
+            )
+            .expect("same original spent ledger continues after both completed children");
+        assert_eq!(next.original_expiry(), expiry);
+        assert!(next.recovery_usage().work_bytes > after.work_bytes);
+        assert_eq!(next.recovery_usage().read_bytes, before.read_bytes);
+        assert_eq!(next.structural_bytes(), Some(raw.as_slice()));
+    }
+}
+
+#[test]
+fn recovered_offsets_limits_and_original_work_keep_actual_partial_rows() {
+    let values = (0..12).map(|index| 127 + index * 129).collect::<Vec<_>>();
+    let (raw, compressed, count) = actual_offset_frame(&values);
+    let directory = Directory::new();
+    let path = directory.0.join("same-offset-parent-source.zst");
+    fs::write(&path, &compressed).expect("one fixed actual source before independent ledgers");
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let run = |parent_work, child_limits| {
+        let mut limits = recovery_decompression_budget_limits();
+        limits.max_work_bytes = parent_work;
+        let mut original = crate::TelemetryRecoveryBudget::new(limits, expiry)
+            .expect("independent ORIGINAL ledger before identical real setup");
+        let input = Bytes::from(
+            original
+                .read_file(&path)
+                .expect("same admitted physical read"),
+        );
+        let setup = original.usage();
+        let sections = crate::decompress_recovered_log_frame_until(
+            input,
+            raw.len(),
+            count,
+            recovery_decompression_policy(),
+            original,
+        )
+        .expect("actual native parent under all independent original envelopes")
+        .prepare_sections_until(structural_section_limits())
+        .expect("actual complete same-ledger section parent");
+        let parent = sections.recovery_usage();
+        let section_usage = sections.usage();
+        (
+            setup,
+            parent,
+            section_usage,
+            sections.prepare_offsets_until(child_limits),
+        )
+    };
+    let ample = recovery_decompression_budget_limits().max_work_bytes;
+    let (setup, parent, section_usage, observed) = run(ample, structural_offset_limits());
+    let observed = observed.expect("actual observed complete child");
+    let usage = observed.usage();
+    let cumulative = observed.recovery_usage();
+    let lane_bytes = observed
+        .parent_sections()
+        .section_bytes(crate::RecoveredStructuralSection::Offsets)
+        .expect("actual offset lane")
+        .len();
+    drop(observed);
+    let exact_child = crate::RecoveredStructuralOffsetLimits {
+        max_input_bytes: lane_bytes,
+        max_records: values.len(),
+        max_declared_bytes: usage.declared_bytes,
+        max_entries: usage.entries,
+        max_work_bytes: usage.work_bytes,
+    };
+    let (same_setup, same_parent, _, exact) = run(ample, exact_child);
+    let exact = exact.expect("all actual observed child boundaries fit exactly");
+    assert_eq!(same_setup, setup);
+    assert_eq!(same_parent, parent);
+    assert_eq!(exact.usage(), usage);
+    assert_eq!(exact.recovery_usage(), cumulative);
+    drop(exact);
+    for axis in 0..5 {
+        let mut limits = exact_child;
+        match axis {
+            0 => limits.max_input_bytes -= 1,
+            1 => limits.max_records -= 1,
+            2 => limits.max_declared_bytes -= 1,
+            3 => limits.max_entries -= 1,
+            _ => limits.max_work_bytes -= 1,
+        }
+        let (same_setup, same_parent, _, refused) = run(ample, limits);
+        let refused = refused.expect_err("one less actual child axis");
+        assert_eq!(same_setup, setup);
+        assert_eq!(same_parent, parent);
+        assert_eq!(refused.parent_sections().usage(), section_usage);
+        assert_eq!(
+            refused.parent_sections().structural_bytes(),
+            Some(raw.as_slice())
+        );
+        assert!(refused.parent_sections().parent_has_native_context());
+        assert!(!refused.child_succeeded());
+    }
+    let (same_setup, same_parent, _, exact) =
+        run(cumulative.work_bytes, structural_offset_limits());
+    let exact = exact.expect("exact observed cumulative ORIGINAL work");
+    assert_eq!(same_setup, setup);
+    assert_eq!(same_parent, parent);
+    assert_eq!(exact.recovery_usage(), cumulative);
+    drop(exact);
+    let (same_setup, same_parent, _, refused) =
+        run(cumulative.work_bytes - 1, structural_offset_limits());
+    let refused =
+        refused.expect_err("one less ORIGINAL cumulative work refuses the actual final row");
+    assert_eq!(same_setup, setup);
+    assert_eq!(same_parent, parent);
+    assert_eq!(refused.parent_sections().usage(), section_usage);
+    assert_eq!(refused.original_expiry(), expiry);
+    assert_eq!(refused.usage().decoded_records, values.len() - 1);
+    assert_eq!(
+        refused
+            .offsets()
+            .iter()
+            .map(|offset| offset.get())
+            .collect::<Vec<_>>(),
+        values[..values.len() - 1]
+    );
+    assert!(refused.allocation_succeeded());
+    assert!(refused.recovery_usage().work_bytes > parent.work_bytes);
+    assert_eq!(
+        refused.parent_sections().structural_bytes(),
+        Some(raw.as_slice())
+    );
+    let mut source = std::error::Error::source(&refused);
+    let mut original_limits = false;
+    while let Some(error) = source {
+        original_limits |= matches!(
+            error.downcast_ref::<crate::TelemetryRecoveryError>(),
+            Some(crate::TelemetryRecoveryError::Limits)
+        );
+        source = error.source();
+    }
+    assert!(
+        original_limits,
+        "actual original budget refusal remains in the child source chain"
+    );
+}
+
+#[test]
+fn recovered_offsets_expiry_and_unwind_retain_allocation_and_actual_child_result() {
+    let (raw, compressed, count) = actual_offset_frame(&[1, 2, 130]);
+    for phase in ["offset-allocation", "offset-row", "structural-child-result"] {
+        for panic in [false, true] {
+            let expiry = Instant::now() + Duration::from_secs(if panic { 30 } else { 1 });
+            let sections = actual_offset_sections(&compressed, raw.len(), count, expiry);
+            let before = sections.recovery_usage();
+            let section_usage = sections.usage();
+            let pointer = sections.structural_bytes().expect("actual output").as_ptr();
+            let _hook = Hook;
+            TARGET.set(Some((phase, 0, panic)));
+            let refused = sections
+                .prepare_offsets_until(structural_offset_limits())
+                .expect_err("actual child/allocator outcome before original E or unwind");
+            assert!(OBSERVED.get());
+            assert!(refused.child_entered());
+            assert!(refused.allocation_entered());
+            assert!(refused.allocation_succeeded());
+            assert_eq!(refused.has_panic(), panic);
+            assert_eq!(
+                refused.child_succeeded(),
+                phase == "structural-child-result"
+            );
+            assert_eq!(
+                refused.usage().decoded_records,
+                match phase {
+                    "offset-allocation" => 0,
+                    "offset-row" => 1,
+                    _ => 3,
+                }
+            );
+            assert_eq!(refused.parent_sections().usage(), section_usage);
+            assert_eq!(
+                refused
+                    .parent_sections()
+                    .structural_bytes()
+                    .expect("same full output")
+                    .as_ptr(),
+                pointer
+            );
+            assert!(refused.parent_sections().parent_has_native_context());
+            assert!(refused.parent_sections().parent_stream_calls() > 0);
+            assert_eq!(refused.original_expiry(), expiry);
+            assert!(refused.recovery_usage().work_bytes > before.work_bytes);
+            if !panic {
+                assert!(matches!(
+                    refused.post_error(),
+                    Some(crate::TelemetryRecoveryError::Expired)
+                ));
+            }
+        }
+    }
+    let expiry = Instant::now() + Duration::from_secs(1);
+    let sections = actual_offset_sections(&compressed, raw.len(), count, expiry);
+    let before = sections.recovery_usage();
+    let section_usage = sections.usage();
+    while Instant::now() < expiry {
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+    let refused = sections
+        .prepare_offsets_until(structural_offset_limits())
+        .expect_err("expired original work never enters the new child");
+    assert!(!refused.child_entered());
+    assert!(!refused.allocation_entered());
+    assert_eq!(refused.recovery_usage(), before);
+    assert_eq!(
+        refused.usage(),
+        crate::RecoveredStructuralOffsetUsage::default()
+    );
+    assert_eq!(refused.parent_sections().usage(), section_usage);
+    assert_eq!(
+        refused.parent_sections().structural_bytes(),
+        Some(raw.as_slice())
+    );
+}
+
+#[test]
+fn malformed_offset_lanes_keep_real_successful_outer_decoder() {
+    let (raw, compressed, count) = actual_offset_frame(&[0, 1, 2]);
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let original = actual_offset_sections(&compressed, raw.len(), count, expiry);
+    let mut lanes = STRUCTURAL_SECTION_KINDS
+        .iter()
+        .map(|kind| {
+            original
+                .section_bytes(*kind)
+                .expect("actual original encoded lane")
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    let canonical_offsets = lanes[0].clone();
+    drop(original);
+    let mut maximum = vec![0xff; 9];
+    maximum.push(1);
+    maximum.extend([1, 0]);
+    let mut overflow = vec![0xff; 9];
+    overflow.extend([2, 0, 0]);
+    let mut trailing = canonical_offsets;
+    trailing.push(0);
+    for (lane, prefix) in [
+        (vec![0, 1, 0x80], vec![0, 1]),
+        (maximum, vec![u64::MAX]),
+        (vec![0x80; 11], vec![]),
+        (overflow, vec![]),
+        (trailing, vec![0, 1, 2]),
+    ] {
+        lanes[0] = lane;
+        let mut malformed = crate::structural::STRUCTURAL_BLOCK_MAGIC.to_vec();
+        append_section_extent(
+            &mut malformed,
+            usize::try_from(count).expect("finite count"),
+        );
+        for lane in &lanes {
+            append_section_extent(&mut malformed, lane.len());
+            malformed.extend_from_slice(lane);
+        }
+        assert!(
+            crate::decode_structural_block(&malformed).is_err(),
+            "ordinary real typed decoder rejects this lane"
+        );
+        let compressed =
+            zstd::bulk::compress(&malformed, 1).expect("real malformed offset lane frame");
+        let sections = actual_offset_sections(&compressed, malformed.len(), count, expiry);
+        let before = sections.recovery_usage();
+        let section_usage = sections.usage();
+        let refused = sections
+            .prepare_offsets_until(structural_offset_limits())
+            .expect_err("genuine successful outer decoder, actual malformed offset child");
+        assert_eq!(refused.parent_sections().usage(), section_usage);
+        assert_eq!(
+            refused.parent_sections().structural_bytes(),
+            Some(malformed.as_slice())
+        );
+        assert!(refused.parent_sections().parent_has_native_context());
+        assert!(refused.parent_sections().parent_stream_calls() > 0);
+        assert!(refused.allocation_succeeded());
+        assert!(!refused.child_succeeded());
+        assert_eq!(
+            refused
+                .offsets()
+                .iter()
+                .map(|offset| offset.get())
+                .collect::<Vec<_>>(),
+            prefix
+        );
+        assert_eq!(refused.original_expiry(), expiry);
+        assert!(refused.recovery_usage().work_bytes > before.work_bytes);
+    }
+}

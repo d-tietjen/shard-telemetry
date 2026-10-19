@@ -115,6 +115,19 @@ remains a genuine parent refusal. Section facts do not decode Pco positions,
 typed metadata or log rows, and confer no query, host or HA ownership. Those
 producers and this new continuation's runtime qualification remain required.
 
+The next consuming offset-lane child decodes actual `LogicalOffset` values in
+row order and retains the complete successful section owner as its last parent.
+It admits concrete continuation/results and vector storage before allocation,
+retains the actual allocator Result before observers/checks, and charges each
+varint byte and completed row on that same original ledger/E. Refusal retains
+the real offset prefix, all encoded sections and the original native context;
+a success can consume both completed children before another same-ledger frame.
+Declared storage is source-visible capacity accounting, not allocator/RSS
+measurement. Pco timestamps, body/field reconstruction and the separate
+compressed typed-metadata/MessagePack lane remain required before full typed
+rows or an owned query producer. This offset unit remains unqualified until
+its actual compiler and regression gates run.
+
 Existing fixture groups define actual filesystem/WAL/constructor/worker coverage.
 The positive group calls a real recovered engine's complete bounded resume
 through this actual factory and asserts native Applied observation, job debit,

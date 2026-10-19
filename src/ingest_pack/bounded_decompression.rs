@@ -122,18 +122,35 @@ struct Attempt<W: FrameWork = NativeResumeWork> {
 /// Complete parent and actual child outcomes, with one original work owner.
 /// Child state contains no reference back to this owner or any native task.
 #[cfg(unix)]
-pub(super) struct FrameContinuation<W: FrameWork, C, E> {
+pub(super) struct FrameContinuation<P, C, E, R> {
     pub(super) child: C,
-    pub(super) initial: Option<std::result::Result<(), W::Refusal>>,
+    pub(super) initial: Option<std::result::Result<(), R>>,
     pub(super) actual: Option<std::result::Result<(), E>>,
-    pub(super) post: Option<std::result::Result<(), W::Refusal>>,
+    pub(super) post: Option<std::result::Result<(), R>>,
     pub(super) panic: Option<Box<dyn Any + Send>>,
     pub(super) entered: bool,
-    // Drop the complete parent/native context after every child/result owner.
-    pub(super) parent: PreparedDecompressedFrame<W>,
+    // Drop every complete parent/native context after all child/result owners.
+    pub(super) parent: P,
+}
+/// Internal scoped access for consuming children; no mutable owner is returned.
+#[cfg(unix)]
+pub(super) trait FrameParent<W: FrameWork> {
+    fn with_frame<T>(
+        &mut self,
+        operation: impl FnOnce(&mut PreparedDecompressedFrame<W>) -> T,
+    ) -> T;
 }
 #[cfg(unix)]
-impl<W: FrameWork, C, E> FrameContinuation<W, C, E> {
+impl<W: FrameWork> FrameParent<W> for PreparedDecompressedFrame<W> {
+    fn with_frame<T>(
+        &mut self,
+        operation: impl FnOnce(&mut PreparedDecompressedFrame<W>) -> T,
+    ) -> T {
+        operation(self)
+    }
+}
+#[cfg(unix)]
+impl<P, C, E, R> FrameContinuation<P, C, E, R> {
     pub(super) fn accepted(&self) -> bool {
         self.entered
             && self.panic.is_none()
@@ -163,13 +180,21 @@ impl<W: FrameWork> PreparedDecompressedFrame<W> {
         self,
         child: C,
         operation: impl FnOnce(&Bytes, &mut W, &mut C, Option<usize>) -> std::result::Result<(), E>,
-    ) -> FrameContinuation<W, C, E> {
-        let fixed = size_of::<FrameContinuation<W, C, E>>()
+    ) -> FrameContinuation<Self, C, E, W::Refusal> {
+        Self::continue_owned_until(self, child, operation)
+    }
+    #[cfg(unix)]
+    pub(super) fn continue_owned_until<P: FrameParent<W>, C, E>(
+        parent: P,
+        child: C,
+        operation: impl FnOnce(&Bytes, &mut W, &mut C, Option<usize>) -> std::result::Result<(), E>,
+    ) -> FrameContinuation<P, C, E, W::Refusal> {
+        let fixed = size_of::<FrameContinuation<P, C, E, W::Refusal>>()
             .checked_mul(3)
             .and_then(|bytes| bytes.checked_add(size_of_val(&operation)))
             .filter(|bytes| *bytes <= isize::MAX as usize);
         let mut continued = FrameContinuation {
-            parent: self,
+            parent,
             child,
             initial: None,
             actual: None,
@@ -178,33 +203,43 @@ impl<W: FrameWork> PreparedDecompressedFrame<W> {
             entered: false,
         };
         let actual = catch_unwind(AssertUnwindSafe(|| {
-            continued.initial = Some(continued.parent.retained.work.check());
+            continued.initial = Some(
+                continued
+                    .parent
+                    .with_frame(|frame| frame.retained.work.check()),
+            );
             if continued
                 .initial
                 .as_ref()
                 .is_some_and(|result| result.is_ok())
-                && let Some(input) = &continued.parent.retained.structural
             {
-                continued.entered = true;
-                continued.actual = Some(operation(
-                    input,
-                    &mut continued.parent.retained.work,
-                    &mut continued.child,
-                    fixed,
-                ));
-                // The real child Result and complete parent already belong to
-                // continued before any observer or original-E postcheck.
-                #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
-                super::bounded_frames::observe_decompression(
-                    continued.parent.retained.work.original_expiry(),
-                    "structural-child-result",
-                );
+                continued.parent.with_frame(|frame| {
+                    if let Some(input) = &frame.retained.structural {
+                        continued.entered = true;
+                        continued.actual = Some(operation(
+                            input,
+                            &mut frame.retained.work,
+                            &mut continued.child,
+                            fixed,
+                        ));
+                        // Store the real child Result before observers/E checks.
+                        #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+                        super::bounded_frames::observe_decompression(
+                            frame.retained.work.original_expiry(),
+                            "structural-child-result",
+                        );
+                    }
+                });
             }
         }));
         if let Err(panic) = actual {
             continued.panic = Some(panic);
         }
-        continued.post = Some(continued.parent.retained.work.check());
+        continued.post = Some(
+            continued
+                .parent
+                .with_frame(|frame| frame.retained.work.check()),
+        );
         continued
     }
     #[cfg(unix)]

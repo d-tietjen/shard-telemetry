@@ -1,5 +1,7 @@
 //! Charged section facts over a retained complete structural-frame decoder.
-use super::bounded_decompression::{FrameContinuation, FrameWork, PreparedDecompressedFrame};
+use super::bounded_decompression::{
+    FrameContinuation, FrameParent, FrameWork, PreparedDecompressedFrame,
+};
 use super::recovery_decompression::RecoveryFrameWork;
 use crate::structural::STRUCTURAL_BLOCK_MAGIC;
 use crate::{TelemetryError, TelemetryRecoveryError, TelemetryRecoveryUsage};
@@ -246,7 +248,12 @@ impl Sections {
         Ok(())
     }
 }
-type Continued = FrameContinuation<RecoveryFrameWork, Sections, Failure>;
+type Continued = FrameContinuation<
+    PreparedDecompressedFrame<RecoveryFrameWork>,
+    Sections,
+    Failure,
+    TelemetryRecoveryError,
+>;
 
 fn section(held: &Continued, kind: RecoveredStructuralSection) -> Option<&[u8]> {
     held.parent
@@ -261,7 +268,30 @@ fn section(held: &Continued, kind: RecoveredStructuralSection) -> Option<&[u8]> 
 pub struct PreparedRecoveredStructuralSections {
     held: Continued,
 }
+impl FrameParent<RecoveryFrameWork> for PreparedRecoveredStructuralSections {
+    fn with_frame<T>(
+        &mut self,
+        operation: impl FnOnce(&mut PreparedDecompressedFrame<RecoveryFrameWork>) -> T,
+    ) -> T {
+        self.held.parent.with_frame(operation)
+    }
+}
 impl PreparedRecoveredStructuralSections {
+    /// Decode actual logical offsets, retaining these complete section facts.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain complete section/native parent and actual offset outcomes inline"
+    )]
+    pub fn prepare_offsets_until(
+        self,
+        limits: super::recovery_offsets::RecoveredStructuralOffsetLimits,
+    ) -> std::result::Result<
+        super::recovery_offsets::PreparedRecoveredStructuralOffsets,
+        super::recovery_offsets::RetainedRecoveredStructuralOffsetError,
+    > {
+        let range = self.held.child.ranges[RecoveredStructuralSection::Offsets.index()].clone();
+        super::recovery_offsets::prepare_offsets_until(self, range, limits)
+    }
     /// Actual record count, checked against the original decoder's count.
     pub fn record_count(&self) -> u32 {
         self.held.child.record_count

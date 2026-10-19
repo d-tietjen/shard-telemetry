@@ -87,9 +87,11 @@ pub use error::{TelemetryError, TelemetryResult};
 pub use fast_telemetry::{FastTelemetryConfig, FastTelemetryExportReport, FastTelemetryExporter};
 #[cfg(unix)]
 pub use ingest_pack::{
-    PreparedRecoveredLogFrame, PreparedRecoveredStructuralSections, RecoveredStructuralSection,
-    RecoveredStructuralSectionLimits, RecoveredStructuralSectionUsage,
-    RetainedRecoveredLogFrameError, RetainedRecoveredStructuralSectionError,
+    PreparedRecoveredLogFrame, PreparedRecoveredStructuralOffsets,
+    PreparedRecoveredStructuralSections, RecoveredStructuralOffsetLimits,
+    RecoveredStructuralOffsetUsage, RecoveredStructuralSection, RecoveredStructuralSectionLimits,
+    RecoveredStructuralSectionUsage, RetainedRecoveredLogFrameError,
+    RetainedRecoveredStructuralOffsetError, RetainedRecoveredStructuralSectionError,
     decompress_recovered_log_frame_until,
 };
 pub use locality::{
