@@ -113,7 +113,7 @@ header scalar/section on the same spent ledger/E, yielding eight encoded
 section views and the actual checked record count. Malformed outer framing
 remains a genuine parent refusal. Section facts do not decode Pco positions,
 typed metadata or log rows, and confer no query, host or HA ownership. Those
-producers and this new continuation's runtime qualification remain required.
+producers remain required for complete typed rows and an owned query.
 
 The next consuming offset-lane child decodes actual `LogicalOffset` values in
 row order and retains the complete successful section owner as its last parent.
@@ -125,8 +125,32 @@ a success can consume both completed children before another same-ledger frame.
 Declared storage is source-visible capacity accounting, not allocator/RSS
 measurement. Pco timestamps, body/field reconstruction and the separate
 compressed typed-metadata/MessagePack lane remain required before full typed
-rows or an owned query producer. This offset unit remains unqualified until
-its actual compiler and regression gates run.
+rows or an owned query producer.
+
+The consuming timestamp child uses the actual pinned Pco file/chunk/read API
+with its owned input and complete offset/section/native parent. It admits only
+current standalone3/wrapped4.1 `u64` Classic NoOp/Consecutive1 framing, checks
+actual bins/page geometry before native constructors, and ignores `n_hint` for
+allocation. Genuine multi-chunk progress uses at most256 values per native
+read, requires actual EndOfData, and accepts/retains the ordinary unread tail.
+The original ledger/E pays every possible admitted allocation/source loop;
+its immutable shared input escrow reports last committed consumption, not an
+unreturned native error bit position. A read error retains the live chunk,
+actual Result and whole initialized destination including the untrusted window.
+Completed chunks release through the real finished `into_src` transition.
+
+The timestamp accounting model is source-derived requested storage/work for
+exact Pco1.0.3 and better_io0.2, under the checked Rust1.93/target configuration;
+it is not a portable private ABI, allocator/RSS or CPU bound. See
+[PCO-TIMESTAMP-ACCOUNTING.md](PCO-TIMESTAMP-ACCOUNTING.md). Both ordinary
+standalone dev/release unwind and actual host release abort configurations
+have explicit selector paths. Unknown configurations refuse only this new
+operation before native entry and retain the parent. Normal standalone
+release and each owning host's canonical release artifact/layout are separate
+qualification gates; standalone tests do not qualify the host graph or abort
+artifact. Panic retention applies only to unwind; abort preserves process-abort
+semantics. Body/field reconstruction and bounded native/MessagePack typed
+metadata still precede complete typed rows and owned query production.
 
 Existing fixture groups define actual filesystem/WAL/constructor/worker coverage.
 The positive group calls a real recovered engine's complete bounded resume
@@ -159,5 +183,6 @@ Existing legacy factories keep ordinary setup, callbacks and query workers.
 This owned route explicitly lacks ordinary live `validate_append`, ordinary
 apply, `TelemetryService` serving, exact-content retry, object/other-signal/atomic modes, private product and installed host
 qualification. Those remain real gates. A strict recovered-log Applied result
-does not itself qualify any of them. Shipping manifests, locks and dependency
-pins are unchanged.
+does not itself qualify any of them. The shipping graph and actual generated locks require their own checks; the
+timestamp unit pins the already-resolved Pco version and adds its existing
+better_io reader dependency directly.

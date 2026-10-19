@@ -1,5 +1,7 @@
 //! Actual bounded logical-offset decoding over complete retained section facts.
-use super::bounded_decompression::{FrameContinuation, FrameWork, PreparedDecompressedFrame};
+use super::bounded_decompression::{
+    FrameContinuation, FrameParent, FrameWork, PreparedDecompressedFrame,
+};
 use super::recovery_decompression::RecoveryFrameWork;
 use super::recovery_sections::PreparedRecoveredStructuralSections;
 use crate::{TelemetryError, TelemetryRecoveryError, TelemetryRecoveryUsage};
@@ -228,12 +230,38 @@ type Continued = FrameContinuation<
 
 /// Actual decoded logical offsets and the complete successful section parent.
 ///
-/// Pco timestamps, bodies, fields and typed metadata remain encoded. These
+/// Bodies, fields and typed metadata remain encoded. These
 /// offsets do not constitute reconstructed log rows or query/HA ownership.
 pub struct PreparedRecoveredStructuralOffsets {
     held: Continued,
 }
+impl FrameParent<RecoveryFrameWork> for PreparedRecoveredStructuralOffsets {
+    fn with_frame<T>(
+        &mut self,
+        operation: impl FnOnce(&mut PreparedDecompressedFrame<RecoveryFrameWork>) -> T,
+    ) -> T {
+        self.held.parent.with_frame(operation)
+    }
+}
 impl PreparedRecoveredStructuralOffsets {
+    /// Decode actual Pco timestamps on this SAME original ledger and E.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain complete offset/native parent and actual Pco outcomes inline"
+    )]
+    pub fn prepare_timestamps_until(
+        self,
+        limits: super::recovery_timestamps::RecoveredStructuralTimestampLimits,
+    ) -> std::result::Result<
+        super::recovery_timestamps::PreparedRecoveredStructuralTimestamps,
+        super::recovery_timestamps::RetainedRecoveredStructuralTimestampError,
+    > {
+        let range = self
+            .held
+            .parent
+            .section_range(super::recovery_sections::RecoveredStructuralSection::Timestamps);
+        super::recovery_timestamps::prepare_timestamps_until(self, range, limits)
+    }
     /// Every actual logical offset in encoded row order, including equal values.
     pub fn offsets(&self) -> &[LogicalOffset] {
         &self.held.child.offsets

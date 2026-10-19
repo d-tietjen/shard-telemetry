@@ -11,6 +11,8 @@ mod recovery_decompression;
 mod recovery_offsets;
 #[cfg(unix)]
 mod recovery_sections;
+#[cfg(unix)]
+mod recovery_timestamps;
 pub(crate) use bounded_decompression::FrameDecompressionLimits;
 pub(crate) use bounded_frames::{
     IndexedFramePreparationLimits, PreparedIndexedIngestFrames, RetainedIndexedFrameError,
@@ -30,6 +32,12 @@ pub use recovery_sections::{
     PreparedRecoveredStructuralSections, RecoveredStructuralSection,
     RecoveredStructuralSectionLimits, RecoveredStructuralSectionUsage,
     RetainedRecoveredStructuralSectionError,
+};
+
+#[cfg(unix)]
+pub use recovery_timestamps::{
+    PreparedRecoveredStructuralTimestamps, RecoveredStructuralTimestampLimits,
+    RecoveredStructuralTimestampUsage, RetainedRecoveredStructuralTimestampError,
 };
 
 use bytes::Bytes;

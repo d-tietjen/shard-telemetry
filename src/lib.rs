@@ -88,10 +88,12 @@ pub use fast_telemetry::{FastTelemetryConfig, FastTelemetryExportReport, FastTel
 #[cfg(unix)]
 pub use ingest_pack::{
     PreparedRecoveredLogFrame, PreparedRecoveredStructuralOffsets,
-    PreparedRecoveredStructuralSections, RecoveredStructuralOffsetLimits,
-    RecoveredStructuralOffsetUsage, RecoveredStructuralSection, RecoveredStructuralSectionLimits,
-    RecoveredStructuralSectionUsage, RetainedRecoveredLogFrameError,
-    RetainedRecoveredStructuralOffsetError, RetainedRecoveredStructuralSectionError,
+    PreparedRecoveredStructuralSections, PreparedRecoveredStructuralTimestamps,
+    RecoveredStructuralOffsetLimits, RecoveredStructuralOffsetUsage, RecoveredStructuralSection,
+    RecoveredStructuralSectionLimits, RecoveredStructuralSectionUsage,
+    RecoveredStructuralTimestampLimits, RecoveredStructuralTimestampUsage,
+    RetainedRecoveredLogFrameError, RetainedRecoveredStructuralOffsetError,
+    RetainedRecoveredStructuralSectionError, RetainedRecoveredStructuralTimestampError,
     decompress_recovered_log_frame_until,
 };
 pub use locality::{

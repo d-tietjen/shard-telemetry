@@ -3273,6 +3273,7 @@ dependencies = [
  "arrow-schema",
  "axum",
  "base64 0.23.1",
+ "better_io",
  "blake3",
  "brotli",
  "bytes",

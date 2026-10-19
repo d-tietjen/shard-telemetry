@@ -277,6 +277,9 @@ impl FrameParent<RecoveryFrameWork> for PreparedRecoveredStructuralSections {
     }
 }
 impl PreparedRecoveredStructuralSections {
+    pub(super) fn section_range(&self, kind: RecoveredStructuralSection) -> Option<Range<usize>> {
+        self.held.child.ranges[kind.index()].clone()
+    }
     /// Decode actual logical offsets, retaining these complete section facts.
     #[allow(
         clippy::result_large_err,

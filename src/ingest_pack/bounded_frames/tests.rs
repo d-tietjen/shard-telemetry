@@ -2254,3 +2254,795 @@ fn malformed_offset_lanes_keep_real_successful_outer_decoder() {
         assert!(refused.recovery_usage().work_bytes > before.work_bytes);
     }
 }
+
+fn structural_timestamp_limits() -> crate::RecoveredStructuralTimestampLimits {
+    crate::RecoveredStructuralTimestampLimits {
+        max_input_bytes: 1 << 20,
+        max_records: 1 << 16,
+        max_chunks: 1024,
+        max_native_calls: 1 << 17,
+        max_bins: 16384,
+        max_ans_log: 14,
+        max_declared_bytes: 16 << 20,
+        max_entries: 16 << 20,
+        max_work_bytes: 64 << 20,
+    }
+}
+
+fn actual_timestamp_file(chunks: &[&[u64]], hint: usize, uniform: bool) -> Vec<u8> {
+    let file = pco::standalone::FileCompressor::default()
+        .with_n_hint(hint)
+        .with_uniform_type(uniform.then_some(pco::data_types::NumberType::U64));
+    let config = pco::ChunkConfig::default()
+        .with_compression_level(8)
+        .with_mode_spec(pco::ModeSpec::Classic)
+        .with_delta_spec(pco::DeltaSpec::TryConsecutive(1));
+    let mut lane = Vec::new();
+    file.write_header(&mut lane)
+        .expect("actual canonical Pco file header");
+    for values in chunks {
+        file.chunk_compressor(values, &config)
+            .expect("genuine configured Classic/consecutive/fallback compressor")
+            .write(&mut lane)
+            .expect("actual native compressed chunk");
+    }
+    file.write_footer(&mut lane)
+        .expect("genuine actual EndOfData marker");
+    lane
+}
+
+fn actual_timestamp_records(values: &[u64]) -> Vec<crate::DurableLog> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(ordinal, timestamp)| {
+            let mut record = crate::DurableLog::new(
+                ShardId::new(7),
+                partition(),
+                shard_stream_core::LogicalOffset::new(
+                    u64::try_from(ordinal).expect("finite ordinal"),
+                ),
+                *timestamp,
+                "actual timestamp typed body",
+                CompressionCohortId::new(4),
+            )
+            .with_field("original", "retained");
+            record.body = Some(crate::TelemetryValue::Array(Arc::new(vec![
+                crate::TelemetryValue::Integer(-7),
+                crate::TelemetryValue::DoubleBits(0x7ff8_0000_0000_0042),
+            ])));
+            record.event_name = Arc::from("actual.timestamps.typed.metadata");
+            record
+        })
+        .collect()
+}
+
+fn timestamp_frame_with_lane(values: &[u64], lane: &[u8]) -> (Vec<u8>, Vec<u8>, u32) {
+    let records = actual_timestamp_records(values);
+    let count = u32::try_from(records.len()).expect("finite original typed record count");
+    let raw =
+        crate::encode_structural_block(&records).expect("actual canonical complete typed producer");
+    let compressed = zstd::bulk::compress(&raw, 1).expect("real canonical outer encoding");
+    let sections = actual_offset_sections(
+        &compressed,
+        raw.len(),
+        count,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let mut wire = crate::structural::STRUCTURAL_BLOCK_MAGIC.to_vec();
+    append_section_extent(&mut wire, records.len());
+    for kind in STRUCTURAL_SECTION_KINDS {
+        let actual = if kind == crate::RecoveredStructuralSection::Timestamps {
+            lane
+        } else {
+            sections
+                .section_bytes(kind)
+                .expect("all original actual other encoded lanes")
+        };
+        append_section_extent(&mut wire, actual.len());
+        wire.extend_from_slice(actual);
+    }
+    let compressed = zstd::bulk::compress(&wire, 1).expect("real outer structural frame");
+    (wire, compressed, count)
+}
+
+fn actual_timestamp_parent(
+    raw: &[u8],
+    compressed: &[u8],
+    count: u32,
+    expiry: Instant,
+) -> crate::PreparedRecoveredStructuralOffsets {
+    actual_offset_sections(compressed, raw.len(), count, expiry)
+        .prepare_offsets_until(structural_offset_limits())
+        .expect("actual complete native/section/offset parent before timestamps")
+}
+
+fn actual_timestamp_random(n: usize) -> Vec<u64> {
+    let mut state = 0x38e9_83df_a762_4021u64;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        })
+        .collect()
+}
+
+#[test]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "this runtime regression must verify the actual selected compiler configuration"
+)]
+fn recovered_timestamps_match_real_modes_chunks_and_ordinary_tail() {
+    assert!(
+        cfg!(telemetry_bounded_pco_layout),
+        "normal reviewed compiler/config selects this new stage"
+    );
+    let consecutive = (0..600u64).map(|i| 1_000_000 + 71 * i).collect::<Vec<_>>();
+    let random = actual_timestamp_random(600);
+    let config = pco::ChunkConfig::default()
+        .with_compression_level(8)
+        .with_mode_spec(pco::ModeSpec::Classic)
+        .with_delta_spec(pco::DeltaSpec::TryConsecutive(1));
+    let file = pco::standalone::FileCompressor::default();
+    assert!(matches!(
+        file.chunk_compressor(&consecutive, &config)
+            .expect("actual consecutive producer")
+            .meta()
+            .delta_encoding,
+        pco::metadata::DeltaEncoding::Consecutive {
+            order: 1,
+            secondary_uses_delta: false
+        }
+    ));
+    assert!(matches!(
+        file.chunk_compressor(&random, &config)
+            .expect("actual incompressible producer fallback")
+            .meta()
+            .delta_encoding,
+        pco::metadata::DeltaEncoding::NoOp
+    ));
+    for (values, uniform) in [(&consecutive, false), (&random, true)] {
+        // Two true chunks, >256 in each, oversized untrusted hint and real tail.
+        let mut lane =
+            actual_timestamp_file(&[&values[..300], &values[300..]], usize::MAX, uniform);
+        let tail = b"retained ordinary first-file tail";
+        lane.extend_from_slice(tail);
+        assert_eq!(
+            pco::standalone::simple_decompress::<u64>(&lane)
+                .expect("ordinary native value/tail oracle"),
+            *values
+        );
+        let (raw, compressed, count) = timestamp_frame_with_lane(values, &lane);
+        let ordinary =
+            crate::decode_structural_block(&raw).expect("ordinary complete exact typed-row oracle");
+        let canonical = crate::encode_structural_block(&actual_timestamp_records(values))
+            .expect("actual canonical complete typed producer");
+        assert_eq!(
+            ordinary,
+            crate::decode_structural_block(&canonical)
+                .expect("full typed differential: unchanged non-Pco lanes")
+        );
+        assert_eq!(
+            ordinary
+                .iter()
+                .map(|row| row.timestamp_unix_nanos)
+                .collect::<Vec<_>>(),
+            *values
+        );
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let parent = actual_timestamp_parent(&raw, &compressed, count, expiry);
+        let pointer = parent
+            .parent_sections()
+            .structural_bytes()
+            .expect("complete output")
+            .as_ptr();
+        let prior = parent.recovery_usage();
+        let result = parent
+            .prepare_timestamps_until(structural_timestamp_limits())
+            .expect("actual owned lower-level Pco chain");
+        assert_eq!(result.timestamps(), values.as_slice());
+        assert_eq!(result.usage().chunks, 2);
+        assert_eq!(result.usage().completed_chunks, 2);
+        assert_eq!(result.usage().reads, 4);
+        assert_eq!(result.usage().native_calls, 8); // file +2 chunks +4 reads +EOF.
+        assert_eq!(result.usage().confirmed_records, values.len());
+        assert!(result.usage().reached_end);
+        assert_eq!(result.unread_tail(), tail);
+        assert_eq!(result.original_expiry(), expiry);
+        assert_eq!(
+            result
+                .parent_offsets()
+                .parent_sections()
+                .structural_bytes()
+                .expect("same complete parent allocation")
+                .as_ptr(),
+            pointer
+        );
+        assert_eq!(
+            result.parent_offsets().parent_sections().structural_bytes(),
+            Some(raw.as_slice())
+        );
+        assert!(
+            result
+                .parent_offsets()
+                .parent_sections()
+                .parent_has_native_context()
+        );
+        assert_eq!(result.recovery_usage().read_bytes, prior.read_bytes);
+        assert_eq!(result.recovery_usage().json_values, prior.json_values);
+        assert!(result.recovery_usage().work_bytes > prior.work_bytes);
+        assert_eq!(
+            crate::decode_structural_block(
+                result
+                    .parent_offsets()
+                    .parent_sections()
+                    .structural_bytes()
+                    .expect("all typed lanes retained")
+            )
+            .expect("same full typed oracle"),
+            ordinary
+        );
+    }
+}
+
+#[test]
+fn recovered_timestamps_native_read_error_retains_untrusted_window_and_source() {
+    let values = actual_timestamp_random(600);
+    let mut lane = actual_timestamp_file(&[&values], values.len(), false);
+    // Remove the real footer and one genuine body byte. Header/metadata remain
+    // genuinely valid; the entered third native read sees actual short input.
+    lane.truncate(lane.len() - 2);
+    assert!(pco::standalone::simple_decompress::<u64>(&lane).is_err());
+    let (raw, compressed, count) = timestamp_frame_with_lane(&values, &lane);
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let parent = actual_timestamp_parent(&raw, &compressed, count, expiry);
+    let prior = parent.recovery_usage();
+    let refused = parent
+        .prepare_timestamps_until(structural_timestamp_limits())
+        .expect_err("real native short-body refusal");
+    assert!(refused.has_native_file() && refused.has_native_chunk());
+    assert!(refused.native_error().is_some());
+    assert!(
+        refused
+            .last_read_result()
+            .expect("actual native read returned a Result")
+            .is_err()
+    );
+    assert_eq!(refused.initialized_timestamps().len(), values.len());
+    assert_eq!(
+        refused.confirmed_timestamps(),
+        &values[..refused.usage().confirmed_records]
+    );
+    assert!(refused.usage().confirmed_records >= 256);
+    let window = refused
+        .pending_window()
+        .expect("actual possibly-modified window stays owned");
+    assert_eq!(refused.last_read_window(), Some(window.clone()));
+    assert!(!window.is_empty() && window.len() <= 256);
+    assert_eq!(window.start, refused.confirmed_timestamps().len());
+    assert_eq!(refused.retained_input(), Some(lane.as_slice()));
+    assert!(
+        refused
+            .last_committed_source_cursor()
+            .is_some_and(|cursor| cursor <= lane.len())
+    );
+    let (fills, consumes) = refused
+        .source_observations()
+        .expect("real reader escrow counters");
+    assert!(fills > 0 && consumes > 0 && fills >= consumes);
+    assert_eq!(refused.usage().completed_chunks, 0);
+    assert!(!refused.usage().reached_end);
+    assert_eq!(
+        refused
+            .parent_offsets()
+            .parent_sections()
+            .structural_bytes(),
+        Some(raw.as_slice())
+    );
+    assert!(
+        refused
+            .parent_offsets()
+            .parent_sections()
+            .parent_has_native_context()
+    );
+    assert_eq!(refused.original_expiry(), expiry);
+    assert!(refused.recovery_usage().work_bytes > prior.work_bytes);
+}
+
+#[test]
+fn recovered_timestamps_limits_and_original_cumulative_work_keep_parent() {
+    let values = (0..300u64).map(|n| 190 + 17 * n).collect::<Vec<_>>();
+    let lane = actual_timestamp_file(&[&values], values.len(), false);
+    let (raw, compressed, count) = timestamp_frame_with_lane(&values, &lane);
+    let directory = Directory::new();
+    let path = directory.0.join("same-real-timestamp-source.zst");
+    fs::write(&path, &compressed)
+        .expect("one fixed real source before independent original ledgers");
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let run = |parent_work, child_limits| {
+        let mut limits = recovery_decompression_budget_limits();
+        limits.max_work_bytes = parent_work;
+        let mut original = crate::TelemetryRecoveryBudget::new(limits, expiry)
+            .expect("one independent ORIGINAL finite ledger before identical real setup");
+        let input = Bytes::from(original.read_file(&path).expect("same actual source read"));
+        let setup = original.usage();
+        let parent = crate::decompress_recovered_log_frame_until(
+            input,
+            raw.len(),
+            count,
+            recovery_decompression_policy(),
+            original,
+        )
+        .expect("real retained outer decoder under original envelope")
+        .prepare_sections_until(structural_section_limits())
+        .expect("same genuine sections")
+        .prepare_offsets_until(structural_offset_limits())
+        .expect("same actual offsets");
+        let prior = parent.recovery_usage();
+        (setup, prior, parent.prepare_timestamps_until(child_limits))
+    };
+    let ample = recovery_decompression_budget_limits().max_work_bytes;
+    let (setup, prior, observed) = run(ample, structural_timestamp_limits());
+    let observed = observed.expect("actual complete observation, no copied formula");
+    let usage = observed.usage();
+    let cumulative = observed.recovery_usage();
+    drop(observed);
+    let exact = crate::RecoveredStructuralTimestampLimits {
+        max_input_bytes: lane.len(),
+        max_records: values.len(),
+        max_chunks: usage.chunks,
+        max_native_calls: usage.native_calls,
+        max_declared_bytes: usage.declared_bytes,
+        max_entries: usage.entries,
+        max_work_bytes: usage.work_bytes,
+        ..structural_timestamp_limits()
+    };
+    let (same_setup, same_prior, accepted) = run(ample, exact);
+    let accepted = accepted.expect("actual observed child boundaries fit exactly");
+    assert_eq!(accepted.usage(), usage);
+    assert_eq!(accepted.recovery_usage(), cumulative);
+    assert_eq!(same_setup, setup);
+    assert_eq!(same_prior, prior);
+    assert_eq!(accepted.timestamps(), values);
+    drop(accepted);
+    for axis in 0..7 {
+        let mut limits = exact;
+        match axis {
+            0 => limits.max_input_bytes -= 1,
+            1 => limits.max_records -= 1,
+            2 => limits.max_chunks -= 1,
+            3 => limits.max_native_calls -= 1,
+            4 => limits.max_declared_bytes -= 1,
+            5 => limits.max_entries -= 1,
+            _ => limits.max_work_bytes -= 1,
+        }
+        let (same_setup, same_prior, refused) = run(ample, limits);
+        let refused = refused.expect_err("one less real child boundary, never renew work");
+        assert_eq!(same_setup, setup);
+        assert_eq!(same_prior, prior);
+        assert_eq!(
+            refused
+                .parent_offsets()
+                .parent_sections()
+                .structural_bytes(),
+            Some(raw.as_slice())
+        );
+        assert!(
+            refused
+                .parent_offsets()
+                .parent_sections()
+                .parent_has_native_context()
+        );
+        assert_eq!(refused.original_expiry(), expiry);
+    }
+    let (same_setup, same_prior, accepted) =
+        run(cumulative.work_bytes, structural_timestamp_limits());
+    let accepted =
+        accepted.expect("exact OBSERVED cumulative ORIGINAL parent work across all stages");
+    assert_eq!(accepted.recovery_usage(), cumulative);
+    assert_eq!(same_setup, setup);
+    assert_eq!(same_prior, prior);
+    drop(accepted);
+    let (same_setup, same_prior, refused) =
+        run(cumulative.work_bytes - 1, structural_timestamp_limits());
+    let refused =
+        refused.expect_err("one less ORIGINAL cumulative work before final physical EOF entry");
+    assert_eq!(same_setup, setup);
+    assert_eq!(same_prior, prior);
+    assert_eq!(refused.confirmed_timestamps(), values);
+    assert!(!refused.usage().reached_end);
+    assert_eq!(refused.usage().completed_chunks, 1);
+    assert!(refused.has_native_file());
+    assert_eq!(refused.original_expiry(), expiry);
+    assert!(refused.recovery_usage().work_bytes > prior.work_bytes);
+    let mut source = std::error::Error::source(&refused);
+    let mut original_limits = false;
+    while let Some(error) = source {
+        original_limits |= matches!(
+            error.downcast_ref::<crate::TelemetryRecoveryError>(),
+            Some(crate::TelemetryRecoveryError::Limits)
+        );
+        source = error.source();
+    }
+    assert!(
+        original_limits,
+        "actual original parent Limits remains in source chain"
+    );
+}
+
+#[test]
+fn recovered_timestamps_expiry_and_unwind_keep_actual_native_owners() {
+    let values = (0..300u64).collect::<Vec<_>>();
+    let lane = actual_timestamp_file(&[&values], values.len(), false);
+    let (raw, compressed, count) = timestamp_frame_with_lane(&values, &lane);
+    for phase in [
+        "timestamp-allocation",
+        "timestamp-reader",
+        "timestamp-file-result",
+        "timestamp-chunk-result",
+        "timestamp-read-result",
+        "timestamp-finished-source",
+        "timestamp-eof-result",
+        "structural-child-result",
+    ] {
+        for panic in [false, true] {
+            if panic && !cfg!(panic = "unwind") {
+                continue;
+            } // abort cannot retain a returned panic.
+            let expiry = Instant::now() + Duration::from_secs(if panic { 30 } else { 1 });
+            let parent = actual_timestamp_parent(&raw, &compressed, count, expiry);
+            let before = parent.recovery_usage();
+            let pointer = parent
+                .parent_sections()
+                .structural_bytes()
+                .expect("real complete output")
+                .as_ptr();
+            let _hook = Hook;
+            TARGET.set(Some((phase, 0, panic)));
+            let refused = parent
+                .prepare_timestamps_until(structural_timestamp_limits())
+                .expect_err("actual saved outcome before original E/unwind");
+            assert!(OBSERVED.get(), "actual phase reached: {phase}");
+            assert_eq!(refused.has_panic(), panic);
+            assert_eq!(
+                refused.child_succeeded(),
+                phase == "structural-child-result"
+            );
+            assert_eq!(
+                refused
+                    .parent_offsets()
+                    .parent_sections()
+                    .structural_bytes()
+                    .expect("same native allocation")
+                    .as_ptr(),
+                pointer
+            );
+            assert!(
+                refused
+                    .parent_offsets()
+                    .parent_sections()
+                    .parent_has_native_context()
+            );
+            assert_eq!(refused.original_expiry(), expiry);
+            assert!(refused.recovery_usage().work_bytes > before.work_bytes);
+            if !panic {
+                assert!(matches!(
+                    refused.post_error(),
+                    Some(crate::TelemetryRecoveryError::Expired)
+                ));
+            }
+            if matches!(
+                phase,
+                "timestamp-file-result"
+                    | "timestamp-chunk-result"
+                    | "timestamp-read-result"
+                    | "timestamp-finished-source"
+                    | "timestamp-eof-result"
+                    | "structural-child-result"
+            ) {
+                assert!(refused.file_result_captured());
+                assert!(refused.has_native_file());
+                assert_eq!(refused.retained_input(), Some(lane.as_slice()));
+            }
+            if matches!(phase, "timestamp-chunk-result" | "timestamp-read-result") {
+                assert!(refused.chunk_result_captured());
+                assert!(refused.has_native_chunk());
+            }
+            if phase == "timestamp-read-result" {
+                let actual = refused
+                    .last_read_result()
+                    .expect("actual native Result saved before observer")
+                    .as_ref()
+                    .expect("genuine successful physical read");
+                assert_eq!(actual.n_processed, 256);
+                assert!(!actual.finished);
+                assert_eq!(refused.pending_window(), Some(0..256));
+                assert_eq!(&refused.initialized_timestamps()[..256], &values[..256]);
+                assert!(refused.confirmed_timestamps().is_empty());
+            }
+            if phase == "timestamp-eof-result" {
+                assert!(refused.end_result_captured());
+                assert!(!refused.has_native_chunk());
+                assert_eq!(refused.confirmed_timestamps(), values);
+                assert_eq!(refused.usage().completed_chunks, 1);
+                assert!(!refused.usage().reached_end);
+            }
+            if phase == "timestamp-finished-source" {
+                assert!(!refused.has_native_chunk());
+                assert_eq!(refused.usage().completed_chunks, 1);
+                assert_eq!(refused.confirmed_timestamps(), values);
+                assert!(!refused.usage().reached_end);
+            }
+        }
+    }
+    let expiry = Instant::now() + Duration::from_secs(1);
+    let parent = actual_timestamp_parent(&raw, &compressed, count, expiry);
+    let prior = parent.recovery_usage();
+    while Instant::now() < expiry {
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+    let refused = parent
+        .prepare_timestamps_until(structural_timestamp_limits())
+        .expect_err("expired original owner does not start a new codec");
+    assert_eq!(refused.recovery_usage(), prior);
+    assert_eq!(
+        refused.usage(),
+        crate::RecoveredStructuralTimestampUsage::default()
+    );
+    assert!(!refused.file_result_captured());
+    assert!(refused.retained_input().is_none());
+    assert_eq!(
+        refused
+            .parent_offsets()
+            .parent_sections()
+            .structural_bytes(),
+        Some(raw.as_slice())
+    );
+}
+
+#[test]
+fn recovered_timestamps_untrusted_metadata_refuses_before_native_chunk() {
+    let values = (0..12u64).map(|n| 9 + n * 81).collect::<Vec<_>>();
+    let canonical = actual_timestamp_file(&[&values], usize::MAX, false);
+    let (_, rest) = pco::standalone::FileDecompressor::new(canonical.as_slice())
+        .expect("actual header location oracle");
+    let meta = canonical.len() - rest.len() + 4; // actual type byte +24-bit n_minus_one.
+    let mut dict = canonical.clone();
+    dict[meta] = (dict[meta] & 0xf0) | 4;
+    let mut lookback = canonical.clone();
+    lookback[meta] = (lookback[meta] & 0x0f) | 0x20;
+    let mut too_many = canonical.clone();
+    // Actual three-byte little-endian n_minus_one now declares13 against12.
+    let preamble = canonical.len() - rest.len();
+    too_many[preamble + 1..preamble + 4].copy_from_slice(&[12, 0, 0]);
+    let mut early = canonical[..preamble].to_vec();
+    early.push(0);
+    for (lane, actual_eof) in [
+        (dict, false),
+        (lookback, false),
+        (too_many, false),
+        (early, true),
+    ] {
+        let (raw, compressed, count) = timestamp_frame_with_lane(&values, &lane);
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let parent = actual_timestamp_parent(&raw, &compressed, count, expiry);
+        let refused = parent
+            .prepare_timestamps_until(structural_timestamp_limits())
+            .expect_err("real valid outer frame, unsupported/malformed inner timestamp lane");
+        assert!(refused.has_native_file());
+        assert!(!refused.has_native_chunk());
+        assert!(refused.native_error().is_none());
+        assert_eq!(refused.usage().native_calls, if actual_eof { 2 } else { 1 });
+        assert_eq!(refused.usage().reached_end, actual_eof);
+        assert_eq!(refused.retained_input(), Some(lane.as_slice()));
+        assert_eq!(refused.initialized_timestamps().len(), values.len());
+        assert!(refused.confirmed_timestamps().is_empty());
+        assert_eq!(refused.original_expiry(), expiry);
+        assert_eq!(
+            refused
+                .parent_offsets()
+                .parent_sections()
+                .structural_bytes(),
+            Some(raw.as_slice())
+        );
+        assert!(
+            refused
+                .parent_offsets()
+                .parent_sections()
+                .parent_has_native_context()
+        );
+    }
+    let mut future_header = canonical;
+    future_header[4] = 4; // real unsupported standalone version, no fake native result.
+    let (raw, compressed, count) = timestamp_frame_with_lane(&values, &future_header);
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let parent = actual_timestamp_parent(&raw, &compressed, count, expiry);
+    let refused = parent
+        .prepare_timestamps_until(structural_timestamp_limits())
+        .expect_err("unsupported file domain refuses before reader/native entry");
+    assert_eq!(refused.usage().native_calls, 0);
+    assert!(!refused.file_result_captured());
+    assert!(refused.retained_input().is_none());
+    assert_eq!(refused.original_expiry(), expiry);
+    assert_eq!(
+        refused
+            .parent_offsets()
+            .parent_sections()
+            .structural_bytes(),
+        Some(raw.as_slice())
+    );
+}
+
+#[test]
+fn recovered_timestamps_same_ledger_continues_after_finished_sources() {
+    let values = (0..300u64).collect::<Vec<_>>();
+    let lane = actual_timestamp_file(&[&values], 0, false);
+    let (raw, compressed, count) = timestamp_frame_with_lane(&values, &lane);
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let parent = actual_timestamp_parent(&raw, &compressed, count, expiry);
+    let before = parent.recovery_usage();
+    let prepared = parent
+        .prepare_timestamps_until(structural_timestamp_limits())
+        .expect("genuine finished native timestamp stage");
+    assert_eq!(prepared.timestamps(), values);
+    assert!(prepared.usage().reached_end);
+    let after = prepared.recovery_usage();
+    let next = prepared
+        .decompress_next_until(
+            Bytes::from(compressed),
+            raw.len(),
+            count,
+            recovery_decompression_policy(),
+        )
+        .expect("same original already-spent work through next actual native frame");
+    assert_eq!(next.original_expiry(), expiry);
+    assert!(
+        next.recovery_usage().work_bytes > after.work_bytes && after.work_bytes > before.work_bytes
+    );
+    assert_eq!(next.recovery_usage().read_bytes, before.read_bytes);
+    assert_eq!(next.structural_bytes(), Some(raw.as_slice()));
+}
+
+#[cfg(panic = "unwind")]
+#[test]
+fn recovered_timestamps_refused_capture_counts_no_unentered_native_read() {
+    let values = (100..400u64).collect::<Vec<_>>();
+    let lane = actual_timestamp_file(&[&values], values.len(), false);
+    let (raw, compressed, count) = timestamp_frame_with_lane(&values, &lane);
+    let directory = Directory::new();
+    let path = directory
+        .0
+        .join("same-real-native-read-admission-source.zst");
+    fs::write(&path, &compressed).expect("one fixed genuine source before original ledgers");
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let run = |parent_work| {
+        let mut limits = recovery_decompression_budget_limits();
+        limits.max_work_bytes = parent_work;
+        let mut original = crate::TelemetryRecoveryBudget::new(limits, expiry)
+            .expect("independent ORIGINAL ledger before identical actual read setup");
+        let input = Bytes::from(original.read_file(&path).expect("same real source read"));
+        let setup = original.usage();
+        let parent = crate::decompress_recovered_log_frame_until(
+            input,
+            raw.len(),
+            count,
+            recovery_decompression_policy(),
+            original,
+        )
+        .expect("actual native parent")
+        .prepare_sections_until(structural_section_limits())
+        .expect("actual sections")
+        .prepare_offsets_until(structural_offset_limits())
+        .expect("actual offsets");
+        let prior = parent.recovery_usage();
+        (
+            setup,
+            prior,
+            parent.prepare_timestamps_until(structural_timestamp_limits()),
+        )
+    };
+    let ample = recovery_decompression_budget_limits().max_work_bytes;
+    let (setup, prior, observed) = {
+        let _hook = Hook;
+        TARGET.set(Some(("timestamp-read-admission", 0, true)));
+        let (setup, prior, actual) = run(ample);
+        assert!(OBSERVED.get(), "the actual native read fee was admitted");
+        let actual = actual.expect_err("observe original work before actual capture/read entry");
+        assert!(actual.has_panic());
+        (setup, prior, actual)
+    };
+    assert!(observed.has_native_file() && observed.has_native_chunk());
+    assert_eq!(
+        observed.usage().native_calls,
+        2,
+        "only the actual File and Chunk constructors entered"
+    );
+    assert_eq!(observed.usage().reads, 0);
+    assert!(observed.last_read_result().is_none());
+    assert!(observed.last_read_window().is_none());
+    let cutoff = observed.recovery_usage().work_bytes;
+    let observed_usage = observed.usage();
+    let source_cursor = observed.last_committed_source_cursor();
+    let source_operations = observed.source_observations();
+    assert!(source_operations.is_some_and(|(fills, consumes)| fills > 0 && consumes > 0));
+    assert_eq!(observed.pending_window(), Some(0..256));
+    assert_eq!(observed.retained_input(), Some(lane.as_slice()));
+    assert!(
+        observed
+            .initialized_timestamps()
+            .iter()
+            .all(|value| *value == 0)
+    );
+    drop(observed);
+
+    // Derive this original cap from the real observation, never a fee formula.
+    // It fits the native fee exactly; the next actual capture charge must refuse.
+    let (same_setup, same_prior, limited) = run(cutoff);
+    let limited = limited.expect_err("capture storage cannot enter an unadmitted read");
+    assert_eq!(same_setup, setup);
+    assert_eq!(same_prior, prior);
+    assert!(!limited.has_panic());
+    assert_eq!(limited.recovery_usage().work_bytes, cutoff);
+    assert_eq!(limited.usage(), observed_usage);
+    assert_eq!(limited.usage().native_calls, 2);
+    assert_eq!(limited.usage().reads, 0);
+    assert!(limited.last_read_result().is_none());
+    assert!(limited.last_read_window().is_none());
+    assert_eq!(limited.pending_window(), Some(0..256));
+    assert_eq!(limited.last_committed_source_cursor(), source_cursor);
+    assert_eq!(
+        limited.source_observations(),
+        source_operations,
+        "the actual native reader has performed no read after its original constructor work"
+    );
+    assert!(limited.has_native_file() && limited.has_native_chunk());
+    assert!(limited.native_error().is_none());
+    assert_eq!(limited.initialized_timestamps().len(), values.len());
+    assert!(
+        limited
+            .initialized_timestamps()
+            .iter()
+            .all(|value| *value == 0)
+    );
+    assert!(limited.confirmed_timestamps().is_empty());
+    assert_eq!(limited.retained_input(), Some(lane.as_slice()));
+    assert_eq!(limited.original_expiry(), expiry);
+    assert_eq!(
+        limited
+            .parent_offsets()
+            .parent_sections()
+            .structural_bytes(),
+        Some(raw.as_slice())
+    );
+    assert!(
+        limited
+            .parent_offsets()
+            .parent_sections()
+            .parent_has_native_context()
+    );
+    let mut source = std::error::Error::source(&limited);
+    let mut original_limits = false;
+    while let Some(error) = source {
+        original_limits |= matches!(
+            error.downcast_ref::<crate::TelemetryRecoveryError>(),
+            Some(crate::TelemetryRecoveryError::Limits)
+        );
+        source = error.source();
+    }
+    assert!(
+        original_limits,
+        "the actual original capture-admission refusal remains retained"
+    );
+    drop(limited);
+    let (same_setup, same_prior, complete) = run(ample);
+    let complete =
+        complete.expect("the unchanged original ample ledger genuinely enters both reads and EOF");
+    assert_eq!(same_setup, setup);
+    assert_eq!(same_prior, prior);
+    assert_eq!(complete.timestamps(), values);
+    assert_eq!(complete.usage().reads, 2);
+    assert_eq!(complete.usage().native_calls, 5);
+    assert!(complete.usage().reached_end);
+}
