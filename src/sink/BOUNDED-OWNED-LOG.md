@@ -101,7 +101,19 @@ without a retry or mutable native/work extractor. The native resume adapter
 keeps its actual work owner, field layout and sized admission formula. This
 is structural-frame decoder substrate; bounded typed-row reconstruction, the
 owned query worker/facade and host/HA query ownership remain separate gates.
-The new adapter regressions require actual qualification on their own source.
+On 2026-10-19 the decoder prerequisite passed nine selected development gates:
+formatting, strict Clippy, all 15 decoder tests (including cumulative original
+work boundaries) and six genuine journal regressions. That result belongs to
+the decoder-only source; it does not qualify later structural or query work.
+
+The consuming structural-section continuation keeps the complete successful
+outer decoder/context/output beside the actual child Result and original-work
+postcheck. It charges concrete continuation/result state and each inspected
+header scalar/section on the same spent ledger/E, yielding eight encoded
+section views and the actual checked record count. Malformed outer framing
+remains a genuine parent refusal. Section facts do not decode Pco positions,
+typed metadata or log rows, and confer no query, host or HA ownership. Those
+producers and this new continuation's runtime qualification remain required.
 
 Existing fixture groups define actual filesystem/WAL/constructor/worker coverage.
 The positive group calls a real recovered engine's complete bounded resume

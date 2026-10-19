@@ -7,6 +7,8 @@ mod bounded_decompression;
 mod bounded_frames;
 #[cfg(unix)]
 mod recovery_decompression;
+#[cfg(unix)]
+mod recovery_sections;
 pub(crate) use bounded_decompression::FrameDecompressionLimits;
 pub(crate) use bounded_frames::{
     IndexedFramePreparationLimits, PreparedIndexedIngestFrames, RetainedIndexedFrameError,
@@ -15,6 +17,12 @@ pub(crate) use bounded_frames::{
 #[cfg(unix)]
 pub use recovery_decompression::{
     PreparedRecoveredLogFrame, RetainedRecoveredLogFrameError, decompress_recovered_log_frame_until,
+};
+#[cfg(unix)]
+pub use recovery_sections::{
+    PreparedRecoveredStructuralSections, RecoveredStructuralSection,
+    RecoveredStructuralSectionLimits, RecoveredStructuralSectionUsage,
+    RetainedRecoveredStructuralSectionError,
 };
 
 use bytes::Bytes;

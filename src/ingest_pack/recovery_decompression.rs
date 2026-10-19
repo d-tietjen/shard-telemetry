@@ -15,6 +15,11 @@ use std::time::Instant;
 pub(super) struct RecoveryFrameWork {
     budget: TelemetryRecoveryBudget,
 }
+impl RecoveryFrameWork {
+    pub(super) fn usage(&self) -> TelemetryRecoveryUsage {
+        self.budget.usage()
+    }
+}
 impl FrameWork for RecoveryFrameWork {
     type Refusal = TelemetryRecoveryError;
 
@@ -67,6 +72,25 @@ impl PreparedRecoveredLogFrame {
     /// Actual admitted decoder work for this frame, separate from prior setup.
     pub fn decoder_work_bytes(&self) -> usize {
         self.inner.work_bytes()
+    }
+
+    /// Consume this complete frame into actual charged structural-section views.
+    ///
+    /// The complete outer decoder/context/output and original work remain owned
+    /// beside the actual child result, including late/refused/unwound children.
+    /// This does not decode typed rows or establish query/serving ownership.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain the complete decoder, original work and child outcome without refusal allocation"
+    )]
+    pub fn prepare_sections_until(
+        self,
+        limits: super::recovery_sections::RecoveredStructuralSectionLimits,
+    ) -> Result<
+        super::recovery_sections::PreparedRecoveredStructuralSections,
+        super::recovery_sections::RetainedRecoveredStructuralSectionError,
+    > {
+        super::recovery_sections::prepare_sections_until(self.inner, limits)
     }
 
     /// Release this completed frame and decode another on the SAME spent ledger.
@@ -165,7 +189,7 @@ impl Error for RetainedRecoveredLogFrameError {
     clippy::result_large_err,
     reason = "retain the original ledger, native context and outcome without a refusal allocation"
 )]
-fn finish(
+pub(super) fn finish(
     result: Result<
         PreparedDecompressedFrame<RecoveryFrameWork>,
         RetainedFrameDecompressionError<RecoveryFrameWork>,

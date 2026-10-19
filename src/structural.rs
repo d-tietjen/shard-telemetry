@@ -31,7 +31,8 @@ use crate::{
     TelemetryError, TelemetryResult, TelemetryValue, TraceId,
 };
 
-const STRUCTURAL_BLOCK_MAGIC: &[u8; 4] = b"STLG";
+/// Canonical frame marker shared with bounded structural-section admission.
+pub(crate) const STRUCTURAL_BLOCK_MAGIC: &[u8; 4] = b"STLG";
 const DIRECT_ATTRIBUTE_VALUE: u8 = 0;
 const DICTIONARY_ATTRIBUTE_VALUE: u8 = 1;
 const TIMESTAMP_PCO_LEVEL: usize = 8;

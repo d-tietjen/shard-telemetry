@@ -1434,3 +1434,393 @@ fn recovery_decoder_late_and_panic_keep_actual_native_outcomes() {
         }
     }
 }
+
+fn structural_section_limits() -> crate::RecoveredStructuralSectionLimits {
+    crate::RecoveredStructuralSectionLimits {
+        max_input_bytes: 1 << 20,
+        max_records: 1 << 16,
+        max_section_bytes: 1 << 20,
+        max_declared_bytes: 1 << 20,
+        max_entries: 1024,
+        max_work_bytes: 1 << 22,
+    }
+}
+
+const STRUCTURAL_SECTION_KINDS: [crate::RecoveredStructuralSection; 8] = [
+    crate::RecoveredStructuralSection::Offsets,
+    crate::RecoveredStructuralSection::Timestamps,
+    crate::RecoveredStructuralSection::Templates,
+    crate::RecoveredStructuralSection::Bodies,
+    crate::RecoveredStructuralSection::Attributes,
+    crate::RecoveredStructuralSection::Fields,
+    crate::RecoveredStructuralSection::TypedMetadata,
+    crate::RecoveredStructuralSection::EmbeddedIndex,
+];
+
+fn append_section_extent(output: &mut Vec<u8>, mut value: usize) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        output.push(byte | if value == 0 { 0 } else { 0x80 });
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+#[test]
+fn recovered_sections_match_exact_wire_views_and_keep_completed_native_parent() {
+    let typed = crate::OtlpLogEvent {
+        timestamp_unix_nanos: 19,
+        observed_timestamp_unix_nanos: 27,
+        fields: Arc::new(vec![crate::MetadataField::new("tenant", "a")]),
+        message: Arc::from("original full typed record"),
+        body: Some(crate::TelemetryValue::Array(Arc::new(vec![
+            crate::TelemetryValue::Integer(-7),
+            crate::TelemetryValue::DoubleBits(0x7ff8_0000_0000_0042),
+        ]))),
+        attributes: Arc::new(vec![crate::TelemetryAttribute::new(
+            "nested",
+            crate::TelemetryValue::Map(Arc::new(vec![crate::TelemetryAttribute::new(
+                "preserved",
+                crate::TelemetryValue::Boolean(true),
+            )])),
+        )]),
+        resource: Arc::new(crate::ResourceContext {
+            schema_url: Arc::from("https://example.test/resource"),
+            ..crate::ResourceContext::default()
+        }),
+        scope: Arc::new(crate::ScopeContext {
+            name: Arc::from("actual.section.fixture"),
+            version: Arc::from("1.0"),
+            ..crate::ScopeContext::default()
+        }),
+        severity_number: 17,
+        severity_text: Arc::from("ERROR"),
+        dropped_attributes_count: 3,
+        flags: 1,
+        trace_id: Some(crate::TraceId::from_bytes([1; 16]).expect("real trace ID")),
+        span_id: Some(crate::SpanId::from_bytes([2; 8]).expect("real span ID")),
+        event_name: Arc::from("original.event"),
+        ..crate::OtlpLogEvent::default()
+    };
+    let events = vec![crate::OtlpLogEvent::default(), typed];
+    let sample = prepare_ingest_pack(&events).expect("actual ordinary typed producer");
+    let mut cursor = IngestPackCursor::new(&sample.payload, 2).expect("actual wire cursor");
+    let group = cursor.next_group().expect("actual typed structural frame");
+    let record_count = u32::try_from(group.record_count).expect("actual frame count fits u32");
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let (input, original, before) = persisted_frame_setup_work(group.compressed, expiry);
+    let parent = crate::decompress_recovered_log_frame_until(
+        input,
+        group.structural_bytes,
+        record_count,
+        recovery_decompression_policy(),
+        original,
+    )
+    .expect("actual complete native decoder");
+    let bytes = parent
+        .structural_bytes()
+        .expect("actual structural bytes")
+        .to_vec();
+    let pointer = parent.structural_bytes().expect("same allocation").as_ptr();
+    let expected = crate::decode_structural_block(&bytes).expect("ordinary full typed oracle");
+    assert_eq!(expected[1].body, events[1].body);
+    assert_eq!(expected[1].attributes, events[1].attributes);
+    assert_eq!(expected[1].resource, events[1].resource);
+    assert_eq!(expected[1].scope, events[1].scope);
+    assert_eq!(expected[1].trace_id, events[1].trace_id);
+    assert_eq!(expected[1].span_id, events[1].span_id);
+    let parent_usage = parent.recovery_usage();
+    let parent_calls = parent.stream_calls();
+    let sections = parent
+        .prepare_sections_until(structural_section_limits())
+        .expect("actual charged section continuation");
+    assert_eq!(sections.record_count(), record_count);
+    assert_eq!(sections.original_expiry(), expiry);
+    assert_eq!(
+        sections
+            .structural_bytes()
+            .expect("retained exact output")
+            .as_ptr(),
+        pointer
+    );
+    assert!(sections.parent_has_native_context());
+    assert_eq!(sections.parent_stream_calls(), parent_calls);
+    assert_eq!(sections.usage().sections, 8);
+    assert!(sections.usage().header_bytes >= 9);
+    assert!(sections.recovery_usage().work_bytes > parent_usage.work_bytes);
+    assert_eq!(sections.recovery_usage().read_bytes, before.read_bytes);
+    assert_eq!(sections.recovery_usage().records, before.records);
+    assert_eq!(sections.recovery_usage().json_values, before.json_values);
+    let mut reconstructed = crate::structural::STRUCTURAL_BLOCK_MAGIC.to_vec();
+    append_section_extent(&mut reconstructed, sections.record_count() as usize);
+    for kind in STRUCTURAL_SECTION_KINDS {
+        let view = sections
+            .section_bytes(kind)
+            .expect("actual complete section fact");
+        assert!(view.as_ptr() >= pointer);
+        assert!((view.as_ptr() as usize) + view.len() <= (pointer as usize) + bytes.len());
+        append_section_extent(&mut reconstructed, view.len());
+        reconstructed.extend_from_slice(view);
+    }
+    assert!(
+        !sections
+            .section_bytes(crate::RecoveredStructuralSection::TypedMetadata)
+            .expect("full typed metadata remains encoded")
+            .is_empty()
+    );
+    assert_eq!(
+        reconstructed, bytes,
+        "views reconstruct the exact original canonical wire"
+    );
+    assert_eq!(
+        crate::decode_structural_block(&reconstructed).expect("ordinary typed decode from views"),
+        expected,
+        "every typed value and field survives the retained views without projection"
+    );
+    let after_sections = sections.recovery_usage();
+    let next = sections
+        .decompress_next_until(
+            Bytes::copy_from_slice(group.compressed),
+            group.structural_bytes,
+            record_count,
+            recovery_decompression_policy(),
+        )
+        .expect("completed sections continue to another actual frame on same original work");
+    assert_eq!(next.original_expiry(), expiry);
+    assert!(next.recovery_usage().work_bytes > after_sections.work_bytes);
+    assert_eq!(next.recovery_usage().read_bytes, before.read_bytes);
+    assert_eq!(next.structural_bytes(), Some(bytes.as_slice()));
+}
+
+#[test]
+fn recovered_sections_limits_and_cumulative_parent_work_retain_real_child() {
+    let sample = original_pack(12, 1);
+    let mut cursor = IngestPackCursor::new(&sample.payload, 12).expect("actual wire cursor");
+    let group = cursor.next_group().expect("actual structural source");
+    let directory = Directory::new();
+    let path = directory.0.join("same-section-parent-source.zst");
+    fs::write(&path, group.compressed).expect("one fixed original source");
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let run = |parent_work, child_limits| {
+        let mut limits = recovery_decompression_budget_limits();
+        limits.max_work_bytes = parent_work;
+        let mut original = crate::TelemetryRecoveryBudget::new(limits, expiry)
+            .expect("independent original ledger before the same setup");
+        let input = Bytes::from(original.read_file(&path).expect("same physical setup"));
+        let setup_usage = original.usage();
+        let parent = crate::decompress_recovered_log_frame_until(
+            input,
+            group.structural_bytes,
+            12,
+            recovery_decompression_policy(),
+            original,
+        )
+        .expect("the actual parent fits every initial envelope");
+        let parent_usage = parent.recovery_usage();
+        (
+            setup_usage,
+            parent_usage,
+            parent.prepare_sections_until(child_limits),
+        )
+    };
+    let ample_parent = recovery_decompression_budget_limits().max_work_bytes;
+    let (setup, parent, observed) = run(ample_parent, structural_section_limits());
+    let observed = observed.expect("actual complete section observation");
+    let observed_usage = observed.recovery_usage();
+    let child_work = observed.usage().work_bytes;
+    let largest = STRUCTURAL_SECTION_KINDS
+        .iter()
+        .map(|kind| {
+            observed
+                .section_bytes(*kind)
+                .expect("actual observed section")
+                .len()
+        })
+        .max()
+        .expect("eight real sections");
+    drop(observed);
+    let mut exact_child = structural_section_limits();
+    exact_child.max_work_bytes = child_work;
+    exact_child.max_section_bytes = largest;
+    exact_child.max_records = 12;
+    let (exact_setup, exact_parent, exact) = run(ample_parent, exact_child);
+    let exact = exact.expect("actual exact child work/section/count ceilings");
+    assert_eq!(exact_setup, setup);
+    assert_eq!(exact_parent, parent);
+    assert_eq!(exact.recovery_usage(), observed_usage);
+    drop(exact);
+    for case in 0..3 {
+        let mut limits = exact_child;
+        match case {
+            0 => limits.max_work_bytes -= 1,
+            1 => limits.max_section_bytes -= 1,
+            _ => limits.max_records -= 1,
+        }
+        let (_, same_parent, refused) = run(ample_parent, limits);
+        let refused = refused.expect_err("one less actual child bound");
+        assert_eq!(same_parent, parent);
+        assert!(refused.parent_has_native_context());
+        assert!(refused.structural_bytes().is_some());
+        assert!(refused.child_entered());
+        assert!(!refused.child_succeeded());
+    }
+    let (exact_setup, exact_parent, exact) =
+        run(observed_usage.work_bytes, structural_section_limits());
+    let exact =
+        exact.expect("exact cumulative ORIGINAL work includes setup/native parent/sections");
+    assert_eq!(exact_setup, setup);
+    assert_eq!(exact_parent, parent);
+    assert_eq!(exact.recovery_usage(), observed_usage);
+    drop(exact);
+    let (short_setup, short_parent, short) =
+        run(observed_usage.work_bytes - 1, structural_section_limits());
+    let short = short.expect_err("one less cumulative ORIGINAL work refuses actual section child");
+    assert_eq!(short_setup, setup);
+    assert_eq!(short_parent, parent);
+    assert_eq!(short.original_expiry(), expiry);
+    assert!(short.parent_has_native_context());
+    assert!(
+        !short
+            .structural_bytes()
+            .expect("complete original output")
+            .is_empty()
+    );
+    assert!(short.usage().sections > 0 && short.usage().sections < 8);
+    assert!(short.recovery_usage().work_bytes > parent.work_bytes);
+    let mut source = std::error::Error::source(&short);
+    let mut actual_limits = false;
+    while let Some(error) = source {
+        actual_limits |= matches!(
+            error.downcast_ref::<crate::TelemetryRecoveryError>(),
+            Some(crate::TelemetryRecoveryError::Limits)
+        );
+        source = error.source();
+    }
+    assert!(
+        actual_limits,
+        "actual parent budget refusal remains in the child source chain"
+    );
+}
+
+#[test]
+fn recovered_sections_expiry_and_unwind_keep_parent_and_actual_child_result() {
+    let sample = original_pack(12, 1);
+    let mut cursor = IngestPackCursor::new(&sample.payload, 12).expect("actual wire cursor");
+    let group = cursor.next_group().expect("actual structural source");
+    for phase in [
+        "structural-record-count",
+        "structural-section",
+        "structural-child-result",
+    ] {
+        for panic in [false, true] {
+            let expiry = Instant::now() + Duration::from_secs(if panic { 30 } else { 1 });
+            let (input, original, _) = persisted_frame_setup_work(group.compressed, expiry);
+            let parent = crate::decompress_recovered_log_frame_until(
+                input,
+                group.structural_bytes,
+                12,
+                recovery_decompression_policy(),
+                original,
+            )
+            .expect("complete actual outer decoder before child entry");
+            let pointer = parent.structural_bytes().expect("actual output").as_ptr();
+            let before = parent.recovery_usage();
+            let _hook = Hook;
+            TARGET.set(Some((phase, 0, panic)));
+            let refused = parent
+                .prepare_sections_until(structural_section_limits())
+                .expect_err("actual captured child phase before original E or unwind");
+            assert!(OBSERVED.get());
+            assert_eq!(refused.has_panic(), panic);
+            assert_eq!(refused.original_expiry(), expiry);
+            assert_eq!(
+                refused
+                    .structural_bytes()
+                    .expect("retained complete parent")
+                    .as_ptr(),
+                pointer
+            );
+            assert!(refused.parent_has_native_context());
+            assert!(refused.parent_stream_calls() > 0);
+            assert!(refused.recovery_usage().work_bytes > before.work_bytes);
+            assert_eq!(
+                refused.child_succeeded(),
+                phase == "structural-child-result"
+            );
+            if phase == "structural-child-result" {
+                assert_eq!(refused.usage().sections, 8);
+                assert!(
+                    refused
+                        .section_bytes(crate::RecoveredStructuralSection::EmbeddedIndex)
+                        .is_some()
+                );
+            }
+            if !panic {
+                assert!(matches!(
+                    refused.post_error(),
+                    Some(crate::TelemetryRecoveryError::Expired)
+                ));
+            }
+        }
+    }
+    let expiry = Instant::now() + Duration::from_secs(1);
+    let (input, original, _) = persisted_frame_setup_work(group.compressed, expiry);
+    let parent = crate::decompress_recovered_log_frame_until(
+        input,
+        group.structural_bytes,
+        12,
+        recovery_decompression_policy(),
+        original,
+    )
+    .expect("complete actual parent before E");
+    let before = parent.recovery_usage();
+    while Instant::now() < expiry {
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+    let refused = parent
+        .prepare_sections_until(structural_section_limits())
+        .expect_err("pre-entry original E does not start a replacement child");
+    assert!(!refused.child_entered());
+    assert_eq!(refused.recovery_usage(), before);
+    assert_eq!(refused.usage().sections, 0);
+    assert!(refused.parent_has_native_context());
+}
+
+#[test]
+fn malformed_structural_wire_stays_a_real_parent_decoder_refusal() {
+    let sample = original_pack(12, 1);
+    let mut cursor = IngestPackCursor::new(&sample.payload, 12).expect("actual wire cursor");
+    let group = cursor.next_group().expect("actual structural source");
+    let raw = zstd::bulk::decompress(group.compressed, group.structural_bytes)
+        .expect("independent ordinary original frame oracle");
+    for case in 0..3 {
+        let mut malformed = raw.clone();
+        match case {
+            0 => malformed[0] ^= 0x80,
+            1 => malformed[4] = 13,
+            _ => {
+                malformed.pop();
+            }
+        }
+        let compressed =
+            zstd::bulk::compress(&malformed, 1).expect("actual malformed frame encoding");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let (input, original, before) = persisted_frame_setup_work(&compressed, expiry);
+        let parent_error = crate::decompress_recovered_log_frame_until(
+            input,
+            malformed.len(),
+            12,
+            recovery_decompression_policy(),
+            original,
+        )
+        .expect_err("real outer framing/count/section refusal; no fabricated successful parent");
+        assert!(parent_error.has_native_context());
+        assert!(parent_error.stream_calls() > 0);
+        assert_eq!(parent_error.output_prefix(), malformed);
+        assert_eq!(parent_error.original_expiry(), expiry);
+        assert!(parent_error.recovery_usage().work_bytes > before.work_bytes);
+        assert!(parent_error.native_error().is_none());
+    }
+}
