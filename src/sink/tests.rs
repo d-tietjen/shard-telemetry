@@ -42,9 +42,13 @@ fn manual_native_query_work_rejects_retained_navigation_before_factory_allocatio
         )),
         ..OtlpSinkConfig::default()
     };
-    let error = TelemetrySinkFactory::new([ShardId::new(0)], config)
-        .err()
-        .expect("explicit work policy cannot enable unbounded posting materialization");
+    let error = match TelemetrySinkFactory::new([ShardId::new(0)], config) {
+        Err(error) => error,
+        Ok(owner) => {
+            drop(owner);
+            panic!("explicit work policy cannot enable unbounded posting materialization");
+        }
+    };
     assert!(
         error
             .to_string()

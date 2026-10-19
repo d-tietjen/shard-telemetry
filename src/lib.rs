@@ -30,6 +30,7 @@ mod offload;
 mod otlp;
 mod otlp_server;
 mod otlp_signal;
+mod owned_append_pool;
 mod production;
 mod prometheus_api;
 mod prometheus_protocol;
@@ -40,6 +41,7 @@ mod query;
 mod query_index;
 mod query_work;
 mod realtime_dictionary;
+mod recovery;
 mod remote_write;
 mod resident;
 mod rollup;
@@ -127,6 +129,10 @@ pub use offload::{
 pub use otlp::{OtlpLogDecoder, OtlpLogEvent};
 pub use otlp_server::{OtlpIngestService, OtlpReceiverConfig, otlp_http_router, serve_otlp_grpc};
 pub use otlp_signal::{OtlpMetricEvent, OtlpSpanEvent, OtlpTelemetryDecoder};
+pub use owned_append_pool::{
+    TelemetryAppendPool, TelemetryAppendPoolLimits, TelemetryAppendPoolSetupError,
+    TelemetryAppendPoolSetupFailure, TelemetryTaskRegistry,
+};
 pub use production::{
     ProductionMetricsSnapshot, ProductionRuntime, ServiceLifecycle, ServiceState,
     SingleTenantConfig,
@@ -149,6 +155,10 @@ pub use realtime_dictionary::{
     RealtimeDictionaryConfig, RealtimeDictionaryObserver, RealtimeDictionaryStats,
     RealtimeDictionaryTrainer,
 };
+pub use recovery::{
+    TelemetryRecoveryBudget, TelemetryRecoveryBuffer, TelemetryRecoveryError,
+    TelemetryRecoveryLimits, TelemetryRecoveryUsage,
+};
 pub use remote_write::{
     DecodedRemoteWrite, METRIC_FLAG_STALE, PROMETHEUS_STALE_NAN_BITS, RemoteWriteDecoder,
     RemoteWriteStats, RemoteWriteVersion,
@@ -163,7 +173,18 @@ pub use signal_ingest::{
     prepare_metric_envelope_with_protocol, prepare_trace_envelope,
 };
 pub use sink::{OtlpSinkConfig, SinkObjectTierConfig, TelemetryService, TelemetrySinkFactory};
-pub use stripe::{IndexReceipt, LogStripe, ShardStreamDurableSink, ShardTelemetry, StripeConfig};
+#[cfg(unix)]
+pub use sink::{
+    OwnedLogApplyLimits, OwnedLogDecompressionLimits, OwnedLogFactoryLimits, OwnedLogReplayLimits,
+    OwnedLogReplayPlan, OwnedLogShard, OwnedLogSinkFactory, RetainedOwnedLogFactoryError,
+};
+#[cfg(unix)]
+pub use sink_journal::{AnchoredJournalLimits, AnchoredSinkJournal, RetainedAnchoredJournalError};
+pub use stripe::{
+    IndexReceipt, LogStripe, LogStripeSetupFailure, LogStripeSetupLimits,
+    LogStripeSetupObservation, PreparedLogStripe, RetainedLogStripeSetupError,
+    ShardStreamDurableSink, ShardTelemetry, StripeConfig,
+};
 pub use structural::{
     DecodedStructuralRecord, EmbeddedFrameIndex, IndexedStructuralBlock, StructuralLogMetadataRef,
     StructuralRecordView, decode_embedded_frame_index, decode_structural_block,
@@ -183,7 +204,7 @@ pub(crate) use telemetry::{
 pub use telemetry_store::{
     DurableTelemetryConfig, DurableTelemetryLimits, DurableTelemetryStore, FetchedTelemetryBatch,
     LifetimeRollupReport, RetentionReport, TelemetryAppendDurability, TelemetryAppendGate,
-    TelemetryEngineAttachment, TelemetryHostAttachment,
+    TelemetryEngineAttachment, TelemetryHostAttachment, TelemetryRecoveredCatalogs,
 };
 pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};
 pub use tier::{

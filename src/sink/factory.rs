@@ -416,6 +416,15 @@ impl DurableAppendSinkFactory for TelemetrySinkFactory {
             })
     }
 
+    #[cfg(unix)]
+    fn load_checkpoint_until(
+        &self,
+        topic_partition: TopicPartition,
+        work: &shard_stream_engine::NativeResumeWork,
+    ) -> shard_stream_engine::NativeResumeCallbackResult<Option<DurableSinkCheckpoint>> {
+        super::bounded_callback::load_checkpoint_until(&self.checkpoints, topic_partition, work)
+    }
+
     fn open_shard(&self, shard_id: ShardId) -> EngineResult<Arc<dyn DurableAppendSink>> {
         let stripe = self
             .available
@@ -456,12 +465,12 @@ impl DurableAppendSinkFactory for TelemetrySinkFactory {
             })?
             .insert(shard_id, sender.clone());
         Ok(Arc::new(ShardTelemetryStripeSink {
-            state: Arc::new(SinkState {
+            state: ShardSinkOwner::Legacy(Arc::new(SinkState {
                 shard_id,
                 sender: Mutex::new(Some(sender)),
                 worker: Mutex::new(Some(worker)),
                 query_workers: Arc::clone(&self.query_workers),
-            }),
+            })),
         }))
     }
 }

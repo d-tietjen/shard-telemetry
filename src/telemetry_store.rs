@@ -51,6 +51,8 @@ mod append_epoch_qualification;
 mod append_helpers;
 #[cfg(test)]
 mod capacity_qualification;
+mod catalog_recovery;
+pub use catalog_recovery::TelemetryRecoveredCatalogs;
 #[cfg(test)]
 mod correlation_qualification;
 #[cfg(test)]
@@ -618,7 +620,7 @@ pub struct FetchedTelemetryBatch {
     pub envelope: crate::TelemetryEnvelope,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedAppendReceipt {
     request_id: String,
     payload_digest: String,

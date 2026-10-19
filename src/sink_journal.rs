@@ -12,7 +12,48 @@ use shard_stream_engine::{DurableAppend, DurableSinkCheckpoint};
 
 use crate::{TelemetryError, TelemetryResult};
 
+#[cfg(unix)]
+mod bounded;
+#[cfg(unix)]
+pub(crate) use bounded::{RetainedSinkJournalError, SinkJournalRecoveryLimits};
+#[cfg(unix)]
+mod anchored;
+#[cfg(all(test, unix))]
+pub(crate) use anchored::anchored_journal_cost;
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use anchored::set_anchored_probe;
+#[cfg(unix)]
+pub use anchored::{AnchoredJournalLimits, AnchoredSinkJournal, RetainedAnchoredJournalError};
+#[cfg(unix)]
+mod replay;
+#[cfg(unix)]
+pub(crate) use replay::JournalReplayInput;
+#[cfg(unix)]
+mod transaction;
+#[cfg(unix)]
+pub(crate) use transaction::{
+    JournalAppendKind, JournalAppendLimits, JournalAppendOutcome, JournalTransaction,
+    RetainedJournalAppendError,
+};
+
 const MAGIC: &[u8; 8] = b"STELSNK1";
+const APPLICATION_MAGIC: &[u8; 8] = b"STELAPP2";
+
+/// Persisted producer domain. Application edges require a held global-map seal;
+/// their sparse physical-lane rows supply no global completion on their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JournalFormat {
+    Legacy,
+    Application,
+}
+impl JournalFormat {
+    fn magic(self) -> &'static [u8; 8] {
+        match self {
+            Self::Legacy => MAGIC,
+            Self::Application => APPLICATION_MAGIC,
+        }
+    }
+}
 const CHECKSUM_BYTES: usize = 32;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const BATCH_SYNC_BYTES: u64 = 1024 * 1024;
@@ -37,11 +78,14 @@ struct JournalState {
     bytes: u64,
     unsynced_bytes: u64,
     checkpoints: HashMap<TopicPartition, DurableSinkCheckpoint>,
+    terminal_write_refused: bool,
 }
 
 /// Checksummed transaction journal for one physical sink stripe.
 #[derive(Debug)]
 pub(crate) struct SinkJournal {
+    format: JournalFormat,
+    shard_id: ShardId,
     max_bytes: u64,
     sync_each_append: bool,
     state: Mutex<JournalState>,
@@ -91,6 +135,8 @@ impl SinkJournal {
             .map_err(|error| journal_io("seek append", error))?;
         Ok((
             Self {
+                format: JournalFormat::Legacy,
+                shard_id,
                 max_bytes,
                 sync_each_append,
                 state: Mutex::new(JournalState {
@@ -98,6 +144,7 @@ impl SinkJournal {
                     bytes,
                     unsynced_bytes: 0,
                     checkpoints,
+                    terminal_write_refused: false,
                 }),
             },
             transactions,
@@ -110,6 +157,11 @@ impl SinkJournal {
         appends: &[DurableAppend],
         next: DurableSinkCheckpoint,
     ) -> TelemetryResult<()> {
+        if self.format != JournalFormat::Legacy {
+            return Err(TelemetryError::InvalidConfig(
+                "application-edge journal requires the held global application transaction",
+            ));
+        }
         let payload = encode_transaction(expected, appends, next)?;
         let frame_bytes = 4_usize
             .checked_add(payload.len())
@@ -119,6 +171,11 @@ impl SinkJournal {
             .state
             .lock()
             .map_err(|_| TelemetryError::StorageIo("sink journal lock is poisoned".into()))?;
+        if state.terminal_write_refused {
+            return Err(TelemetryError::StorageIo(
+                "sink journal requires genuine recovery after refused bounded write".into(),
+            ));
+        }
         let actual = state
             .checkpoints
             .get(&expected.topic_partition)

@@ -334,7 +334,7 @@ pub(super) fn for_each_signal_tier_payload(
                         tier.object_store(),
                         &artifact.object_key,
                         &metadata,
-                        &[block.payload_offset..end],
+                        std::slice::from_ref(&(block.payload_offset..end)),
                     )?;
                     for payload in encoded {
                         if blake3::hash(payload.as_ref()).to_hex().as_str()

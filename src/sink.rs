@@ -42,6 +42,23 @@ use crate::{
     decode_signal_recovery_state, decode_trace_block, stage_signal_group,
 };
 
+#[cfg(unix)]
+mod bounded_apply;
+#[cfg(unix)]
+pub(crate) use bounded_apply::ApplicationJournalEdge;
+#[cfg(unix)]
+mod bounded_callback;
+#[cfg(unix)]
+pub(crate) use bounded_callback::{
+    JournalCallbackReceipt, append_application_journal_until, append_journal_until,
+};
+#[cfg(unix)]
+pub(crate) mod owned_log;
+#[cfg(unix)]
+pub use owned_log::{
+    OwnedLogApplyLimits, OwnedLogDecompressionLimits, OwnedLogFactoryLimits, OwnedLogReplayLimits,
+    OwnedLogReplayPlan, OwnedLogShard, OwnedLogSinkFactory, RetainedOwnedLogFactoryError,
+};
 mod factory;
 mod indexing;
 mod object_tier;
@@ -790,15 +807,28 @@ impl Drop for SinkState {
 }
 
 #[derive(Clone)]
+enum ShardSinkOwner {
+    Legacy(Arc<SinkState>),
+    #[cfg(unix)]
+    Owned(Arc<owned_log::OwnedLogWorker>),
+}
+#[derive(Clone)]
 struct ShardTelemetryStripeSink {
-    state: Arc<SinkState>,
+    state: ShardSinkOwner,
 }
 
 impl fmt::Debug for ShardTelemetryStripeSink {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ShardTelemetryStripeSink")
-            .field("shard_id", &self.state.shard_id)
+            .field(
+                "shard_id",
+                &match &self.state {
+                    ShardSinkOwner::Legacy(s) => s.shard_id,
+                    #[cfg(unix)]
+                    ShardSinkOwner::Owned(s) => s.shard_id(),
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -810,15 +840,23 @@ impl DurableAppendSink for ShardTelemetryStripeSink {
         appends: &[DurableAppend],
         next: DurableSinkCheckpoint,
     ) -> EngineResult<DurableSinkApply> {
+        let state = match &self.state {
+            ShardSinkOwner::Legacy(state) => state,
+            #[cfg(unix)]
+            ShardSinkOwner::Owned(_) => {
+                return Err(EngineError::UnsupportedDurability(
+                    "owned log worker requires original native work",
+                ));
+            }
+        };
         let (response, receiver) = sync_channel(1);
-        let sender = self
-            .state
+        let sender = state
             .sender
             .lock()
             .map_err(|_| EngineError::CorruptState("shard-telemetry sink lock poisoned".into()))?
             .as_ref()
             .cloned()
-            .ok_or(EngineError::WorkerStopped(self.state.shard_id))?;
+            .ok_or(EngineError::WorkerStopped(state.shard_id))?;
         sender
             .send(SinkCommand::Apply(SinkApplyCommand {
                 expected,
@@ -826,10 +864,27 @@ impl DurableAppendSink for ShardTelemetryStripeSink {
                 next,
                 response,
             }))
-            .map_err(|_| EngineError::WorkerStopped(self.state.shard_id))?;
+            .map_err(|_| EngineError::WorkerStopped(state.shard_id))?;
         receiver
             .recv()
-            .map_err(|_| EngineError::WorkerStopped(self.state.shard_id))?
+            .map_err(|_| EngineError::WorkerStopped(state.shard_id))?
+    }
+    #[cfg(unix)]
+    fn apply_until(
+        &self,
+        expected: DurableSinkCheckpoint,
+        appends: &[DurableAppend],
+        next: DurableSinkCheckpoint,
+        work: &shard_stream_engine::NativeResumeWork,
+    ) -> shard_stream_engine::NativeResumeCallbackResult<DurableSinkApply> {
+        match &self.state {
+            ShardSinkOwner::Owned(worker) => worker.apply_until(expected, appends, next, work),
+            ShardSinkOwner::Legacy(_) => {
+                Err(shard_stream_engine::NativeResumeCallbackError::unsupported(
+                    "durable sink has no bounded apply producer",
+                ))
+            }
+        }
     }
 }
 

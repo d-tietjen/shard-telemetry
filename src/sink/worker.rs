@@ -1,5 +1,10 @@
 use super::*;
 
+#[cfg(unix)]
+pub(super) fn run_owned_sink_worker(shared: Arc<owned_log::Shared>) {
+    owned_log::run(shared);
+}
+
 pub(super) fn run_sink_worker(
     mut stripe: TelemetryStripeState,
     checkpoints: Arc<Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>>,

@@ -778,28 +778,23 @@ impl MetricStripe {
     }
 
     pub(super) fn seal_series(&mut self, series: SeriesFingerprint) -> TelemetryResult<()> {
-        if let Some(limit) = self.resident_payload_limit {
-            if let Some(head) = self.series.get(&series) {
-                if !head.points.is_empty() {
-                    let points = head.points.values().cloned().collect::<Vec<_>>();
-                    let encoded = encode_metric_chunk(&points)?;
-                    let retained = self
-                        .pending_chunks
-                        .iter()
-                        .filter(|chunk| chunk.topic_partition == head.topic_partition)
-                        .fold(0_u64, |total, chunk| {
-                            total.saturating_add(
-                                u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX),
-                            )
-                        });
-                    if retained.saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX))
-                        > limit
-                    {
-                        return Err(TelemetryError::InvalidConfig(
-                            "sealed metric payload capacity exhausted",
-                        ));
-                    }
-                }
+        if let Some(limit) = self.resident_payload_limit
+            && let Some(head) = self.series.get(&series)
+            && !head.points.is_empty()
+        {
+            let points = head.points.values().cloned().collect::<Vec<_>>();
+            let encoded = encode_metric_chunk(&points)?;
+            let retained = self
+                .pending_chunks
+                .iter()
+                .filter(|chunk| chunk.topic_partition == head.topic_partition)
+                .fold(0_u64, |total, chunk| {
+                    total.saturating_add(u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX))
+                });
+            if retained.saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX)) > limit {
+                return Err(TelemetryError::InvalidConfig(
+                    "sealed metric payload capacity exhausted",
+                ));
             }
         }
         let Some(head) = self.series.get_mut(&series) else {

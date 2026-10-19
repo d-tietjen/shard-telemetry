@@ -143,6 +143,10 @@ impl DurableTelemetryStore {
         result
     }
 
+    #[allow(
+        dead_code,
+        reason = "the single-cutoff compatibility helper is exercised by retention component tests"
+    )]
     pub(super) fn compact_retention_before(
         &self,
         cutoff: u64,

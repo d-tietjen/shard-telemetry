@@ -3,6 +3,14 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+mod bounded_decompression;
+mod bounded_frames;
+pub(crate) use bounded_decompression::FrameDecompressionLimits;
+pub(crate) use bounded_frames::{
+    IndexedFramePreparationLimits, PreparedIndexedIngestFrames, RetainedIndexedFrameError,
+    prepare_indexed_ingest_frames_until,
+};
+
 use bytes::Bytes;
 use shard_stream_core::LogicalOffset;
 

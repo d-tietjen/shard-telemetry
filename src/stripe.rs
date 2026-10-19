@@ -757,6 +757,16 @@ pub struct LogStripe {
 }
 
 mod append;
+mod bounded_setup;
+pub use bounded_setup::{
+    LogStripeSetupFailure, LogStripeSetupLimits, LogStripeSetupObservation, PreparedLogStripe,
+    RetainedLogStripeSetupError,
+};
+mod bounded_publication;
+pub(crate) use bounded_publication::{
+    LogIndexPublicationLimits, LogIndexPublicationOutcome, LogPublicationInput,
+    PreparedLogIndexPublication, PublishedLogIndex, RetainedLogIndexPublicationError,
+};
 mod cache;
 pub(crate) use cache::*;
 mod lifecycle;

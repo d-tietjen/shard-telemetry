@@ -7,6 +7,7 @@ use std::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::LokiApiError;
+use crate::recovery::{TelemetryRecoveryBudget, TelemetryRecoveryError, TelemetryRecoveryUsage};
 
 const DELETE_CATALOG_VERSION: u32 = 1;
 
@@ -76,6 +77,68 @@ impl DeleteCatalog {
         } else {
             DeleteState::default()
         };
+        Ok(Self {
+            path: Some(path),
+            state: RwLock::new(state),
+        })
+    }
+
+    pub(crate) fn open_with_recovery_budget(
+        path: PathBuf,
+        budget: &mut TelemetryRecoveryBudget,
+    ) -> Result<Self, TelemetryRecoveryError> {
+        budget.charge(TelemetryRecoveryUsage {
+            retained_bytes: path.capacity(),
+            ..Default::default()
+        })?;
+        let exists = budget.io(|| path.try_exists())?;
+        let state = if exists {
+            let encoded = budget.read_file(&path)?;
+            let persisted: PersistedDeleteCatalog = budget.decode_json(
+                &encoded,
+                crate::recovery::largest_element::<DeleteRequest>()
+                    .max(std::mem::size_of::<PersistedDeleteCatalog>()),
+            )?;
+            if persisted.version != DELETE_CATALOG_VERSION || persisted.state.next_request_id == 0 {
+                return budget.invalid();
+            }
+            // Hash canonical state without constructing a second full JSON
+            // buffer. Serialization work is charged before every writer call.
+            let observed = budget.hash_json(&persisted.state)?;
+            if observed.to_hex().as_str() != persisted.checksum {
+                return budget.invalid();
+            }
+            for (tenant, requests) in &persisted.state.tenants {
+                if tenant.is_empty() {
+                    return budget.invalid();
+                }
+                let mut previous: Option<&str> = None;
+                for request in requests {
+                    budget.charge(TelemetryRecoveryUsage {
+                        work_bytes: request
+                            .request_id
+                            .len()
+                            .checked_add(request.status.len())
+                            .ok_or(TelemetryRecoveryError::Limits)?,
+                        ..Default::default()
+                    })?;
+                    if request.request_id.is_empty()
+                        || u64::from_str_radix(&request.request_id, 16)
+                            .is_ok_and(|id| id >= persisted.state.next_request_id)
+                        || previous.is_some_and(|prior| prior >= request.request_id.as_str())
+                        || request.start_time > request.end_time
+                        || !matches!(request.status.as_str(), "received" | "canceled")
+                    {
+                        return budget.invalid();
+                    }
+                    previous = Some(&request.request_id);
+                }
+            }
+            persisted.state
+        } else {
+            DeleteState::default()
+        };
+        budget.check()?;
         Ok(Self {
             path: Some(path),
             state: RwLock::new(state),
@@ -270,6 +333,48 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_delete_recovery_preserves_order_checksum_and_legacy_behavior() {
+        use crate::recovery::tests::{Directory, budget, limits};
+        let directory = Directory::new();
+        let path = directory.0.join("deletes.json");
+        let original = DeleteCatalog::open(path.clone()).expect("legacy constructor");
+        original
+            .create("tenant-a", 1, 2, "{app=\"api\"}".into(), 3)
+            .expect("first delete");
+        original
+            .create("tenant-a", 4, 5, "{app=\"worker\"}".into(), 6)
+            .expect("second delete");
+        let expected = original.list("tenant-a").expect("original records");
+        let before = fs::read(&path).expect("actual persisted bytes");
+        let recovered = DeleteCatalog::open_with_recovery_budget(path.clone(), &mut budget())
+            .expect("bounded recovery");
+        assert_eq!(
+            recovered.list("tenant-a").expect("bounded records"),
+            expected
+        );
+        assert_eq!(fs::read(&path).expect("no rewrite"), before);
+        assert_eq!(
+            recovered
+                .create("tenant-b", 7, 8, "{app=\"other\"}".into(), 9)
+                .expect("monotonic ID"),
+            "0000000000000003"
+        );
+        assert_eq!(
+            DeleteCatalog::open(path.clone())
+                .expect("legacy restart")
+                .list("tenant-a")
+                .expect("legacy records"),
+            expected
+        );
+        fs::write(&path, vec![b' '; limits().max_file_bytes + 1]).expect("oversized actual JSON");
+        assert!(matches!(
+            DeleteCatalog::open_with_recovery_budget(path, &mut budget()),
+            Err(TelemetryRecoveryError::Limits)
+        ));
+    }
 
     #[test]
     fn durable_catalog_survives_restart_and_allocates_monotonic_ids() {

@@ -54,6 +54,76 @@ ownership, through ingestion and query work. The existing
 the same attachment implementation. Hosts remain responsible for startup
 deadlines, sink installation, write fencing and readiness.
 
+`TelemetryRecoveredCatalogs::recover` provides a separate bounded catalog
+preparation step on Linux/Android. A single `TelemetryRecoveryBudget` keeps the
+original absolute deadline and cumulative limits for file/path bytes,
+directory advances (including dot entries, retries and EOF), JSON object/value
+counts, decoded strings, declared retained state and work. Regular-file reads
+use nofollow/nonblocking opens and explicit bounded attempts; buffer and path
+capacities are checked after allocation. A tree-free JSON census precedes typed
+decoding, with escaped-string scratch accounted separately. Refusal errors can
+retain actual buffers and physical errors without exposing buffer contents in
+Debug output. These are input and declared-state bounds, not process RSS or a
+hard limit on filesystem syscall duration.
+
+The recovered owner holds the real delete/retry catalogs and releases its
+exclusive directory lease last. Bounded receipt migration reconciles retained
+v1 input even after partial v2 publication, preserves identical retries and
+rejects conflicting identities. Expired v1 entries need no fabricated v2 file;
+stale temporary files are safely rewritten on restart. Existing constructors
+retain their prior behavior. Catalog names must remain stable and writers must
+cooperate with the lease: separate rename/remove/reopen operations do not form
+a kernel-atomic namespace fence. This stage does not open a complete owned
+store or qualify sink/object recovery, worker construction or serving readiness.
+
+`TelemetryAppendPool::build_until` is a separate actual worker producer. It
+requires an explicit worker count and requested stack size, shares the caller's
+`TelemetryRecoveryBudget`, and registers every actual Rayon worker with a
+host-provided `TelemetryTaskRegistry` using the same saved expiry. Each worker
+keeps the complete engine handle until its physical loop exits. The host must
+retain entered thread handles and their actual outcomes even when registration
+returns a late error. Drop the pool before joining the registry; a cooperative
+stop flag alone cannot replace Rayon's termination/physical join sequence.
+Partial startup and late registration failures keep entered work in that
+registry. A successfully constructed pool refused at its final clock check is
+retained in the error until dropped. Worker count, requested stacks, names and
+known callback state are admitted; private Rayon scheduler allocations and OS
+stack rounding are not measured allocator/RSS bounds. This does not yet connect
+bounded journal/object recovery and catalogs into a complete owned attachment.
+
+The internal consuming [log-index publication producer](src/stripe/BOUNDED-PUBLICATION.md)
+installs normal compressed query frames and their watermark using the original
+native resume work and deadline. It retains real input, child results and
+partial query state on refusal. The separate internal
+[consuming log transaction](src/sink/BOUNDED-APPLY.md) joins genuine anchored
+journal commit, query-index commit and publication in the original shared
+application-checkpoint/cache owners. The actual
+[owned log factory](src/sink/BOUNDED-OWNED-LOG.md) connects that transaction to
+the strict sink trait and host-registered workers for recovered single-log
+commands. The opt-in `OwnedLogSinkFactory::new_with_replay_until` accepts an
+explicit complete configured log-partition scope and finite replay limits. Its
+first genuine native checkpoint callback validates the whole cross-shard journal
+chain and rebuilds the actual query/application state on the registered workers
+without rewriting journal bytes. Unsupported transaction shapes, conflicting
+edges, incomplete scope, expiry or partial failure keep the factory terminal;
+original rows and physical outcomes remain retained. The existing `new_until`
+continues to reject nonempty journals. Local replay grants no current control,
+HA query ownership or source-completeness proof. Ordinary live validation,
+serving, other signal/object modes, private product and host integration remain
+gates. Empty engine recovery does not invoke a checkpoint callback: an opt-in
+factory remains quarantined until a genuine configured-partition checkpoint
+turn completes its actual adoption. The explicit
+`AnchoredSinkJournal::open_application_until` producer creates `STELAPP2` files
+for actual global application edges distributed over physical shards. The
+writer borrows the held global application-checkpoint map and original native
+work, stores the unchanged native expected/next and shard coordinates, and
+allows only local sparse nonregression after the global edge matched. Reopen
+still checks the complete cross-anchor chain before any index mutation.
+`open_until` retains the `STELSNK1` domain and its original exact local placement
+comparison. Each opener rejects the other format; mixed-format sources are
+ineligible, and application-format factories require explicit replay opt-in.
+No existing journal is relabeled, rewritten or silently migrated.
+
 ## Related projects
 
 ShardTelemetry is standalone; it does not declare a runtime dependency on the

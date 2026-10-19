@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 
 use crate::LokiApiError;
+use crate::recovery::{TelemetryRecoveryBudget, TelemetryRecoveryError, TelemetryRecoveryUsage};
 
 const DATA_FORMAT_MARKER: &[u8] = b"shard-telemetry-data-format=1\n";
 
@@ -15,6 +16,41 @@ pub(crate) struct DataDirectoryLease {
 }
 
 impl DataDirectoryLease {
+    pub(crate) fn acquire_with_recovery_budget(
+        directory: &Path,
+        budget: &mut TelemetryRecoveryBudget,
+    ) -> Result<Self, TelemetryRecoveryError> {
+        if directory.as_os_str().len() > budget.path_limit() {
+            return budget.invalid();
+        }
+        let parent = budget.ensure_directory(directory)?;
+        let lock_path = budget.join_path(directory, std::ffi::OsStr::new("LOCK"))?;
+        budget.check()?;
+        let lock = budget.open_path(&lock_path, crate::recovery::RecoveryFileAccess::Lock)?;
+        budget.io(|| lock.try_lock_exclusive())?;
+        let marker_path = budget.join_path(directory, std::ffi::OsStr::new("FORMAT"))?;
+        budget.check()?;
+        if budget.io(|| marker_path.try_exists())? {
+            if budget.read_file(&marker_path)? != DATA_FORMAT_MARKER {
+                return budget.invalid();
+            }
+        } else {
+            budget.charge(TelemetryRecoveryUsage {
+                work_bytes: DATA_FORMAT_MARKER.len(),
+                ..Default::default()
+            })?;
+            let temporary = budget.suffixed_path(&marker_path, ".tmp")?;
+            let mut marker =
+                budget.open_path(&temporary, crate::recovery::RecoveryFileAccess::Temporary)?;
+            budget.write_file(&mut marker, DATA_FORMAT_MARKER)?;
+            budget.io(|| marker.sync_all())?;
+            budget.io(|| fs::rename(temporary, marker_path))?;
+            budget.io(|| parent.sync_all())?;
+        }
+        budget.check()?;
+        Ok(Self { _lock: lock })
+    }
+
     pub(crate) fn acquire(directory: &Path) -> Result<Self, LokiApiError> {
         fs::create_dir_all(directory).map_err(storage_io_error)?;
         let lock_path = directory.join("LOCK");
