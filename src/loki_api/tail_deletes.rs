@@ -1,10 +1,15 @@
 use super::*;
+use axum::extract::ws::Message;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use std::pin::Pin;
+use std::task::Poll;
 
 pub(super) async fn tail(
     websocket: WebSocketUpgrade,
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
+    query_gate: Option<axum::Extension<Arc<dyn crate::NativeRequestGate>>>,
 ) -> Result<Response, LokiApiError> {
     let tail_permit = state
         .production
@@ -22,104 +27,209 @@ pub(super) async fn tail(
             .as_deref()
             .ok_or_else(|| LokiApiError::bad_request("query parameter is required"))?,
     )?;
-    let mut live = state.live.subscribe();
+    let live = state.live.subscribe();
     let store = Arc::clone(&state.store);
-    let mut service_shutdown = state
+    let service_shutdown = state
         .production
         .as_ref()
         .map(|runtime| runtime.lifecycle().subscribe_shutdown());
     let result = execute_stream_query(state, headers, params).await?.0;
+    let query_gate = query_gate.map(|axum::Extension(gate)| gate);
+    if let Some(gate) = &query_gate {
+        gate.check_query()
+            .map_err(LokiApiError::backend_unavailable)?;
+    }
+    let session = TailSession {
+        initial: result,
+        tenant: tenant_name,
+        selector,
+        store,
+        live,
+        shutdown: service_shutdown,
+        _permit: tail_permit,
+        gate: query_gate,
+    };
     Ok(websocket
-        .on_upgrade(move |mut socket| async move {
-            let _tail_permit = tail_permit;
-            let payload = result
-                .get("data")
-                .and_then(|data| data.get("result"))
-                .cloned()
-                .unwrap_or_else(|| json!([]));
-            let _ = socket
-                .send(axum::extract::ws::Message::Text(
-                    json!({"streams": payload, "dropped_entries": []})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-            loop {
-                let shutdown = async {
-                    match service_shutdown.as_mut() {
-                        Some(shutdown) => {
-                            let _ = shutdown.changed().await;
-                        }
-                        None => std::future::pending::<()>().await,
-                    }
-                };
-                let received = tokio::select! {
-                    biased;
-                    () = shutdown => break,
-                    received = live.recv() => received,
-                };
-                match received {
-                    Ok(push) if push.tenant == tenant_name => {
-                        let Ok(delete_filter) = store
-                            .delete_requests(&tenant_name)
-                            .and_then(|requests| LogicalDeleteFilter::compile(&requests))
-                        else {
-                            break;
-                        };
-                        let entries = push
-                            .entries
-                            .into_iter()
-                            .filter_map(|entry| {
-                                if delete_filter.matches(&entry) {
-                                    None
-                                } else {
-                                    selector.process(entry)
-                                }
-                            })
-                            .collect::<Vec<_>>();
-                        if entries.is_empty() {
-                            continue;
-                        }
-                        let payload = tail_streams(entries);
-                        if socket
-                            .send(axum::extract::ws::Message::Text(
-                                json!({"streams": payload, "dropped_entries": []})
-                                    .to_string()
-                                    .into(),
-                            ))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                        if socket
-                            .send(axum::extract::ws::Message::Text(
-                                json!({
-                                    "streams": [],
-                                    "dropped_entries": [{
-                                        "labels": {},
-                                        "timestamp": now_nanos().to_string(),
-                                        "dropped": dropped
-                                    }]
-                                })
-                                .to_string()
-                                .into(),
-                            ))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        })
+        .on_upgrade(move |socket| session.run(socket))
         .into_response())
 }
+
+// The actual production websocket consumes this same session. No new queue,
+// policy, authority or provider is created; an optional existing gate stays
+// owned alongside the original subscription permit for the entire lifetime.
+struct TailSession {
+    initial: Value,
+    tenant: String,
+    selector: LogSelector,
+    store: Arc<dyn LokiStore>,
+    live: broadcast::Receiver<LivePush>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    gate: Option<Arc<dyn crate::NativeRequestGate>>,
+}
+impl TailSession {
+    async fn run<S, E>(mut self, mut socket: S)
+    where
+        S: Sink<Message> + Stream<Item = Result<Message, E>> + Unpin,
+    {
+        let gated = self.gate.is_some();
+        let payload = self
+            .initial
+            .get("data")
+            .and_then(|data| data.get("result"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let initial = Message::Text(
+            json!({"streams": payload, "dropped_entries": []})
+                .to_string()
+                .into(),
+        );
+        let sent =
+            send_tail_message(&mut socket, initial, self.gate.as_ref(), &mut self.shutdown).await;
+        // Preserve the original no-extension initial-send behavior.
+        if gated && !sent {
+            return;
+        }
+        loop {
+            let incoming = async {
+                if gated {
+                    socket.next().await
+                } else {
+                    std::future::pending().await
+                }
+            };
+            let received = tokio::select! {
+                biased;
+                () = tail_shutdown(&mut self.shutdown, gated) => break,
+                incoming = incoming => {
+                    match incoming {
+                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                        Some(Ok(_)) => continue,
+                    }
+                }
+                received = self.live.recv() => received,
+            };
+            let message = match received {
+                Ok(push) if push.tenant == self.tenant => {
+                    let Ok(delete_filter) = self
+                        .store
+                        .delete_requests(&self.tenant)
+                        .and_then(|requests| LogicalDeleteFilter::compile(&requests))
+                    else {
+                        break;
+                    };
+                    let entries = push
+                        .entries
+                        .into_iter()
+                        .filter_map(|entry| {
+                            if delete_filter.matches(&entry) {
+                                None
+                            } else {
+                                self.selector.process(entry)
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    Message::Text(
+                        json!({"streams": tail_streams(entries), "dropped_entries": []})
+                            .to_string()
+                            .into(),
+                    )
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(dropped)) => Message::Text(
+                    json!({
+                        "streams": [], "dropped_entries": [{"labels": {},
+                        "timestamp": now_nanos().to_string(), "dropped": dropped}]
+                    })
+                    .to_string()
+                    .into(),
+                ),
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            if !send_tail_message(&mut socket, message, self.gate.as_ref(), &mut self.shutdown)
+                .await
+            {
+                break;
+            }
+        }
+    }
+}
+
+async fn tail_shutdown(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>, gated: bool) {
+    match shutdown.as_mut() {
+        Some(shutdown) => {
+            if gated && *shutdown.borrow() {
+                return;
+            }
+            let _ = shutdown.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn send_tail_message<S, E>(
+    socket: &mut S,
+    message: Message,
+    gate: Option<&Arc<dyn crate::NativeRequestGate>>,
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> bool
+where
+    S: Sink<Message> + Stream<Item = Result<Message, E>> + Unpin,
+{
+    #[cfg(test)]
+    tests::encoded(&message);
+    let Some(gate) = gate else {
+        return socket.send(message).await.is_ok();
+    };
+    // Keep the real encoded message while readiness is pending. The SAME gate
+    // is checked after readiness, immediately before the actual start_send.
+    // That check can linearize before later transport writes; it is not a
+    // permission held atomically through network publication or flush.
+    let mut message = Some(message);
+    let send = futures_util::future::poll_fn(|cx| {
+        // One peer item per poll, including while readiness OR flush is pending.
+        // This socket has one poll owner; no split or concurrent read half is
+        // created. A buffered terminal event after a nonterminal item must not
+        // depend on a future sink wake, so explicitly schedule its next poll.
+        match Pin::new(&mut *socket).poll_next(cx) {
+            Poll::Ready(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => {
+                return Poll::Ready(Err(()));
+            }
+            Poll::Ready(Some(Ok(_))) => cx.waker().wake_by_ref(),
+            Poll::Pending => {}
+        }
+        if message.is_some() {
+            match Pin::new(&mut *socket).poll_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => return Poll::Ready(Err(())),
+                Poll::Ready(Ok(())) => {}
+            }
+            if gate.check_query().is_err() {
+                return Poll::Ready(Err(()));
+            }
+            let Some(message) = message.take() else {
+                return Poll::Ready(Err(()));
+            };
+            if Pin::new(&mut *socket).start_send(message).is_err() {
+                return Poll::Ready(Err(()));
+            }
+        }
+        Pin::new(&mut *socket)
+            .poll_flush(cx)
+            .map(|actual| actual.map_err(|_| ()))
+    });
+    tokio::select! {
+        biased;
+        () = tail_shutdown(shutdown, true) => false,
+        actual = send => actual.is_ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn tail_streams(entries: Vec<LokiEntry>) -> Vec<Value> {
     let mut streams = BTreeMap::<BTreeMap<String, String>, Vec<Value>>::new();

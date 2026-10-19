@@ -1,5 +1,12 @@
 //! Loki API ownership: stable store contract and models, routing, ingestion, LogQL, and handlers.
 //! `loki_api/` separates HTTP routes, parsing, evaluation, and operational endpoints.
+//!
+//! Hosts may attach `axum::Extension<Arc<dyn NativeRequestGate>>` to Loki tail
+//! requests. The actual session retains that same gate and checks each encoded
+//! initial/live/lag message after sink readiness, before enqueueing it. It does
+//! not recapture owners or confer authority, nor retain a permission atomically
+//! through later transport writes. With no extension, existing tail behavior
+//! remains. Optional analytical deferred bodies require their own integration.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
