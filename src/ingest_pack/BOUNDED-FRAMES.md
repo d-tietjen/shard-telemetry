@@ -123,3 +123,31 @@ construction, registered index-worker lifetime and original graph validation.
 The separate consuming log-index publisher can use this recovery policy, but
 a prepared group is neither `Applied` nor an
 indexed/application checkpoint, durable journal receipt or serving permission.
+
+
+## Index after the recovery timestamp parent
+
+`PreparedRecoveredStructuralTimestamps::prepare_index_until` consumes the actual
+successful outer-zstd/section/offset/Pco chain into bounded embedded-index
+preparation. It runs the existing two-pass parser against the original section
+view using the original non-clone recovery ledger and absolute expiry. All actual
+index state drops before the complete timestamp/native parent. The completed
+index is an immutable result; bodies, fields and typed metadata remain encoded.
+It is neither a fully reconstructed row nor query/serving permission.
+
+`RecoveredStructuralIndexLimits` bounds the same parser input/counts, output
+requests, allocation slots and explicit work as the existing native path. Fixed
+continuation/Bytes-sharing metadata and parser-state/input framing are separately
+charged to the original recovery ledger, outside local output counters. Unlike
+native work, recovery entries do not add an implicit work surcharge or become
+JSON values/records. Real reserve requests, old-vector copies and observed
+capacity excess retain their existing admission order. A refusal retains actual
+grown vectors, source, partial/completed index and original ledger error; no
+rollback, retry or refund is provided. Actual native-work framing still charges
+one complete native wrapper including its original work holder.
+
+Success can consume all completed children into `decompress_next_until` on the
+same already-spent ledger/E. Terminal error exposes only immutable observations,
+including an index completed before late expiry/unwind; its presence alone does
+not mean acceptance. Catching unwind does not make a process-abort build return
+from panic. These APIs do not establish whole replay/factory or host completion.

@@ -49,7 +49,7 @@ type Result<T, R = NativeResumeRefusal> = std::result::Result<T, Failure<R>>;
 /// Mandatory admission at the existing native codec boundaries. A concrete
 /// owner is monomorphized into the attempt; the native path gains no wrapper,
 /// trait object, storage field or alternative reservation policy.
-pub(super) trait FrameWork {
+pub(crate) trait FrameWork {
     type Refusal: Error + 'static;
     fn check(&mut self) -> std::result::Result<(), Self::Refusal>;
     fn pay(

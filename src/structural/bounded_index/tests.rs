@@ -673,3 +673,16 @@ fn actual_run_slot_and_cumulative_work_limits_precede_their_real_phase() {
         }
     });
 }
+
+// Reuse the existing actual phase observer for the new consuming recovery chain.
+pub(super) fn with_recovery_phase<T>(
+    phase: &'static str,
+    panic: bool,
+    operation: impl FnOnce() -> T,
+) -> T {
+    LATE.set(!panic);
+    PANIC.set(panic);
+    TARGET.set(Some(phase));
+    let _hooks = Hooks;
+    operation()
+}

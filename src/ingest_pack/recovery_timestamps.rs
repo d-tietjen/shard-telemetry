@@ -498,6 +498,37 @@ impl FrameParent<RecoveryFrameWork> for PreparedRecoveredStructuralTimestamps {
     }
 }
 impl PreparedRecoveredStructuralTimestamps {
+    // Observe actual completed parent custody in the recovery-index regressions.
+    #[cfg(test)]
+    pub(super) fn has_native_file(&self) -> bool {
+        self.held.child.file.is_some()
+            || self
+                .held
+                .child
+                .file_result
+                .as_ref()
+                .is_some_and(|result| result.is_ok())
+    }
+    // The real EndOfData Result has been consumed into its returned reader.
+    #[cfg(test)]
+    pub(super) fn has_end_source(&self) -> bool {
+        self.held.child.usage.reached_end && self.held.child.source.is_some()
+    }
+    /// Decode the actual embedded index on the same original work and expiry.
+    /// The complete Pco/offset/section/native parent remains retained on refusal.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain complete original parents and real partial index state inline"
+    )]
+    pub fn prepare_index_until(
+        self,
+        limits: super::recovery_index::RecoveredStructuralIndexLimits,
+    ) -> std::result::Result<
+        super::recovery_index::PreparedRecoveredStructuralIndex,
+        super::recovery_index::RetainedRecoveredStructuralIndexError,
+    > {
+        super::recovery_index::prepare_index_until(self, limits)
+    }
     /// Every actual decoded u64 timestamp in authoritative outer row order.
     pub fn timestamps(&self) -> &[u64] {
         &self.held.child.output

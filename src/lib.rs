@@ -87,14 +87,15 @@ pub use error::{TelemetryError, TelemetryResult};
 pub use fast_telemetry::{FastTelemetryConfig, FastTelemetryExportReport, FastTelemetryExporter};
 #[cfg(unix)]
 pub use ingest_pack::{
-    PreparedRecoveredLogFrame, PreparedRecoveredStructuralOffsets,
-    PreparedRecoveredStructuralSections, PreparedRecoveredStructuralTimestamps,
-    RecoveredStructuralOffsetLimits, RecoveredStructuralOffsetUsage, RecoveredStructuralSection,
-    RecoveredStructuralSectionLimits, RecoveredStructuralSectionUsage,
+    PreparedRecoveredLogFrame, PreparedRecoveredStructuralIndex,
+    PreparedRecoveredStructuralOffsets, PreparedRecoveredStructuralSections,
+    PreparedRecoveredStructuralTimestamps, RecoveredStructuralIndexLimits,
+    RecoveredStructuralIndexUsage, RecoveredStructuralOffsetLimits, RecoveredStructuralOffsetUsage,
+    RecoveredStructuralSection, RecoveredStructuralSectionLimits, RecoveredStructuralSectionUsage,
     RecoveredStructuralTimestampLimits, RecoveredStructuralTimestampUsage,
-    RetainedRecoveredLogFrameError, RetainedRecoveredStructuralOffsetError,
-    RetainedRecoveredStructuralSectionError, RetainedRecoveredStructuralTimestampError,
-    decompress_recovered_log_frame_until,
+    RetainedRecoveredLogFrameError, RetainedRecoveredStructuralIndexError,
+    RetainedRecoveredStructuralOffsetError, RetainedRecoveredStructuralSectionError,
+    RetainedRecoveredStructuralTimestampError, decompress_recovered_log_frame_until,
 };
 pub use locality::{
     CompressionBlockAssignment, CompressionBlockCollator, CompressionBlockScore,

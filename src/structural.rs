@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use shard_stream_core::LogicalOffset;
 
 mod bounded_index;
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use bounded_index::with_recovery_phase;
+#[cfg(unix)]
+pub(crate) use bounded_index::{EmbeddedIndexFailure, EmbeddedIndexState};
 mod decoder;
 pub(crate) use bounded_index::{
     EmbeddedIndexDecodeLimits, PreparedEmbeddedFrameIndex, RetainedEmbeddedIndexError,

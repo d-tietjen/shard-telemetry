@@ -3046,3 +3046,351 @@ fn recovered_timestamps_refused_capture_counts_no_unentered_native_read() {
     assert_eq!(complete.usage().native_calls, 5);
     assert!(complete.usage().reached_end);
 }
+
+fn structural_index_limits() -> crate::RecoveredStructuralIndexLimits {
+    crate::RecoveredStructuralIndexLimits {
+        max_input_bytes: 1 << 20,
+        max_records: 1 << 16,
+        max_dictionary_entries: 1 << 17,
+        max_terms: 1 << 16,
+        max_fields: 1 << 16,
+        max_locator_ids: 1 << 20,
+        max_runs: 1 << 18,
+        max_output_bytes: 1 << 24,
+        max_allocation_slots: 1 << 22,
+        max_work_bytes: 1 << 27,
+    }
+}
+fn actual_recovery_index_frame() -> crate::IndexedStructuralBlock {
+    let mut records = actual_timestamp_records(&(0..96).map(|i| 10_000 + i).collect::<Vec<_>>());
+    for (ordinal, record) in records.iter_mut().enumerate() {
+        record.message = Arc::from(if ordinal < 48 {
+            "ordinary alpha message"
+        } else {
+            "worker failed after retry count 42 from shard"
+        });
+        record.fields = Arc::new(vec![
+            crate::MetadataField::new("service", "billing"),
+            crate::MetadataField::new("severity", "INFO"),
+        ]);
+    }
+    crate::encode_indexed_structural_records(&records)
+        .expect("real complete structural producer including exact typed lane and index")
+}
+fn actual_recovery_index_parent(
+    raw: &[u8],
+    compressed: &[u8],
+    count: u32,
+    expiry: Instant,
+) -> crate::PreparedRecoveredStructuralTimestamps {
+    actual_timestamp_parent(raw, compressed, count, expiry)
+        .prepare_timestamps_until(structural_timestamp_limits())
+        .expect("actual native outer/sections/offsets/Pco parent before index")
+}
+#[test]
+fn recovered_index_matches_real_emitter_and_continues_same_original_ledger() {
+    let frame = actual_recovery_index_frame();
+    let compressed = zstd::bulk::compress(&frame.structural, 1).expect("actual outer codec");
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let parent = actual_recovery_index_parent(&frame.structural, &compressed, 96, expiry);
+    let prior = parent.recovery_usage();
+    let pointer = parent
+        .parent_offsets()
+        .parent_sections()
+        .structural_bytes()
+        .expect("actual retained complete source")
+        .as_ptr();
+    assert!(parent.has_native_file() && parent.has_end_source());
+    let index = parent
+        .prepare_index_until(structural_index_limits())
+        .expect("actual same-parser recovery child");
+    let ordinary = crate::decode_embedded_frame_index(&frame.structural)
+        .expect("actual ordinary index oracle");
+    assert_eq!(index.index(), Some(&ordinary));
+    assert_eq!(index.index(), Some(&frame.index));
+    assert_eq!(
+        index.retained_input(),
+        Some(frame.embedded_index.as_slice())
+    );
+    let range = index.input_range().expect("original actual section range");
+    assert_eq!(
+        index.retained_input().expect("exact shared input").as_ptr(),
+        pointer.wrapping_add(range.start)
+    );
+    assert!(index.child_succeeded() && !index.has_panic());
+    assert_eq!(index.original_expiry(), expiry);
+    let usage = index.usage();
+    assert_eq!(
+        usage.output_bytes,
+        ordinary.cache_bytes() - size_of::<crate::EmbeddedFrameIndex>()
+    );
+    let spent = index.recovery_usage();
+    assert_eq!(spent.read_bytes, prior.read_bytes);
+    assert_eq!(spent.records, prior.records);
+    assert_eq!(spent.json_values, prior.json_values);
+    // Fixed state+input admission is outside local output requests; local slots
+    // do not become an extra work surcharge on the recovery ledger.
+    assert_eq!(
+        spent.work_bytes - prior.work_bytes,
+        usage.continuation_bytes + usage.work_bytes
+    );
+    assert!(
+        spent.retained_bytes - prior.retained_bytes > usage.continuation_bytes + usage.output_bytes
+    );
+    let second = index
+        .decompress_next_until(
+            Bytes::from(compressed),
+            frame.structural.len(),
+            96,
+            recovery_decompression_policy(),
+        )
+        .expect("same spent original ledger after all completed children")
+        .prepare_sections_until(structural_section_limits())
+        .expect("second actual sections")
+        .prepare_offsets_until(structural_offset_limits())
+        .expect("second actual offsets")
+        .prepare_timestamps_until(structural_timestamp_limits())
+        .expect("second actual native Pco")
+        .prepare_index_until(structural_index_limits())
+        .expect("second actual same-parser index");
+    assert_eq!(second.index(), Some(&ordinary));
+    assert_eq!(second.original_expiry(), expiry);
+    assert!(second.recovery_usage().work_bytes > spent.work_bytes);
+    assert!(second.recovery_usage().retained_bytes > spent.retained_bytes);
+    assert_eq!(second.recovery_usage().read_bytes, prior.read_bytes);
+}
+#[test]
+fn recovered_index_exact_and_one_less_original_caps_retain_partial_output() {
+    let frame = actual_recovery_index_frame();
+    let compressed = zstd::bulk::compress(&frame.structural, 1).expect("actual finite frame");
+    let directory = Directory::new();
+    let path = directory.0.join("same-index-original-source.zst");
+    fs::write(&path, &compressed).expect("one real source before independent original ledgers");
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let run = |bytes, work, child| {
+        let mut limits = recovery_decompression_budget_limits();
+        limits.max_retained_bytes = bytes;
+        limits.max_work_bytes = work;
+        let mut original = crate::TelemetryRecoveryBudget::new(limits, expiry)
+            .expect("independent original budget before identical setup");
+        let input = Bytes::from(
+            original
+                .read_file(&path)
+                .expect("same actual physical read"),
+        );
+        let parent = crate::decompress_recovered_log_frame_until(
+            input,
+            frame.structural.len(),
+            96,
+            recovery_decompression_policy(),
+            original,
+        )
+        .expect("actual entered outer stream")
+        .prepare_sections_until(structural_section_limits())
+        .expect("actual section parent")
+        .prepare_offsets_until(structural_offset_limits())
+        .expect("actual offsets")
+        .prepare_timestamps_until(structural_timestamp_limits())
+        .expect("actual native Pco before index boundary");
+        let prior = parent.recovery_usage();
+        (prior, parent.prepare_index_until(child))
+    };
+    let ample = recovery_decompression_budget_limits();
+    let (_, observed) = run(
+        ample.max_retained_bytes,
+        ample.max_work_bytes,
+        structural_index_limits(),
+    );
+    let observed = observed
+        .expect("real complete observation before constructing independent original exact ledgers");
+    let cumulative = observed.recovery_usage();
+    let local = observed.usage();
+    drop(observed);
+    let (_, exact) = run(
+        cumulative.retained_bytes,
+        cumulative.work_bytes,
+        structural_index_limits(),
+    );
+    let exact = exact.expect("exact original caps fit actual complete chain");
+    assert_eq!(exact.recovery_usage(), cumulative);
+    assert_eq!(exact.index(), Some(&frame.index));
+    drop(exact);
+    for (bytes, work) in [
+        (cumulative.retained_bytes - 1, cumulative.work_bytes),
+        (cumulative.retained_bytes, cumulative.work_bytes - 1),
+    ] {
+        let (prior, refused) = run(bytes, work, structural_index_limits());
+        let refused =
+            refused.expect_err("actual original ledger refuses before complete index acceptance");
+        assert!(refused.usage().output_bytes > 0);
+        assert_eq!(
+            refused.retained_input(),
+            Some(frame.embedded_index.as_slice())
+        );
+        assert!(refused.parent_timestamps().has_native_file());
+        assert_eq!(refused.original_expiry(), expiry);
+        assert!(refused.recovery_usage().work_bytes > prior.work_bytes);
+        assert_eq!(refused.recovery_usage().records, prior.records);
+        assert_eq!(refused.recovery_usage().json_values, prior.json_values);
+        let mut cause = std::error::Error::source(&refused);
+        let mut original_refusal = false;
+        while let Some(error) = cause {
+            original_refusal |= matches!(
+                error.downcast_ref::<crate::TelemetryRecoveryError>(),
+                Some(crate::TelemetryRecoveryError::Limits)
+            );
+            cause = error.source();
+        }
+        assert!(
+            original_refusal,
+            "retain the actual original ledger refusal in source chain"
+        );
+    }
+    let mut smaller = structural_index_limits();
+    smaller.max_output_bytes = local.output_bytes - 1;
+    let (_, refused) = run(ample.max_retained_bytes, ample.max_work_bytes, smaller);
+    let refused =
+        refused.expect_err("actual local allocation admission preserves existing partial vectors");
+    assert!(refused.usage().output_bytes > 0);
+    assert!(refused.usage().partial_column_bytes > 0);
+    assert_eq!(
+        refused.retained_input(),
+        Some(frame.embedded_index.as_slice())
+    );
+}
+#[test]
+fn recovered_index_late_and_unwind_keep_real_partial_and_completed_state() {
+    let frame = actual_recovery_index_frame();
+    let compressed = zstd::bulk::compress(&frame.structural, 1).expect("actual outer frame");
+    for phase in [
+        "column",
+        "run",
+        "id",
+        "membership",
+        "term",
+        "field",
+        "completed",
+    ] {
+        for panic in [false, true] {
+            let expiry = Instant::now() + Duration::from_millis(200);
+            let parent = actual_recovery_index_parent(&frame.structural, &compressed, 96, expiry);
+            let before = parent.recovery_usage();
+            let pointer = parent
+                .parent_offsets()
+                .parent_sections()
+                .structural_bytes()
+                .expect("real complete source")
+                .as_ptr();
+            let refused = crate::structural::with_recovery_phase(phase, panic, || {
+                parent.prepare_index_until(structural_index_limits())
+            })
+            .expect_err("actual parser mutation precedes original expiry or unwind");
+            assert_eq!(refused.has_panic(), panic);
+            assert_eq!(refused.original_expiry(), expiry);
+            assert_eq!(
+                refused
+                    .parent_timestamps()
+                    .parent_offsets()
+                    .parent_sections()
+                    .structural_bytes()
+                    .expect("original parent allocation")
+                    .as_ptr(),
+                pointer
+            );
+            assert!(
+                refused.parent_timestamps().has_native_file()
+                    && refused.parent_timestamps().has_end_source()
+            );
+            assert_eq!(
+                refused.retained_input(),
+                Some(frame.embedded_index.as_slice())
+            );
+            let actual = refused.usage();
+            match phase {
+                "column" | "run" => assert!(actual.partial_column_bytes > 0),
+                "id" => assert!(actual.partial_locator_ids > 0),
+                "membership" => assert!(actual.partial_memberships > 0),
+                "term" => assert!(actual.partial_terms > 0),
+                "field" => assert!(actual.partial_fields > 0),
+                _ => assert_eq!(refused.index(), Some(&frame.index)),
+            }
+            assert_eq!(refused.index().is_some(), phase == "completed");
+            assert!(!refused.child_succeeded());
+            assert!(refused.recovery_usage().work_bytes > before.work_bytes);
+        }
+    }
+    for panic in [false, true] {
+        let expiry = Instant::now() + Duration::from_millis(200);
+        let parent = actual_recovery_index_parent(&frame.structural, &compressed, 96, expiry);
+        let _hook = Hook;
+        TARGET.set(Some(("structural-child-result", 0, panic)));
+        let refused = parent
+            .prepare_index_until(structural_index_limits())
+            .expect_err(
+                "actual complete child Result is captured before generic continuation postcheck",
+            );
+        assert!(OBSERVED.get());
+        assert_eq!(refused.has_panic(), panic);
+        assert!(refused.child_succeeded());
+        assert_eq!(refused.index(), Some(&frame.index));
+        assert_eq!(refused.original_expiry(), expiry);
+        assert!(refused.parent_timestamps().has_end_source());
+    }
+}
+#[test]
+fn recovered_index_malformed_wire_retains_genuine_complete_parent_and_codec_error() {
+    let frame = actual_recovery_index_frame();
+    let compressed = zstd::bulk::compress(&frame.structural, 1).expect("ordinary original frame");
+    let sections = actual_offset_sections(
+        &compressed,
+        frame.structural.len(),
+        96,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let mut wire = crate::structural::STRUCTURAL_BLOCK_MAGIC.to_vec();
+    append_section_extent(&mut wire, 96);
+    let malformed = &frame.embedded_index[..frame.embedded_index.len() - 1];
+    for kind in STRUCTURAL_SECTION_KINDS {
+        let lane = if kind == crate::RecoveredStructuralSection::EmbeddedIndex {
+            malformed
+        } else {
+            sections
+                .section_bytes(kind)
+                .expect("all original other lanes")
+        };
+        append_section_extent(&mut wire, lane.len());
+        wire.extend_from_slice(lane);
+    }
+    drop(sections);
+    let ordinary =
+        crate::decode_embedded_frame_index(&wire).expect_err("actual legacy codec failure oracle");
+    let compressed =
+        zstd::bulk::compress(&wire, 1).expect("actual outer compression of malformed child only");
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let parent = actual_recovery_index_parent(&wire, &compressed, 96, expiry);
+    let before = parent.recovery_usage();
+    assert!(parent.has_native_file() && parent.has_end_source());
+    let refused = parent
+        .prepare_index_until(structural_index_limits())
+        .expect_err("real same parser preserves codec refusal");
+    assert_eq!(refused.retained_input(), Some(malformed));
+    assert_eq!(refused.original_expiry(), expiry);
+    assert!(refused.parent_timestamps().has_native_file());
+    let mut source = std::error::Error::source(&refused);
+    let mut actual = None;
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<crate::TelemetryError>() {
+            actual = Some(error);
+            break;
+        }
+        source = error.source();
+    }
+    assert_eq!(
+        actual
+            .expect("actual original codec error preserved")
+            .to_string(),
+        ordinary.to_string()
+    );
+    assert!(refused.recovery_usage().work_bytes > before.work_bytes);
+    assert!(refused.index().is_none() && !refused.child_succeeded());
+}
