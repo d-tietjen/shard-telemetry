@@ -37,75 +37,20 @@ pub(super) fn decode_seekable_record_lane(
     encoded: &[u8],
     record_count: usize,
 ) -> TelemetryResult<SeekableRecordLane<'_>> {
-    let footer_start =
-        encoded
-            .len()
-            .checked_sub(size_of::<u32>())
-            .ok_or(TelemetryError::InvalidBlockEncoding(
-                "record lane footer is truncated",
-            ))?;
-    let directory_start = usize::try_from(u32::from_le_bytes(
-        encoded[footer_start..]
-            .try_into()
-            .map_err(|_| TelemetryError::InvalidBlockEncoding("record lane footer is invalid"))?,
-    ))
-    .map_err(|_| TelemetryError::InvalidBlockEncoding("record lane footer does not fit usize"))?;
-    let directory =
-        encoded
-            .get(directory_start..footer_start)
-            .ok_or(TelemetryError::InvalidBlockEncoding(
-                "record lane directory is invalid",
-            ))?;
-    let payload = encoded
-        .get(..directory_start)
-        .ok_or(TelemetryError::InvalidBlockEncoding(
-            "record lane payload is truncated",
-        ))?;
-    let mut cursor = 0usize;
-    let interval = read_usize(directory, &mut cursor)?;
-    if interval == 0 {
-        return Err(TelemetryError::InvalidBlockEncoding(
-            "record lane checkpoint interval is zero",
-        ));
-    }
-    let checkpoint_count = read_usize(directory, &mut cursor)?;
-    if checkpoint_count != record_count.div_ceil(interval) {
-        return Err(TelemetryError::InvalidBlockEncoding(
-            "record lane checkpoint count mismatch",
-        ));
-    }
-    let mut checkpoints = Vec::with_capacity(checkpoint_count);
-    let mut previous = 0usize;
-    for index in 0..checkpoint_count {
-        let delta = read_usize(directory, &mut cursor)?;
-        let checkpoint =
-            previous
-                .checked_add(delta)
-                .ok_or(TelemetryError::InvalidBlockEncoding(
-                    "record lane checkpoint overflow",
-                ))?;
-        if (index == 0 && checkpoint != 0) || (index > 0 && checkpoint < previous) {
-            return Err(TelemetryError::InvalidBlockEncoding(
-                "record lane checkpoints are not ordered",
-            ));
-        }
-        checkpoints.push(checkpoint);
-        previous = checkpoint;
-    }
-    require_consumed(directory, cursor)?;
-    if checkpoints
-        .last()
-        .is_some_and(|checkpoint| *checkpoint > payload.len())
-        || (record_count == 0 && !payload.is_empty())
-    {
-        return Err(TelemetryError::InvalidBlockEncoding(
-            "record lane checkpoint exceeds payload",
-        ));
-    }
+    let mut state = message_core::LaneState::default();
+    let mut wire = message_core::WireState::default();
+    message_core::visit_lane(
+        encoded,
+        record_count,
+        &mut state,
+        &mut wire,
+        &mut message_core::Ordinary,
+    )
+    .map_err(|_| wire.take_error())?;
     Ok(SeekableRecordLane {
-        interval,
-        checkpoints,
-        payload,
+        interval: state.interval,
+        checkpoints: state.checkpoints,
+        payload: &encoded[..state.directory_start],
     })
 }
 
@@ -114,12 +59,17 @@ pub(super) fn validate_checkpoint_cursor(
     record_ordinal: usize,
     cursor: usize,
 ) -> TelemetryResult<()> {
-    if record_ordinal.is_multiple_of(lane.interval)
-        && lane
-            .checkpoints
-            .get(record_ordinal / lane.interval)
-            .copied()
-            != Some(cursor)
+    validate_checkpoint_parts(lane.interval, &lane.checkpoints, record_ordinal, cursor)
+}
+
+pub(super) fn validate_checkpoint_parts(
+    interval: usize,
+    checkpoints: &[usize],
+    record_ordinal: usize,
+    cursor: usize,
+) -> TelemetryResult<()> {
+    if record_ordinal.is_multiple_of(interval)
+        && checkpoints.get(record_ordinal / interval).copied() != Some(cursor)
     {
         return Err(TelemetryError::InvalidBlockEncoding(
             "record lane checkpoint does not point to a record",

@@ -1133,34 +1133,16 @@ pub(super) fn decode_timestamps(encoded: &[u8], record_count: usize) -> Telemetr
 }
 
 pub(super) fn decode_templates(encoded: &[u8]) -> TelemetryResult<Vec<Vec<Vec<u8>>>> {
-    let mut cursor = 0usize;
-    let count = read_usize(encoded, &mut cursor)?;
-    ensure_count_within(
-        count,
-        encoded.len().saturating_sub(cursor),
-        "template count",
-    )?;
-    let mut templates = Vec::with_capacity(count);
-    for _ in 0..count {
-        let literal_count = read_usize(encoded, &mut cursor)?;
-        if literal_count == 0 {
-            return Err(TelemetryError::InvalidBlockEncoding(
-                "template has no literals",
-            ));
-        }
-        ensure_count_within(
-            literal_count,
-            encoded.len().saturating_sub(cursor),
-            "template literal count",
-        )?;
-        let mut literals = Vec::with_capacity(literal_count);
-        for _ in 0..literal_count {
-            literals.push(read_bytes(encoded, &mut cursor)?.to_vec());
-        }
-        templates.push(literals);
-    }
-    require_consumed(encoded, cursor)?;
-    Ok(templates)
+    let mut state = message_core::TemplateState::default();
+    let mut wire = message_core::WireState::default();
+    let mut target = message_core::OrdinaryTemplates {
+        input: encoded,
+        templates: Vec::new(),
+        current: Vec::new(),
+    };
+    message_core::visit_templates(encoded, &mut state, &mut wire, &mut target)
+        .map_err(|_| wire.take_error())?;
+    Ok(target.templates)
 }
 
 pub(super) fn decode_bodies(
@@ -1171,19 +1153,34 @@ pub(super) fn decode_bodies(
 ) -> TelemetryResult<Vec<Arc<str>>> {
     validate_body_layout(index, templates.len(), record_count)?;
     let lane = decode_seekable_record_lane(encoded, record_count)?;
-    let mut cursor = 0usize;
+    let mut state = message_core::BodyState::default();
+    let mut wire = message_core::WireState::default();
     let mut messages = Vec::with_capacity(record_count);
     let mut exact_templates = vec![None::<Arc<str>>; templates.len()];
     let mut previous = None::<Arc<str>>;
     let mut previous_encoded = None::<Range<usize>>;
     let mut previous_template_id = None::<usize>;
     for record_ordinal in 0..record_count {
-        validate_checkpoint_cursor(&lane, record_ordinal, cursor)?;
-        let record_start = cursor;
-        let template_id = body_template_id(index, record_ordinal, templates.len())?;
-        let message = match template_id {
-            None => {
-                let bytes = read_bytes(lane.payload, &mut cursor)?;
+        state.ordinal = record_ordinal;
+        message_core::scan_body_record(
+            message_core::BodyInput {
+                payload: lane.payload,
+                index,
+                templates: templates.len(),
+                interval: lane.interval,
+                checkpoints: &lane.checkpoints,
+            },
+            |id| templates[id][1..].len() + 1,
+            &mut state,
+            &mut wire,
+            &mut message_core::Ordinary,
+        )
+        .map_err(|_| wire.take_error())?;
+        let record_start = state.record_start;
+        let template_id = state.template;
+        let message = match state.actual.clone() {
+            Some(message_core::BodyRecord::Raw(range)) => {
+                let bytes = &lane.payload[range];
                 if let Some(previous) = &previous
                     && previous.as_bytes() == bytes
                 {
@@ -1192,7 +1189,13 @@ pub(super) fn decode_bodies(
                     decode_text(bytes.to_vec())?
                 }
             }
-            Some(template_id) => {
+            Some(
+                message_core::BodyRecord::Exact(template_id)
+                | message_core::BodyRecord::Dynamic {
+                    template: template_id,
+                    ..
+                },
+            ) => {
                 let literals = templates
                     .get(template_id)
                     .ok_or(TelemetryError::InvalidBlockEncoding("unknown template ID"))?;
@@ -1207,10 +1210,7 @@ pub(super) fn decode_bodies(
                         message
                     }
                 } else {
-                    for _ in &literals[1..] {
-                        let _ = read_bytes(lane.payload, &mut cursor)?;
-                    }
-                    let record_end = cursor;
+                    let record_end = state.cursor;
                     if let (Some(previous), Some(previous_encoded)) = (&previous, &previous_encoded)
                         && previous_template_id == Some(template_id)
                         && lane.payload[previous_encoded.clone()]
@@ -1218,26 +1218,40 @@ pub(super) fn decode_bodies(
                     {
                         Arc::clone(previous)
                     } else {
-                        let mut replay = record_start;
                         let mut reconstructed = literals.first().cloned().ok_or(
                             TelemetryError::InvalidBlockEncoding("template has no first literal"),
                         )?;
-                        for literal in &literals[1..] {
-                            reconstructed.extend_from_slice(read_bytes(lane.payload, &mut replay)?);
-                            reconstructed.extend_from_slice(literal);
-                        }
-                        debug_assert_eq!(replay, record_end);
+                        let mut target = message_core::OrdinaryFragments {
+                            payload: lane.payload,
+                            literals,
+                            output: &mut reconstructed,
+                        };
+                        message_core::replay_body(
+                            lane.payload,
+                            literals.len(),
+                            record_start,
+                            &mut state,
+                            &mut wire,
+                            &mut target,
+                        )
+                        .map_err(|_| wire.take_error())?;
+                        debug_assert_eq!(state.replay, record_end);
                         decode_text(reconstructed)?
                     }
                 }
             }
+            None => {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "missing message body record",
+                ));
+            }
         };
         previous = Some(Arc::clone(&message));
-        previous_encoded = Some(record_start..cursor);
+        previous_encoded = Some(record_start..state.cursor);
         previous_template_id = template_id;
         messages.push(message);
     }
-    require_consumed(lane.payload, cursor)?;
+    require_consumed(lane.payload, state.cursor)?;
     Ok(messages)
 }
 

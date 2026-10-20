@@ -27,6 +27,7 @@ mod index;
 use index::*;
 mod lanes;
 use lanes::*;
+mod message_core;
 mod wire;
 use wire::*;
 
