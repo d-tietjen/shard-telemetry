@@ -10,6 +10,8 @@ mod recovery_decompression;
 #[cfg(unix)]
 mod recovery_index;
 #[cfg(unix)]
+mod recovery_messages;
+#[cfg(unix)]
 mod recovery_metadata;
 #[cfg(unix)]
 mod recovery_offsets;
@@ -32,6 +34,11 @@ pub use recovery_decompression::{
 pub use recovery_index::{
     PreparedRecoveredStructuralIndex, RecoveredStructuralIndexLimits,
     RecoveredStructuralIndexUsage, RetainedRecoveredStructuralIndexError,
+};
+#[cfg(unix)]
+pub use recovery_messages::{
+    PreparedRecoveredMessages, RecoveredMessageBytes, RecoveredMessageLimits,
+    RecoveredMessageUsage, RetainedRecoveredMessageError,
 };
 #[cfg(unix)]
 pub use recovery_metadata::{

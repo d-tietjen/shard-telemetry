@@ -87,20 +87,22 @@ pub use error::{TelemetryError, TelemetryResult};
 pub use fast_telemetry::{FastTelemetryConfig, FastTelemetryExportReport, FastTelemetryExporter};
 #[cfg(unix)]
 pub use ingest_pack::{
-    PreparedRecoveredLogFrame, PreparedRecoveredPackedMetadata, PreparedRecoveredStructuralIndex,
-    PreparedRecoveredStructuralMetadataBytes, PreparedRecoveredStructuralOffsets,
-    PreparedRecoveredStructuralSections, PreparedRecoveredStructuralTimestamps,
-    RecoveredPackedInput, RecoveredPackedMetadataLimits, RecoveredPackedMetadataUsage,
-    RecoveredPackedNode, RecoveredPackedNodeKind, RecoveredPackedRecord, RecoveredPackedRejection,
-    RecoveredPackedValue, RecoveredStructuralIndexLimits, RecoveredStructuralIndexUsage,
+    PreparedRecoveredLogFrame, PreparedRecoveredMessages, PreparedRecoveredPackedMetadata,
+    PreparedRecoveredStructuralIndex, PreparedRecoveredStructuralMetadataBytes,
+    PreparedRecoveredStructuralOffsets, PreparedRecoveredStructuralSections,
+    PreparedRecoveredStructuralTimestamps, RecoveredMessageBytes, RecoveredMessageLimits,
+    RecoveredMessageUsage, RecoveredPackedInput, RecoveredPackedMetadataLimits,
+    RecoveredPackedMetadataUsage, RecoveredPackedNode, RecoveredPackedNodeKind,
+    RecoveredPackedRecord, RecoveredPackedRejection, RecoveredPackedValue,
+    RecoveredStructuralIndexLimits, RecoveredStructuralIndexUsage,
     RecoveredStructuralMetadataByteUsage, RecoveredStructuralOffsetLimits,
     RecoveredStructuralOffsetUsage, RecoveredStructuralSection, RecoveredStructuralSectionLimits,
     RecoveredStructuralSectionUsage, RecoveredStructuralTimestampLimits,
     RecoveredStructuralTimestampUsage, RetainedRecoveredLogFrameError,
-    RetainedRecoveredPackedMetadataError, RetainedRecoveredStructuralIndexError,
-    RetainedRecoveredStructuralMetadataByteError, RetainedRecoveredStructuralOffsetError,
-    RetainedRecoveredStructuralSectionError, RetainedRecoveredStructuralTimestampError,
-    decompress_recovered_log_frame_until,
+    RetainedRecoveredMessageError, RetainedRecoveredPackedMetadataError,
+    RetainedRecoveredStructuralIndexError, RetainedRecoveredStructuralMetadataByteError,
+    RetainedRecoveredStructuralOffsetError, RetainedRecoveredStructuralSectionError,
+    RetainedRecoveredStructuralTimestampError, decompress_recovered_log_frame_until,
 };
 pub use locality::{
     CompressionBlockAssignment, CompressionBlockCollator, CompressionBlockScore,

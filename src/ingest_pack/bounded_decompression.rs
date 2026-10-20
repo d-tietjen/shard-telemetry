@@ -261,6 +261,28 @@ impl<W: FrameWork> PreparedDecompressedFrame<W> {
     pub(super) fn with_scoped_work<T>(&mut self, operation: impl FnOnce(&mut W) -> T) -> T {
         operation(&mut self.retained.work)
     }
+    /// Scoped disjoint structural/work input for one consuming message child.
+    #[cfg(unix)]
+    pub(super) fn with_structural_work<T>(
+        &mut self,
+        framing: &std::cell::Cell<Option<usize>>,
+        operation: impl FnOnce(Option<&Bytes>, &mut W) -> T,
+    ) -> T {
+        let parts = [
+            size_of_val(&operation),
+            size_of::<&mut Self>(),
+            size_of::<&std::cell::Cell<Option<usize>>>(),
+            size_of::<[usize; 4]>(),
+        ];
+        framing.set(parts.into_iter().fold(framing.get(), |sum, n| {
+            sum.and_then(|sum| sum.checked_add(n))
+                .filter(|value| *value <= isize::MAX as usize)
+        }));
+        operation(
+            self.retained.state.structural.as_ref(),
+            &mut self.retained.work,
+        )
+    }
     #[cfg(unix)]
     pub(super) fn work(&self) -> &W {
         &self.retained.work

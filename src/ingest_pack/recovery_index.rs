@@ -231,6 +231,39 @@ macro_rules! views {
 }
 impl PreparedRecoveredStructuralIndex {
     views!();
+    /// Borrow only this actual child index and the disjoint original frame.
+    pub(super) fn with_index_frame<T>(
+        &mut self,
+        framing: &std::cell::Cell<Option<usize>>,
+        operation: impl FnOnce(
+            Option<&EmbeddedFrameIndex>,
+            &mut PreparedDecompressedFrame<RecoveryFrameWork>,
+        ) -> T,
+    ) -> T {
+        let operation_bytes = std::mem::size_of_val(&operation);
+        let index = self
+            .held
+            .child
+            .state
+            .as_ref()
+            .and_then(EmbeddedIndexState::index);
+        let scoped =
+            |frame: &mut PreparedDecompressedFrame<RecoveryFrameWork>| operation(index, frame);
+        let parts = [
+            operation_bytes,
+            size_of::<usize>(), // actual operation_bytes control
+            std::mem::size_of_val(&scoped),
+            size_of::<Option<&EmbeddedFrameIndex>>(),
+            size_of::<&mut Self>(),
+            size_of::<&std::cell::Cell<Option<usize>>>(),
+            size_of::<[usize; 7]>(),
+        ];
+        framing.set(parts.into_iter().fold(framing.get(), |sum, n| {
+            sum.and_then(|sum| sum.checked_add(n))
+                .filter(|value| *value <= isize::MAX as usize)
+        }));
+        self.held.parent.with_frame(scoped)
+    }
     /// Consume this accepted index into absent metadata or exact native bytes.
     /// The same original work/E and complete parent remain retained; MessagePack
     /// and typed rows are not decoded or accepted by this byte producer.

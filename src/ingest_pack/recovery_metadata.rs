@@ -315,6 +315,27 @@ macro_rules! views {
     };
 }
 impl PreparedRecoveredStructuralMetadataBytes {
+    /// Forward one scoped borrow to the actual retained index/frame pair.
+    pub(super) fn with_index_frame<T>(
+        &mut self,
+        framing: &std::cell::Cell<Option<usize>>,
+        operation: impl FnOnce(
+            Option<&crate::EmbeddedFrameIndex>,
+            &mut PreparedDecompressedFrame<RecoveryFrameWork>,
+        ) -> T,
+    ) -> T {
+        let parts = [
+            std::mem::size_of_val(&operation),
+            size_of::<&mut Self>(),
+            size_of::<&std::cell::Cell<Option<usize>>>(),
+            size_of::<[usize; 4]>(),
+        ];
+        framing.set(parts.into_iter().fold(framing.get(), |sum, n| {
+            sum.and_then(|sum| sum.checked_add(n))
+                .filter(|value| *value <= isize::MAX as usize)
+        }));
+        self.held.parent.with_index_frame(framing, operation)
+    }
     /// Scoped raw bytes and original work for the consuming packed-metadata child.
     pub(super) fn continue_raw_until<C, E>(
         self,

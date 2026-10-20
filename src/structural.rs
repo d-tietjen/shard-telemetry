@@ -28,6 +28,26 @@ use index::*;
 mod lanes;
 use lanes::*;
 mod message_core;
+#[cfg(all(test, unix))]
+pub(crate) use message_core::message_test_wire_fixture;
+#[cfg(unix)]
+pub(crate) fn validate_message_body_layout(
+    index: &EmbeddedFrameIndex,
+    templates: usize,
+    records: usize,
+) -> TelemetryResult<()> {
+    decoder::validate_body_layout(index, templates, records)
+}
+#[cfg(unix)]
+pub(crate) use message_core::{
+    BodyInput, BodyRecord, BodyState, CoreFailure, FragmentHooks, HelperResult, LaneHooks,
+    LaneState, TemplateHooks, TemplateState, WireHooks, WireSource, WireState, replay_body,
+    scan_body_record, visit_lane, visit_templates,
+};
+#[cfg(unix)]
+pub(crate) fn require_message_payload_consumed(input: &[u8], cursor: usize) -> TelemetryResult<()> {
+    wire::require_consumed(input, cursor)
+}
 mod wire;
 use wire::*;
 

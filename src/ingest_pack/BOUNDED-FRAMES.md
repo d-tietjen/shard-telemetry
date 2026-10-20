@@ -267,3 +267,45 @@ apply to process abort. Canonical CONTRIBUTING gates and actual normal profile
 qualification remain required for source changes. This arena grants no query,
 HA, serving, atomic-append or release authority, and does not complete the owned
 service/product attachment or a whole configured partition traversal.
+
+PreparedRecoveredPackedMetadata::prepare_messages_until consumes that arena
+and the complete native lineage into full-scope validated message bytes.
+Template and body traversal shares the ordinary wire core. Its ordinary
+wrappers retain their existing allocation order, raw/exact/dynamic Arc caches,
+nonminimal-varint acceptance and malformed-input precedence. Any positive
+checkpoint interval, including an interval larger than the row count, and equal
+checkpoints retain their existing reader meaning; the producer's interval is
+not an additional admission rule. Unused template literals remain byte strings,
+so invalid UTF8 in an unused literal is not rejected. A reconstructed row is
+validated after all its fragments have been scanned and copied; UTF8 can span
+fragment boundaries.
+
+The bounded owner retains template literal ranges, actual directory checkpoints,
+actual helper Results and consumed cursors, completed ordered row ranges,
+initialized reconstruction bytes and actual UTF8/reservation outcomes. Helpers
+store their actual Result before the observation hook. Allocation attempts
+record requested capacity, actual old capacity, actual Result and actual
+returned capacity before the hook or excess-capacity admission. Growth charges
+the old allocation capacity as well as the new request, including growth while
+initialized length is below capacity. Observed excess remains owned on refusal.
+The attempted row ordinal is distinct from the ordinal associated with the last
+delivered source and UTF8 result; a later failed scan does not relabel an earlier
+result as the current row.
+
+Every helper/carrier/control table includes its actual storage; native borrowed
+UTF8 results, mapped results and actual bridge/operation closures are included.
+The scoped internal bridge borrows disjoint accepted index/structural input and
+the same nonClone recovery work without returning an owner or work reference.
+All original setup and previous frame usage remain spent, the same absolute
+expiry applies, actual child results precede post-checks and the complete
+packed/index/Pco/native parent is destroyed last. Errors are terminal and keep
+the real partial child, first original-work refusal, helper error, UTF8 error or
+unwind. The bounded path retains std::str::Utf8Error; the ordinary decoder
+continues to report its existing static codec category for invalid text.
+
+These ranges are message-byte results, not final log models. Field/attribute
+dictionary references, typed-row cross-table validation, index publication,
+query ownership, full configured traversal, serving/HA/product attachment and
+release gates remain separate. The request/copy accounting is not allocator
+RSS, a portable ABI or a total-stack bound; panic retention applies only when
+the process unwinds.

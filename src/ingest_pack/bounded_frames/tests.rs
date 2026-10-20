@@ -5548,3 +5548,885 @@ mod packed_metadata {
         }
     }
 }
+
+mod messages {
+    use super::*;
+    use crate::{RecoveredMessageBytes, RecoveredMessageLimits, RecoveredPackedMetadataLimits};
+
+    const COUNT: u32 = 4;
+
+    fn limits() -> RecoveredMessageLimits {
+        RecoveredMessageLimits {
+            max_input_bytes: 1 << 20,
+            max_records: 1 << 16,
+            max_templates: 1 << 16,
+            max_literals: 1 << 18,
+            max_checkpoints: 1 << 16,
+            max_message_bytes: 1 << 20,
+            max_output_bytes: 1 << 24,
+            max_slots: 1 << 22,
+            max_work_bytes: 1 << 27,
+        }
+    }
+
+    fn packed_limits() -> RecoveredPackedMetadataLimits {
+        RecoveredPackedMetadataLimits {
+            max_input_bytes: 1 << 20,
+            max_records: 1 << 16,
+            max_nodes: 1 << 18,
+            max_depth: 128,
+            max_callbacks: 1 << 20,
+            max_output_bytes: 1 << 26,
+            max_slots: 1 << 22,
+            max_work_bytes: 1 << 27,
+        }
+    }
+
+    fn parent(
+        raw: &[u8],
+        outer: &[u8],
+        count: u32,
+        expiry: Instant,
+    ) -> crate::PreparedRecoveredPackedMetadata {
+        actual_recovery_index_parent(raw, outer, count, expiry)
+            .prepare_index_until(structural_index_limits())
+            .expect("actual embedded-index producer")
+            .prepare_metadata_bytes_until(recovery_decompression_policy())
+            .expect("actual second native stream")
+            .prepare_packed_metadata_until(packed_limits())
+            .expect("actual accepted typed arena before message entry")
+    }
+
+    fn check_parent(parent: &crate::PreparedRecoveredPackedMetadata, raw: &[u8], expiry: Instant) {
+        assert_eq!(parent.original_expiry(), expiry);
+        assert!(matches!(parent.parser_result(), Some(Ok(()))));
+        assert!(!parent.nodes().is_empty());
+        assert!(parent.parent_metadata().has_native_context());
+        let timestamps = parent.parent_metadata().parent_index().parent_timestamps();
+        assert!(timestamps.has_end_source());
+        assert_eq!(
+            timestamps
+                .parent_offsets()
+                .parent_sections()
+                .structural_bytes(),
+            Some(raw)
+        );
+    }
+
+    fn scalar(out: &mut Vec<u8>, value: usize, nonminimal: bool) {
+        if nonminimal {
+            assert!(
+                value < 128,
+                "the deliberate nonminimal fixture is two bytes"
+            );
+            out.extend_from_slice(&[(value as u8) | 0x80, 0]);
+        } else {
+            append_section_extent(out, value);
+        }
+    }
+
+    fn templates(entries: &[Vec<Vec<u8>>], nonminimal: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        scalar(&mut out, entries.len(), nonminimal);
+        for literals in entries {
+            scalar(&mut out, literals.len(), nonminimal);
+            for literal in literals {
+                scalar(&mut out, literal.len(), nonminimal);
+                out.extend_from_slice(literal);
+            }
+        }
+        out
+    }
+
+    fn lane(payload: &[u8], interval: usize, checkpoints: &[usize], nonminimal: bool) -> Vec<u8> {
+        let mut out = payload.to_vec();
+        let start = u32::try_from(out.len()).expect("finite actual footer");
+        scalar(&mut out, interval, nonminimal);
+        scalar(&mut out, checkpoints.len(), nonminimal);
+        let mut previous = 0;
+        for checkpoint in checkpoints {
+            scalar(&mut out, checkpoint - previous, nonminimal);
+            previous = *checkpoint;
+        }
+        out.extend_from_slice(&start.to_le_bytes());
+        out
+    }
+
+    fn encoded_values(values: &[&[u8]], nonminimal: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in values {
+            scalar(&mut out, value.len(), nonminimal);
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
+    fn fixture(
+        template_bytes: &[u8],
+        bodies: &[u8],
+        template_count: usize,
+        layouts: &[u32],
+    ) -> Vec<u8> {
+        let records = actual_timestamp_records(&[10_000, 10_001, 10_002, 10_003]);
+        crate::structural::message_test_wire_fixture(
+            &records,
+            template_bytes,
+            bodies,
+            template_count,
+            layouts,
+        )
+        .expect("mutate genuine encoded sections/index before any recovery producer")
+    }
+
+    fn dynamic_frame() -> Vec<u8> {
+        fixture(
+            &templates(&[vec![vec![0xc3], Vec::new()]], false),
+            &lane(&encoded_values(&[&[0xa9][..]; 4], false), 256, &[0], false),
+            1,
+            &[0; 4],
+        )
+    }
+
+    fn ordinary_reason(error: &crate::TelemetryError) -> &'static str {
+        match error {
+            crate::TelemetryError::InvalidBlockEncoding(reason) => reason,
+            other => panic!("unexpected actual ordinary error: {other:?}"),
+        }
+    }
+
+    fn original_limits(error: &(dyn std::error::Error + 'static)) -> bool {
+        let mut next = Some(error);
+        while let Some(error) = next {
+            if matches!(
+                error.downcast_ref::<crate::TelemetryRecoveryError>(),
+                Some(crate::TelemetryRecoveryError::Limits)
+            ) {
+                return true;
+            }
+            next = error.source();
+        }
+        false
+    }
+
+    fn parity(raw: &[u8], count: u32) -> crate::PreparedRecoveredMessages {
+        let ordinary = crate::decode_structural_block(raw).expect("actual full ordinary oracle");
+        let outer = zstd::bulk::compress(raw, 1).expect("real outer codec");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let packed = parent(raw, &outer, count, expiry);
+        let pointer = packed
+            .raw_bytes()
+            .expect("actual native packed source")
+            .as_ptr();
+        let before = packed.recovery_usage();
+        let result = packed
+            .prepare_messages_until(limits())
+            .expect("actual full message producer");
+        assert_eq!(result.messages().len(), ordinary.len());
+        assert_eq!(result.usage().rows, ordinary.len());
+        assert_eq!(result.original_expiry(), expiry);
+        assert_eq!(
+            result
+                .parent_packed()
+                .raw_bytes()
+                .expect("same source")
+                .as_ptr(),
+            pointer
+        );
+        assert!(result.recovery_usage().work_bytes > before.work_bytes);
+        assert!(result.recovery_usage().retained_bytes > before.retained_bytes);
+        assert!(result.child_succeeded());
+        assert!(!result.has_panic());
+        check_parent(result.parent_packed(), raw, expiry);
+        for (actual, expected) in result.messages().iter().zip(&ordinary) {
+            assert_eq!(
+                result.source_bytes(actual),
+                Some(expected.message.as_bytes())
+            );
+        }
+        result
+    }
+
+    #[test]
+    fn messages_real_full_scope_and_wire_compatibility() {
+        let mut records =
+            actual_timestamp_records(&(0..272u64).map(|i| 10_000 + i).collect::<Vec<_>>());
+        for (i, record) in records.iter_mut().enumerate() {
+            record.message = Arc::from(match i % 4 {
+                0 => String::new(),
+                1 => "fixed repeated body".to_owned(),
+                2 => format!("ERROR request_id=req-{i:08} retry={} card declined", i % 7),
+                _ => "unicode repeated body 顧客".to_owned(),
+            });
+            record.body = Some(crate::TelemetryValue::String(Arc::clone(&record.message)));
+            record.event_name = Arc::from("actual.messages.typed.parent");
+        }
+        records[271].message = Arc::from("one unique untemplated body Ω");
+        records[271].body = Some(crate::TelemetryValue::String(Arc::clone(
+            &records[271].message,
+        )));
+        let raw = crate::encode_structural_block(&records).expect("actual complete emitter");
+        let result = parity(&raw, 272);
+        assert!(
+            result
+                .messages()
+                .iter()
+                .any(|r| matches!(r, RecoveredMessageBytes::Body(_)))
+        );
+        assert!(
+            result
+                .messages()
+                .iter()
+                .any(|r| matches!(r, RecoveredMessageBytes::Template(_)))
+        );
+        assert!(
+            result
+                .messages()
+                .iter()
+                .any(|r| matches!(r, RecoveredMessageBytes::Reconstructed(_)))
+        );
+        assert_eq!(result.checkpoints().len(), 2);
+        drop(result);
+
+        // Zero template entries are valid: the real raw fallback has layout ID0.
+        let raw_payload = encoded_values(&[&b"zero template raw body"[..]; 4], false);
+        let raw = fixture(&[0], &lane(&raw_payload, 256, &[0], false), 0, &[0; 4]);
+        let result = parity(&raw, COUNT);
+        assert!(
+            result
+                .messages()
+                .iter()
+                .all(|r| matches!(r, RecoveredMessageBytes::Body(_)))
+        );
+        assert!(
+            result
+                .messages()
+                .iter()
+                .all(|r| result.source_bytes(r) == Some(&b"zero template raw body"[..]))
+        );
+        assert!(result.literal_ranges().is_empty());
+        drop(result);
+
+        // Exact templates consume no body payload, including equal checkpoint offsets.
+        for interval in [1, 3, 257, usize::MAX] {
+            let checkpoints = vec![0; (COUNT as usize).div_ceil(interval)];
+            let raw = fixture(
+                &templates(&[vec![Vec::new()]], false),
+                &lane(&[], interval, &checkpoints, false),
+                1,
+                &[0; 4],
+            );
+            let result = parity(&raw, COUNT);
+            assert!(
+                result
+                    .messages()
+                    .iter()
+                    .all(|r| result.source_bytes(r) == Some(&[][..]))
+            );
+        }
+
+        // A valid UTF8 code point crosses an individually invalid literal/value boundary.
+        let raw = dynamic_frame();
+        let result = parity(&raw, COUNT);
+        assert!(
+            result
+                .messages()
+                .iter()
+                .all(|r| result.source_bytes(r) == Some("é".as_bytes()))
+        );
+        assert_eq!(result.reconstructed_bytes(), "éééé".as_bytes());
+        drop(result);
+
+        // Unused literal bytes are not individually text-validated by the ordinary codec.
+        let raw = fixture(
+            &templates(&[vec![b"used".to_vec()], vec![vec![0xff]]], false),
+            &lane(&[], 2, &[0, 0], false),
+            2,
+            &[0; 4],
+        );
+        let result = parity(&raw, COUNT);
+        assert!(
+            result
+                .messages()
+                .iter()
+                .all(|r| result.source_bytes(r) == Some(&b"used"[..]))
+        );
+        assert_eq!(result.literal_ranges().len(), 2);
+        drop(result);
+
+        // Deliberately nonminimal terminating varints in every relevant prefix domain.
+        let payload = encoded_values(&[&b"raw"[..]; 4], true);
+        let raw = fixture(
+            &templates(&[vec![Vec::new()]], true),
+            &lane(&payload, 2, &[0, 10], true),
+            1,
+            &[1; 4],
+        );
+        let result = parity(&raw, COUNT);
+        assert!(
+            result
+                .messages()
+                .iter()
+                .all(|r| result.source_bytes(r) == Some(&b"raw"[..]))
+        );
+    }
+
+    #[test]
+    fn messages_malformed_wire_utf8_and_ordinary_error_order() {
+        let one = templates(&[vec![b"unused".to_vec()]], false);
+        let values = encoded_values(&[&[0xff], b"a", b"b", b"c"], false);
+        let mut trailing = values.clone();
+        trailing.push(0);
+        let valid_values = encoded_values(&[b"a", b"b", b"c", b"d"], false);
+        let mut valid_trailing = valid_values.clone();
+        valid_trailing.push(0);
+        let cases = [
+            (
+                "template scalar truncated",
+                vec![0x80],
+                lane(&[], 256, &[0], false),
+                "truncated block",
+                false,
+                0,
+            ),
+            (
+                "template scalar overflow",
+                vec![0xff; 10],
+                lane(&[], 256, &[0], false),
+                "varint overflow",
+                false,
+                0,
+            ),
+            (
+                "template scalar too long",
+                vec![0x80; 10],
+                lane(&[], 256, &[0], false),
+                "varint is too long",
+                false,
+                0,
+            ),
+            (
+                "body footer truncated",
+                one.clone(),
+                vec![0; 3],
+                "record lane footer is truncated",
+                false,
+                0,
+            ),
+            (
+                "zero literals",
+                vec![1, 0],
+                lane(&[], 256, &[0], false),
+                "template has no literals",
+                false,
+                0,
+            ),
+            (
+                "template extent",
+                vec![1, 1, 3, b'x'],
+                lane(&[], 256, &[0], false),
+                "truncated section",
+                false,
+                0,
+            ),
+            (
+                "layout dictionary",
+                vec![0],
+                lane(&[], 256, &[0], false),
+                "body layout dictionary disagrees with templates",
+                false,
+                0,
+            ),
+            (
+                "bad directory before first UTF8",
+                one.clone(),
+                lane(&values, 256, &[], false),
+                "record lane checkpoint count mismatch",
+                false,
+                0,
+            ),
+            (
+                "first UTF8 before later cursor",
+                one.clone(),
+                lane(&values, 1, &[0, 3, 4, 6], false),
+                "invalid UTF-8 text",
+                true,
+                0,
+            ),
+            (
+                "first UTF8 before trailing payload",
+                one.clone(),
+                lane(&trailing, 256, &[0], false),
+                "invalid UTF-8 text",
+                true,
+                0,
+            ),
+            (
+                "trailing after complete rows",
+                one,
+                lane(&valid_trailing, 256, &[0], false),
+                "trailing component bytes",
+                false,
+                4,
+            ),
+        ];
+        for (name, template, bodies, expected, utf8, completed) in cases {
+            let raw = fixture(&template, &bodies, 1, &[1; 4]);
+            let ordinary = crate::decode_structural_block(&raw).expect_err(name);
+            assert_eq!(ordinary_reason(&ordinary), expected, "{name}");
+            let outer = zstd::bulk::compress(&raw, 1).expect("real malformed wire codec");
+            let expiry = Instant::now() + Duration::from_secs(30);
+            let packed = parent(&raw, &outer, COUNT, expiry);
+            let pointer = packed.raw_bytes().expect("real prior source").as_ptr();
+            let error = packed.prepare_messages_until(limits()).expect_err(name);
+            assert_eq!(
+                error
+                    .parent_packed()
+                    .raw_bytes()
+                    .expect("retained source")
+                    .as_ptr(),
+                pointer
+            );
+            check_parent(error.parent_packed(), &raw, expiry);
+            assert_eq!(error.messages().len(), completed, "{name}");
+            assert!(!error.child_succeeded());
+            assert!(!error.has_panic());
+            match name {
+                "template scalar truncated" => {
+                    assert!(matches!(
+                        error.scalar_result(),
+                        Some(Err(crate::TelemetryError::InvalidBlockEncoding(
+                            "truncated block"
+                        )))
+                    ));
+                    assert_eq!(error.helper_cursor(), 1);
+                }
+                "template scalar overflow" | "template scalar too long" => {
+                    assert!(matches!(error.scalar_result(), Some(Err(_))));
+                    assert_eq!(error.helper_cursor(), 10);
+                }
+                "body footer truncated" => {
+                    assert!(matches!(
+                        error.helper_result(),
+                        Some(Err(crate::TelemetryError::InvalidBlockEncoding(
+                            "record lane footer is truncated"
+                        )))
+                    ));
+                    // Unit helpers preserve the LAST POSITIONED template cursor;
+                    // this is not an invented body/footer cursor.
+                    assert_eq!(error.helper_cursor(), template.len());
+                }
+                _ => {}
+            }
+            if utf8 {
+                let actual = error
+                    .utf8_result()
+                    .expect("actual UTF8 invocation")
+                    .as_ref()
+                    .expect_err("actual malformed text");
+                assert_eq!(actual.valid_up_to(), 0);
+                assert_eq!(actual.error_len(), Some(1));
+                assert_eq!(
+                    error.source_bytes(error.current_message().expect("actual delivered raw body")),
+                    Some(&[0xff][..])
+                );
+                assert_eq!(error.current_ordinal(), 0);
+                assert_eq!(error.current_message_ordinal(), Some(0));
+                assert!(error.helper_error().is_none());
+            } else {
+                assert_eq!(
+                    ordinary_reason(error.helper_error().expect("actual native helper error")),
+                    expected,
+                    "{name}"
+                );
+            }
+        }
+
+        // The real dynamic fragment extent is checked before first-literal UTF8.
+        let raw = fixture(
+            &templates(&[vec![vec![0xff], Vec::new()]], false),
+            &lane(&[5, b'x'], 256, &[0], false),
+            1,
+            &[0; 4],
+        );
+        assert_eq!(
+            ordinary_reason(
+                &crate::decode_structural_block(&raw).expect_err("fragment before text")
+            ),
+            "truncated section"
+        );
+        let outer = zstd::bulk::compress(&raw, 1).expect("real source");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let error = parent(&raw, &outer, COUNT, expiry)
+            .prepare_messages_until(limits())
+            .expect_err("native read_bytes fails before reconstruction");
+        assert!(matches!(
+            error.range_result(),
+            Some(Err(crate::TelemetryError::InvalidBlockEncoding(
+                "truncated section"
+            )))
+        ));
+        assert_eq!(
+            error.helper_cursor(),
+            1,
+            "failed extent retains the consumed length prefix"
+        );
+        assert!(error.utf8_result().is_none());
+        assert!(error.reconstructed_bytes().is_empty());
+        assert!(error.messages().is_empty());
+        check_parent(error.parent_packed(), &raw, expiry);
+
+        // Row1's real failed read must not relabel row0's retained message/UTF8.
+        let raw = fixture(
+            &templates(&[vec![vec![0xc3], Vec::new()]], false),
+            &lane(&[1, 0xa9, 5, b'x'], 256, &[0], false),
+            1,
+            &[0; 4],
+        );
+        assert_eq!(
+            ordinary_reason(&crate::decode_structural_block(&raw).expect_err("row1 extent")),
+            "truncated section"
+        );
+        let outer = zstd::bulk::compress(&raw, 1).expect("real row1 failed-read source");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let error = parent(&raw, &outer, COUNT, expiry)
+            .prepare_messages_until(limits())
+            .expect_err("real second-row extent failure");
+        assert_eq!(error.current_ordinal(), 1);
+        assert_eq!(error.current_message_ordinal(), Some(0));
+        assert_eq!(error.current_template_id(), Some(0));
+        assert_eq!(error.current_body_range(), None);
+        assert!(matches!(
+            error.range_result(),
+            Some(Err(crate::TelemetryError::InvalidBlockEncoding(
+                "truncated section"
+            )))
+        ));
+        assert_eq!(error.helper_cursor(), 3);
+        assert_eq!(error.messages().len(), 1);
+        assert_eq!(error.reconstructed_bytes(), "é".as_bytes());
+        assert_eq!(
+            error.source_bytes(error.current_message().expect("row0 retained source")),
+            Some("é".as_bytes())
+        );
+        assert!(matches!(error.utf8_result(), Some(Ok(()))));
+        assert!(!error.child_succeeded());
+        check_parent(error.parent_packed(), &raw, expiry);
+    }
+
+    #[test]
+    fn messages_exact_original_cumulative_and_child_boundaries() {
+        let raw = dynamic_frame();
+        let outer = zstd::bulk::compress(&raw, 1).expect("actual source");
+        let directory = Directory::new();
+        let path = directory.0.join("same-messages-original-parent.zst");
+        fs::write(&path, &outer).expect("one fixed physical setup for every original ledger");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let replay = |bytes, work| {
+            let mut cap = recovery_decompression_budget_limits();
+            cap.max_retained_bytes = bytes;
+            cap.max_work_bytes = work;
+            let mut original = crate::TelemetryRecoveryBudget::new(cap, expiry)
+                .expect("independent original BEFORE real setup");
+            let input = Bytes::from(original.read_file(&path).expect("same physical read setup"));
+            let first = crate::decompress_recovered_log_frame_until(
+                input,
+                raw.len(),
+                COUNT,
+                recovery_decompression_policy(),
+                original,
+            )
+            .expect("first real outer")
+            .prepare_sections_until(structural_section_limits())
+            .expect("first sections")
+            .prepare_offsets_until(structural_offset_limits())
+            .expect("first offsets")
+            .prepare_timestamps_until(structural_timestamp_limits())
+            .expect("first Pco")
+            .prepare_index_until(structural_index_limits())
+            .expect("first native index")
+            .prepare_metadata_bytes_until(recovery_decompression_policy())
+            .expect("first second native stream")
+            .prepare_packed_metadata_until(packed_limits())
+            .expect("first actual arena")
+            .prepare_messages_until(limits())
+            .expect("first actual complete messages");
+            let spent = first.recovery_usage();
+            let second = first
+                .decompress_next_until(
+                    Bytes::copy_from_slice(&outer),
+                    raw.len(),
+                    COUNT,
+                    recovery_decompression_policy(),
+                )
+                .expect("next native frame consumes SAME spent work/E")
+                .prepare_sections_until(structural_section_limits())
+                .expect("second sections")
+                .prepare_offsets_until(structural_offset_limits())
+                .expect("second offsets")
+                .prepare_timestamps_until(structural_timestamp_limits())
+                .expect("second Pco")
+                .prepare_index_until(structural_index_limits())
+                .expect("second index")
+                .prepare_metadata_bytes_until(recovery_decompression_policy())
+                .expect("second metadata stream")
+                .prepare_packed_metadata_until(packed_limits())
+                .expect("second real arena");
+            assert_eq!(second.original_expiry(), expiry);
+            let before = second.recovery_usage();
+            assert!(before.work_bytes > spent.work_bytes);
+            (before, second.prepare_messages_until(limits()))
+        };
+        let ample = recovery_decompression_budget_limits();
+        let (prior, actual) = replay(ample.max_retained_bytes, ample.max_work_bytes);
+        let actual = actual.expect("observe genuine complete two-frame usage");
+        let total = actual.recovery_usage();
+        let usage = actual.usage();
+        assert!(total.work_bytes > prior.work_bytes && total.retained_bytes > prior.retained_bytes);
+        drop(actual);
+        let (same, exact) = replay(total.retained_bytes, total.work_bytes);
+        assert_eq!(same, prior);
+        let exact = exact.expect("exact observed cumulative original limits fit");
+        assert_eq!(exact.recovery_usage(), total);
+        assert_eq!(exact.usage(), usage);
+        assert_eq!(exact.reconstructed_bytes(), "éééé".as_bytes());
+        drop(exact);
+        for (bytes, work) in [
+            (total.retained_bytes - 1, total.work_bytes),
+            (total.retained_bytes, total.work_bytes - 1),
+        ] {
+            let (same, result) = replay(bytes, work);
+            assert_eq!(same, prior);
+            let error = result.expect_err("one-less original cumulative limit refuses");
+            assert!(original_limits(&error));
+            assert!(error.recovery_refusal().is_some());
+            check_parent(error.parent_packed(), &raw, expiry);
+        }
+
+        let observed = parent(&raw, &outer, COUNT, expiry)
+            .prepare_messages_until(limits())
+            .expect("actual local usage");
+        let usage = observed.usage();
+        let mut exact = limits();
+        exact.max_output_bytes = usage.output_bytes;
+        exact.max_slots = usage.slots;
+        exact.max_work_bytes = usage.work_bytes;
+        exact.max_message_bytes = usage.message_bytes;
+        drop(observed);
+        let exact = parent(&raw, &outer, COUNT, expiry)
+            .prepare_messages_until(exact)
+            .expect("exact measured child limits");
+        assert_eq!(exact.usage(), usage);
+        drop(exact);
+        for axis in 0..7 {
+            let mut cap = limits();
+            match axis {
+                0 => cap.max_output_bytes = usage.output_bytes - 1,
+                1 => cap.max_slots = usage.slots - 1,
+                2 => cap.max_work_bytes = usage.work_bytes - 1,
+                3 => cap.max_message_bytes = usage.message_bytes - 1,
+                4 => cap.max_records = COUNT as usize - 1,
+                5 => cap.max_literals = 1,
+                6 => cap.max_checkpoints = 0,
+                _ => unreachable!(),
+            }
+            let error = parent(&raw, &outer, COUNT, expiry)
+                .prepare_messages_until(cap)
+                .expect_err("finite real child limit refuses");
+            assert!(!error.child_succeeded());
+            assert!(
+                error.recovery_refusal().is_none(),
+                "local limit is distinct from original budget"
+            );
+            check_parent(error.parent_packed(), &raw, expiry);
+            if axis == 4 {
+                assert!(error.scalar_result().is_none());
+                assert!(error.range_result().is_none());
+                assert!(error.reservation_result().is_none());
+                assert!(error.messages().is_empty());
+            }
+        }
+        let mut cap = limits();
+        cap.max_input_bytes = 1;
+        let error = parent(&raw, &outer, COUNT, expiry)
+            .prepare_messages_until(cap)
+            .expect_err("input cap before real scalar/helper entry");
+        assert!(error.scalar_result().is_none());
+        assert!(error.range_result().is_none());
+        assert!(error.utf8_result().is_none());
+        assert!(error.reservation_result().is_none());
+        assert!(error.messages().is_empty());
+    }
+
+    #[test]
+    fn messages_late_unwind_retains_actual_helper_output_and_parents() {
+        let raw = dynamic_frame();
+        let outer = zstd::bulk::compress(&raw, 1).expect("real source");
+        for phase in [
+            "message-scalar",
+            "message-range",
+            "message-helper-result",
+            "message-layout",
+            "message-checkpoint",
+            "message-body-record",
+            "message-literal",
+            "message-template",
+            "message-reservation",
+            "message-delivered",
+            "message-copy",
+            "message-utf8",
+            "message-row",
+            "structural-child-result",
+        ] {
+            for panic in [false, true] {
+                let expiry = Instant::now() + Duration::from_millis(200);
+                let packed = parent(&raw, &outer, COUNT, expiry);
+                let pointer = packed
+                    .raw_bytes()
+                    .expect("actual source before hook")
+                    .as_ptr();
+                let _hook = Hook;
+                TARGET.set(Some((phase, 0, panic)));
+                let error = packed
+                    .prepare_messages_until(limits())
+                    .expect_err("actual hook must veto acceptance");
+                assert!(OBSERVED.get(), "actual requested phase reached: {phase}");
+                assert_eq!(error.has_panic(), panic, "{phase}");
+                assert_eq!(error.original_expiry(), expiry);
+                assert_eq!(
+                    error
+                        .parent_packed()
+                        .raw_bytes()
+                        .expect("retained actual source")
+                        .as_ptr(),
+                    pointer
+                );
+                check_parent(error.parent_packed(), &raw, expiry);
+                assert_eq!(error.child_succeeded(), phase == "structural-child-result");
+                match phase {
+                    "message-scalar" => {
+                        assert!(matches!(error.scalar_result(), Some(Ok(1))));
+                        assert_eq!(error.helper_cursor(), 1);
+                    }
+                    "message-range" => {
+                        let range = error
+                            .range_result()
+                            .expect("actual range Result")
+                            .as_ref()
+                            .expect("actual first literal extent")
+                            .clone();
+                        assert_eq!(range, 3..4);
+                        let bytes = error
+                            .parent_packed()
+                            .parent_metadata()
+                            .parent_index()
+                            .parent_timestamps()
+                            .parent_offsets()
+                            .parent_sections()
+                            .section_bytes(crate::RecoveredStructuralSection::Templates)
+                            .expect("held original template bytes");
+                        assert_eq!(bytes.get(range), Some(&[0xc3][..]));
+                        assert_eq!(error.helper_cursor(), 4);
+                    }
+                    "message-helper-result" => {
+                        assert!(matches!(error.helper_result(), Some(Ok(()))))
+                    }
+                    "message-layout" => {
+                        assert!(matches!(error.template_id_result(), Some(Ok(Some(0)))))
+                    }
+                    "message-checkpoint" => assert_eq!(error.checkpoints(), &[0]),
+                    "message-body-record" => {
+                        assert_eq!(error.current_template_id(), Some(0));
+                        assert_eq!(error.current_body_range(), Some(0..2));
+                    }
+                    "message-literal" => {
+                        assert_eq!(error.literal_ranges().len(), 1);
+                        assert_eq!(error.literal_ranges()[0], 3..4);
+                    }
+                    "message-template" => assert_eq!(error.literal_ranges().len(), 2),
+                    "message-reservation" => {
+                        assert!(matches!(error.reservation_result(), Some(Ok(()))));
+                        assert!(error.reservation_entered());
+                        assert_eq!(error.reservation_request(), Some(1));
+                        assert_eq!(error.reservation_old_capacity(), Some(0));
+                        assert!(
+                            error
+                                .reservation_capacity()
+                                .expect("actual returned capacity")
+                                >= 1
+                        );
+                    }
+                    "message-delivered" => {
+                        assert_eq!(error.current_message_ordinal(), Some(0));
+                        assert_eq!(
+                            error.source_bytes(
+                                error.current_message().expect("actual empty destination")
+                            ),
+                            Some(&[][..])
+                        );
+                        assert!(error.utf8_result().is_none());
+                    }
+                    "message-copy" => {
+                        assert_eq!(error.current_message_ordinal(), Some(0));
+                        assert_eq!(error.reconstructed_bytes(), &[0xc3]);
+                        assert_eq!(
+                            error.source_bytes(
+                                error.current_message().expect("actual copied prefix")
+                            ),
+                            Some(&[0xc3][..])
+                        );
+                        assert!(error.utf8_result().is_none());
+                    }
+                    "message-utf8" => {
+                        assert_eq!(error.current_message_ordinal(), Some(0));
+                        assert!(matches!(error.utf8_result(), Some(Ok(()))));
+                        assert_eq!(
+                            error.source_bytes(
+                                error
+                                    .current_message()
+                                    .expect("actual complete current message")
+                            ),
+                            Some("é".as_bytes())
+                        );
+                        assert!(error.messages().is_empty());
+                    }
+                    "message-row" => {
+                        assert_eq!(error.current_message_ordinal(), Some(0));
+                        assert_eq!(error.messages().len(), 1);
+                        assert_eq!(error.usage().rows, 1);
+                        assert_eq!(
+                            error.source_bytes(&error.messages()[0]),
+                            Some("é".as_bytes())
+                        );
+                    }
+                    "structural-child-result" => {
+                        assert_eq!(error.current_message_ordinal(), Some(3));
+                        assert_eq!(error.messages().len(), COUNT as usize);
+                        assert_eq!(error.reconstructed_bytes(), "éééé".as_bytes());
+                        assert!(matches!(error.helper_result(), Some(Ok(()))));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let expiry = Instant::now() + Duration::from_millis(200);
+        let packed = parent(&raw, &outer, COUNT, expiry);
+        while Instant::now() < expiry {
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        let error = packed
+            .prepare_messages_until(limits())
+            .expect_err("original E already expired before message entry");
+        assert_eq!(error.usage(), crate::RecoveredMessageUsage::default());
+        assert!(error.scalar_result().is_none());
+        assert!(error.range_result().is_none());
+        assert!(error.helper_result().is_none());
+        assert!(error.reservation_result().is_none());
+        assert!(error.utf8_result().is_none());
+        assert!(error.messages().is_empty());
+        assert!(error.literal_ranges().is_empty());
+        assert!(error.reconstructed_bytes().is_empty());
+        assert!(!error.child_succeeded());
+        assert!(!error.has_panic());
+        check_parent(error.parent_packed(), &raw, expiry);
+    }
+}

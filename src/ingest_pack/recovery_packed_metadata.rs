@@ -7,11 +7,13 @@ use super::recovery_metadata::PreparedRecoveredStructuralMetadataBytes;
 use crate::{OwnedLogDecompressionLimits, TelemetryRecoveryError, TelemetryRecoveryUsage};
 use bytes::Bytes;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::cell::Cell;
 use std::collections::TryReserveError;
 use std::error::Error;
 use std::fmt;
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 use std::ops::Range;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
 // Pass this static str BY VALUE. Its selected custom::<&str> conversion requests
@@ -1426,6 +1428,112 @@ macro_rules! views {
 }
 impl PreparedRecoveredPackedMetadata {
     views!();
+    /// Consume this accepted arena into full-scope validated message bytes.
+    /// Fields/final row models/query ownership remain separate operations.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain complete typed/native parent and actual message outcomes inline"
+    )]
+    pub fn prepare_messages_until(
+        self,
+        limits: super::recovery_messages::RecoveredMessageLimits,
+    ) -> Result<
+        super::recovery_messages::PreparedRecoveredMessages,
+        super::recovery_messages::RetainedRecoveredMessageError,
+    > {
+        super::recovery_messages::prepare(self, limits)
+    }
+    /// Scoped actual index/structural/work handoff to the single message child.
+    pub(super) fn continue_messages_until<C, E>(
+        self,
+        child: C,
+        operation: impl FnOnce(
+            Option<&Bytes>,
+            Option<&crate::EmbeddedFrameIndex>,
+            &mut RecoveryFrameWork,
+            &mut C,
+            Option<usize>,
+        ) -> Result<(), E>,
+    ) -> FrameContinuation<Self, C, E, TelemetryRecoveryError> {
+        let check = <RecoveryFrameWork as FrameWork>::check;
+        let check_parent = move |frame: &mut PreparedDecompressedFrame<RecoveryFrameWork>| {
+            frame.with_scoped_work(check)
+        };
+        let parts = [
+            size_of::<FrameContinuation<Self, C, E, TelemetryRecoveryError>>().checked_mul(3),
+            Some(size_of_val(&operation)),
+            Some(size_of_val(&check_parent)),
+            Some(size_of_val(&check)),
+            Some(size_of::<Cell<Option<usize>>>()),
+            Some(size_of::<[Option<usize>; 6]>()),
+        ];
+        let framing = Cell::new(parts.into_iter().try_fold(0usize, |sum, n| {
+            n.and_then(|n| sum.checked_add(n))
+                .filter(|value| *value <= isize::MAX as usize)
+        }));
+        let mut held = FrameContinuation {
+            child,
+            initial: None,
+            actual: None,
+            post: None,
+            panic: None,
+            entered: false,
+            parent: self,
+        };
+        let caught_operation = || {
+            held.initial = Some(held.parent.with_frame(check_parent));
+            if held.initial.as_ref().is_some_and(|v| v.is_ok()) {
+                let frame_operation =
+                    |index: Option<&crate::EmbeddedFrameIndex>,
+                     frame: &mut PreparedDecompressedFrame<RecoveryFrameWork>| {
+                        let work_operation =
+                            |input: Option<&Bytes>, work: &mut RecoveryFrameWork| {
+                                held.entered = true;
+                                held.actual = Some(operation(
+                                    input,
+                                    index,
+                                    work,
+                                    &mut held.child,
+                                    framing.get(),
+                                ));
+                                #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+                                super::bounded_frames::observe_decompression(
+                                    work.original_expiry(),
+                                    "structural-child-result",
+                                );
+                            };
+                        framing.set(
+                            framing
+                                .get()
+                                .and_then(|n| n.checked_add(size_of_val(&work_operation)))
+                                .filter(|value| *value <= isize::MAX as usize),
+                        );
+                        frame.with_structural_work(&framing, work_operation);
+                    };
+                framing.set(
+                    framing
+                        .get()
+                        .and_then(|n| n.checked_add(size_of_val(&frame_operation)))
+                        .filter(|value| *value <= isize::MAX as usize),
+                );
+                held.parent
+                    .held
+                    .parent
+                    .with_index_frame(&framing, frame_operation);
+            }
+        };
+        framing.set(
+            framing
+                .get()
+                .and_then(|n| n.checked_add(size_of_val(&caught_operation)))
+                .filter(|value| *value <= isize::MAX as usize),
+        );
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(caught_operation)) {
+            held.panic = Some(panic);
+        }
+        held.post = Some(held.parent.with_frame(check_parent));
+        held
+    }
     /// Consume this completed typed arena before the next frame on SAME work/E.
     #[allow(
         clippy::result_large_err,
