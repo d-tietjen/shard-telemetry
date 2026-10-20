@@ -292,3 +292,86 @@ fn span_retention_uses_end_time_before_limits_and_preserves_event_time_filters()
     index.retain_since_signal_timestamps([0, 21, 0]);
     assert!(index.query(&query).is_empty());
 }
+
+#[test]
+fn three_and_four_key_correlations_require_every_identity_before_pagination() {
+    let trace_id = TraceId::from_bytes([1; 16]).expect("trace ID");
+    let attribute = TelemetryAttribute::new("required", TelemetryValue::String(Arc::from("yes")));
+    let missing = TelemetryAttribute::new("required", TelemetryValue::String(Arc::from("missing")));
+    let resource = Arc::new(ResourceContext::default());
+    let wanted_scope = Arc::new(ScopeContext {
+        name: Arc::from("wanted"),
+        ..ScopeContext::default()
+    });
+    let wrong_scope = Arc::new(ScopeContext {
+        name: Arc::from("wrong"),
+        ..ScopeContext::default()
+    });
+    let absent_scope = ScopeContext {
+        name: Arc::from("absent"),
+        ..ScopeContext::default()
+    };
+    let partition = TopicPartition::new(LOGS_TOPIC_ID, LogicalPartitionId::new(0));
+    let mut index = CorrelationIndex::new(CorrelationConfig::default());
+    let mut records = Vec::new();
+    for offset in 0..3 {
+        let mut log = DurableLog::new(
+            ShardId::new(0),
+            partition,
+            LogicalOffset::new(offset),
+            10 + offset * 10,
+            "three-key conjunction",
+            CompressionCohortId::new(1),
+        );
+        log.trace_id = Some(trace_id);
+        log.resource = Arc::clone(&resource);
+        log.scope = Arc::clone(if offset == 0 {
+            &wrong_scope
+        } else {
+            &wanted_scope
+        });
+        log.attributes = Arc::new(vec![attribute.clone()]);
+        records.push(log.record_ref);
+        index.index_log("tenant-a", &log);
+    }
+    let two = CorrelationQuery::new("tenant-a")
+        .with_trace_id(trace_id)
+        .with_resource_id(resource.id());
+    assert_eq!(index.query(&two), records);
+    let three = two.clone().with_scope_id(wanted_scope.id());
+    let four = three.clone().with_attribute(&attribute);
+    for query in [three, four] {
+        assert_eq!(index.query(&query), records[1..]);
+        assert_eq!(index.query(&query.clone().with_limit(1)), vec![records[1]]);
+        assert_eq!(
+            index.query(&query.clone().after(records[1]).with_limit(1)),
+            vec![records[2]]
+        );
+        assert!(
+            index
+                .query(&query.clone().with_scope_id(absent_scope.id()))
+                .is_empty()
+        );
+        let other_tenant = CorrelationQuery {
+            tenant: Arc::from("tenant-b"),
+            ..query.clone()
+        };
+        assert!(index.query(&other_tenant).is_empty());
+        let mut retained = Vec::new();
+        index.query_into_with_retention(&query, [25, 0, 0], &mut retained);
+        assert_eq!(retained, vec![records[2]]);
+    }
+    assert!(
+        index
+            .query(&two.clone().with_attribute(&missing))
+            .is_empty()
+    );
+    assert!(
+        index
+            .query(
+                &two.with_scope_id(wanted_scope.id())
+                    .with_attribute(&missing)
+            )
+            .is_empty()
+    );
+}
