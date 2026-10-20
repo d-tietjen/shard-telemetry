@@ -205,14 +205,15 @@ impl CorrelationIndex {
             .get(&(tenant_id, second_key))
             .map(Vec::as_slice)
             .unwrap_or_default();
-        if key_iter.next().is_none() {
+        let Some(third_key) = key_iter.next() else {
             query_two_postings(query, cutoffs, first, second, selected);
             return;
-        }
+        };
 
         let mut keys = Vec::with_capacity(3 + query.attributes.len());
         keys.push(first_key);
         keys.push(second_key);
+        keys.push(third_key);
         keys.extend(key_iter);
         let mut lists = keys
             .into_iter()
