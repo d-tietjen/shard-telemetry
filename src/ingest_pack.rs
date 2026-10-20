@@ -10,6 +10,8 @@ mod recovery_decompression;
 #[cfg(unix)]
 mod recovery_index;
 #[cfg(unix)]
+mod recovery_metadata;
+#[cfg(unix)]
 mod recovery_offsets;
 #[cfg(unix)]
 mod recovery_sections;
@@ -28,6 +30,11 @@ pub use recovery_decompression::{
 pub use recovery_index::{
     PreparedRecoveredStructuralIndex, RecoveredStructuralIndexLimits,
     RecoveredStructuralIndexUsage, RetainedRecoveredStructuralIndexError,
+};
+#[cfg(unix)]
+pub use recovery_metadata::{
+    PreparedRecoveredStructuralMetadataBytes, RecoveredStructuralMetadataByteUsage,
+    RetainedRecoveredStructuralMetadataByteError,
 };
 #[cfg(unix)]
 pub use recovery_offsets::{

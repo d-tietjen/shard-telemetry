@@ -3737,3 +3737,585 @@ mod scoped_stream {
         assert!(!short.child.output_prefix().is_empty());
     }
 }
+
+mod metadata_bytes {
+    use super::*;
+
+    const COUNT: u32 = 12;
+
+    fn frame(typed: bool) -> crate::IndexedStructuralBlock {
+        let values = (0..u64::from(COUNT)).map(|i| 19 + i).collect::<Vec<_>>();
+        let mut records = actual_timestamp_records(&values);
+        for record in &mut records {
+            if typed {
+                record.body = Some(crate::TelemetryValue::Array(Arc::new(vec![
+                    crate::TelemetryValue::String(Arc::from("real nested metadata ".repeat(64))),
+                    crate::TelemetryValue::Bytes(Arc::from(
+                        (0..512).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+                    )),
+                    crate::TelemetryValue::DoubleBits(0x7ff8_0000_0000_0042),
+                ])));
+            } else {
+                record.observed_timestamp_unix_nanos = 0;
+                record.body = None;
+                record.attributes = Arc::default();
+                record.resource = Arc::default();
+                record.scope = Arc::default();
+                record.severity_number = 0;
+                record.severity_text = Arc::default();
+                record.dropped_attributes_count = 0;
+                record.flags = 0;
+                record.trace_id = None;
+                record.span_id = None;
+                record.event_name = Arc::default();
+            }
+        }
+        crate::encode_indexed_structural_records(&records).expect("real structural log producer")
+    }
+    fn parent(
+        raw: &[u8],
+        compressed: &[u8],
+        expiry: Instant,
+    ) -> crate::PreparedRecoveredStructuralIndex {
+        actual_recovery_index_parent(raw, compressed, COUNT, expiry)
+            .prepare_index_until(structural_index_limits())
+            .expect("actual complete outer/native/Pco/index parent")
+    }
+    fn lane(raw: &[u8]) -> Vec<u8> {
+        let compressed = zstd::bulk::compress(raw, 1).expect("actual outer codec");
+        actual_offset_sections(
+            &compressed,
+            raw.len(),
+            COUNT,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .section_bytes(crate::RecoveredStructuralSection::TypedMetadata)
+        .expect("actual typed section")
+        .to_vec()
+    }
+    fn with_lane(raw: &[u8], metadata: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let compressed = zstd::bulk::compress(raw, 1).expect("actual outer producer");
+        let original = actual_offset_sections(
+            &compressed,
+            raw.len(),
+            COUNT,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let mut encoded = crate::structural::STRUCTURAL_BLOCK_MAGIC.to_vec();
+        append_section_extent(&mut encoded, COUNT as usize);
+        for kind in STRUCTURAL_SECTION_KINDS {
+            let section = if kind == crate::RecoveredStructuralSection::TypedMetadata {
+                metadata
+            } else {
+                original
+                    .section_bytes(kind)
+                    .expect("unchanged real producer section")
+            };
+            append_section_extent(&mut encoded, section.len());
+            encoded.extend_from_slice(section);
+        }
+        let outer = zstd::bulk::compress(&encoded, 1).expect("real malformed-input outer framing");
+        (encoded, outer)
+    }
+    fn encoded(raw: &[u8]) -> Vec<u8> {
+        let mut lane = u32::try_from(raw.len())
+            .expect("finite actual metadata bytes")
+            .to_le_bytes()
+            .to_vec();
+        lane.extend_from_slice(&zstd::bulk::compress(raw, 1).expect("real metadata zstd"));
+        lane
+    }
+    fn has_original_limits(error: &(dyn std::error::Error + 'static)) -> bool {
+        let mut cause = Some(error);
+        while let Some(error) = cause {
+            if matches!(
+                error.downcast_ref::<crate::TelemetryRecoveryError>(),
+                Some(crate::TelemetryRecoveryError::Limits)
+            ) {
+                return true;
+            }
+            cause = error.source();
+        }
+        false
+    }
+
+    #[test]
+    fn metadata_bytes_real_empty_and_rich_producers_continue_same_spent_work() {
+        for typed in [false, true] {
+            let frame = frame(typed);
+            let metadata = lane(&frame.structural);
+            assert_eq!(metadata.is_empty(), !typed);
+            let raw = if typed {
+                let n = u32::from_le_bytes(metadata[..4].try_into().expect("real header")) as usize;
+                zstd::bulk::decompress(&metadata[4..], n)
+                    .expect("ordinary real metadata-byte oracle")
+            } else {
+                Vec::new()
+            };
+            let outer = zstd::bulk::compress(&frame.structural, 1).expect("actual outer codec");
+            let expiry = Instant::now() + Duration::from_secs(30);
+            let index = parent(&frame.structural, &outer, expiry);
+            let pointer = index
+                .parent_timestamps()
+                .parent_offsets()
+                .parent_sections()
+                .structural_bytes()
+                .expect("actual parent source")
+                .as_ptr();
+            let prior = index.recovery_usage();
+            let result = index
+                .prepare_metadata_bytes_until(recovery_decompression_policy())
+                .expect("actual production consuming metadata-byte method");
+            assert_eq!(result.is_absent(), !typed);
+            assert!(result.child_succeeded() && !result.has_panic());
+            assert_eq!(result.raw_bytes(), typed.then_some(raw.as_slice()));
+            assert_eq!(result.has_native_context(), typed);
+            assert_eq!(result.creation_entered(), typed);
+            assert_eq!(
+                result.declared_raw_bytes(),
+                typed.then_some(raw.len() as u32)
+            );
+            assert_eq!(
+                result.captured_header(),
+                typed.then_some((raw.len() as u32).to_le_bytes())
+            );
+            if typed {
+                assert!(matches!(result.init_result(), Some(Ok(_))));
+                assert!(matches!(result.parameter_result(), Some(Ok(_))));
+                assert!(matches!(result.last_stream_result(), Some(Ok(0))));
+                assert_eq!(result.retained_compressed_input(), Some(&metadata[4..]));
+                assert_eq!(result.initialized_output().len(), raw.len() + 1);
+                assert!(result.usage().stream_calls > 1);
+            } else {
+                assert!(result.retained_compressed_input().is_none());
+                assert!(result.initialized_output().is_empty());
+                assert_eq!(result.usage().stream_calls, 0);
+            }
+            assert_eq!(result.parent_index().index(), Some(&frame.index));
+            assert!(result.parent_index().parent_timestamps().has_native_file());
+            assert!(result.parent_index().parent_timestamps().has_end_source());
+            assert_eq!(
+                result
+                    .parent_index()
+                    .parent_timestamps()
+                    .parent_offsets()
+                    .parent_sections()
+                    .structural_bytes()
+                    .expect("same actual backing")
+                    .as_ptr(),
+                pointer
+            );
+            assert_eq!(result.original_expiry(), expiry);
+            let usage = result.usage();
+            let spent = result.recovery_usage();
+            assert_eq!(
+                spent.retained_bytes - prior.retained_bytes,
+                usage.continuation_bytes + usage.sharing_bytes + usage.decoder_declared_bytes
+            );
+            assert_eq!(
+                spent.work_bytes - prior.work_bytes,
+                usage.continuation_bytes
+                    + usage.sharing_bytes
+                    + usage.header_bytes
+                    + usage.decoder_work_bytes
+            );
+            assert_eq!(spent.read_bytes, prior.read_bytes);
+            assert_eq!(spent.records, prior.records);
+            assert_eq!(spent.json_values, prior.json_values);
+            let second = result
+                .decompress_next_until(
+                    Bytes::copy_from_slice(&outer),
+                    frame.structural.len(),
+                    COUNT,
+                    recovery_decompression_policy(),
+                )
+                .expect("same already-spent original work enters next actual frame");
+            assert_eq!(second.original_expiry(), expiry);
+            assert!(second.recovery_usage().work_bytes > spent.work_bytes);
+            assert!(second.recovery_usage().retained_bytes > spent.retained_bytes);
+        }
+    }
+
+    #[test]
+    fn metadata_bytes_absent_skips_unused_native_policy_and_nonempty_does_not_clip_it() {
+        for typed in [false, true] {
+            let frame = frame(typed);
+            let outer = zstd::bulk::compress(&frame.structural, 1).expect("actual producer");
+            for large in [false, true] {
+                let n = if large { usize::MAX } else { 0 };
+                let limits = crate::OwnedLogDecompressionLimits {
+                    max_input_bytes: n,
+                    max_output_bytes: n,
+                    input_chunk_bytes: n,
+                    output_chunk_bytes: n,
+                    max_stream_calls: n,
+                    max_window_log: if large { u32::MAX } else { 0 },
+                    max_decoder_bytes: n,
+                    max_declared_bytes: n,
+                    max_entries: n,
+                    max_work_bytes: n,
+                };
+                let expiry = Instant::now() + Duration::from_secs(30);
+                let index = parent(&frame.structural, &outer, expiry);
+                let prior = index.recovery_usage();
+                let outcome = index.prepare_metadata_bytes_until(limits);
+                if typed {
+                    let error =
+                        outcome.expect_err("nonempty preserves unchanged invalid native policy");
+                    assert!(
+                        !error.is_absent()
+                            && !error.creation_entered()
+                            && !error.has_native_context()
+                    );
+                    assert_eq!(error.usage().stream_calls, 0);
+                    assert!(format!("{error:?}").contains("Stream(Limits)"));
+                    assert!(error.retained_compressed_input().is_some());
+                } else {
+                    let absent =
+                        outcome.expect("unused zero/maximal native ceilings are unvalidated");
+                    assert!(absent.is_absent() && absent.child_succeeded());
+                    assert!(!absent.creation_entered() && !absent.has_native_context());
+                    assert!(absent.init_result().is_none() && absent.parameter_result().is_none());
+                    assert!(
+                        absent.last_stream_result().is_none()
+                            && absent.retained_compressed_input().is_none()
+                    );
+                    assert_eq!(absent.usage().stream_calls, 0);
+                    assert_eq!(absent.usage().decoder_declared_bytes, 0);
+                    assert_eq!(
+                        absent.recovery_usage().retained_bytes - prior.retained_bytes,
+                        absent.usage().continuation_bytes
+                    );
+                    assert_eq!(
+                        absent.recovery_usage().work_bytes - prior.work_bytes,
+                        absent.usage().continuation_bytes
+                    );
+                    assert_eq!(absent.original_expiry(), expiry);
+                }
+            }
+            if typed {
+                let mut limits = recovery_decompression_policy();
+                limits.max_output_bytes = usize::MAX;
+                let error = parent(
+                    &frame.structural,
+                    &outer,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .prepare_metadata_bytes_until(limits)
+                .expect_err("64MiB raw check never clips invalid caller max_output");
+                assert!(format!("{error:?}").contains("Stream(Limits)"));
+                assert!(!error.creation_entered());
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_bytes_real_header_native_errors_and_exact_tail_custody() {
+        let frame = frame(true);
+        let original = lane(&frame.structural);
+        let n = u32::from_le_bytes(original[..4].try_into().expect("actual header")) as usize;
+        let raw = zstd::bulk::decompress(&original[4..], n).expect("actual oracle bytes");
+        let mut corrupt = original.clone();
+        corrupt[8] |= 0x08;
+        let mut truncated = original.clone();
+        truncated.pop();
+        let mut high = original.clone();
+        high[..4].copy_from_slice(&u32::try_from(n + 1).expect("finite").to_le_bytes());
+        let mut low = original.clone();
+        low[..4].copy_from_slice(&u32::try_from(n - 1).expect("positive").to_le_bytes());
+        let mut garbage = original.clone();
+        garbage.push(0xff);
+        let cases = vec![
+            (vec![1], false),
+            (vec![1, 2, 3], false),
+            ((64u32 * 1024 * 1024).to_le_bytes().to_vec(), false),
+            (((64u32 * 1024 * 1024) + 1).to_le_bytes().to_vec(), false),
+            (encoded(&[]), false),
+            (original[..4].to_vec(), false),
+            (corrupt, true),
+            (truncated, true),
+            (high, true),
+            (low, true),
+            (garbage, true),
+        ];
+        for (bad, native) in cases {
+            let (source, outer) = with_lane(&frame.structural, &bad);
+            let expiry = Instant::now() + Duration::from_secs(30);
+            let error = parent(&source, &outer, expiry)
+                .prepare_metadata_bytes_until(recovery_decompression_policy())
+                .expect_err("real malformed metadata through successful actual outer/index parent");
+            assert!(!error.is_absent() && !error.child_succeeded());
+            assert_eq!(error.creation_entered(), native);
+            assert_eq!(error.has_native_context(), native);
+            if error.declared_raw_bytes() == Some(64u32 * 1024 * 1024) {
+                assert_eq!(error.retained_compressed_input(), Some(&[][..]));
+                assert!(format!("{error:?}").contains("Stream(Limits)"));
+            }
+            assert_eq!(error.original_expiry(), expiry);
+            assert_eq!(error.parent_index().index(), Some(&frame.index));
+            assert!(error.parent_index().parent_timestamps().has_native_file());
+            assert!(error.parent_index().parent_timestamps().has_end_source());
+            if native {
+                assert!(error.usage().stream_calls > 0);
+                assert!(error.last_stream_result().is_some());
+                assert!(!error.initialized_output().is_empty());
+                assert!(raw.starts_with(error.output_prefix()));
+            }
+        }
+        let half = raw.len() / 2;
+        let mut joined = u32::try_from(raw.len())
+            .expect("finite")
+            .to_le_bytes()
+            .to_vec();
+        joined
+            .extend_from_slice(&zstd::bulk::compress(&raw[..half], 1).expect("actual first frame"));
+        joined.extend_from_slice(&0x184d_2a50u32.to_le_bytes());
+        joined.extend_from_slice(&3u32.to_le_bytes());
+        joined.extend_from_slice(&[1, 2, 3]);
+        joined.extend_from_slice(
+            &zstd::bulk::compress(&raw[half..], 1).expect("actual second frame"),
+        );
+        assert_eq!(
+            zstd::bulk::decompress(&joined[4..], raw.len())
+                .expect("ordinary concatenated/skippable oracle"),
+            raw
+        );
+        let (source, outer) = with_lane(&frame.structural, &joined);
+        let result = parent(&source, &outer, Instant::now() + Duration::from_secs(30))
+            .prepare_metadata_bytes_until(recovery_decompression_policy())
+            .expect("same full actual input extent");
+        assert_eq!(result.raw_bytes(), Some(raw.as_slice()));
+        let mut tail = raw.clone();
+        tail.extend_from_slice(&[0x90, 0xc0]);
+        let packed: crate::structural::PackedLogMetadata =
+            rmp_serde::from_slice(&raw).expect("ordinary real packed value");
+        let first: crate::structural::PackedLogMetadata =
+            rmp_serde::from_slice(&tail).expect("ordinary first-value tail behavior");
+        assert_eq!(first, packed);
+        let (source, outer) = with_lane(&frame.structural, &encoded(&tail));
+        let result = parent(&source, &outer, Instant::now() + Duration::from_secs(30))
+            .prepare_metadata_bytes_until(recovery_decompression_policy())
+            .expect("opaque exact native bytes with retained MessagePack tail");
+        assert_eq!(result.raw_bytes(), Some(tail.as_slice()));
+    }
+
+    #[test]
+    fn metadata_bytes_exact_and_one_less_original_work_and_native_calls() {
+        for typed in [false, true] {
+            let frame = frame(typed);
+            let outer = zstd::bulk::compress(&frame.structural, 1).expect("actual producer");
+            let directory = Directory::new();
+            let path = directory.0.join("same-original-metadata-source.zst");
+            fs::write(&path, &outer).expect("fixed fixture before independent original budgets");
+            let expiry = Instant::now() + Duration::from_secs(30);
+            let run = |bytes, work, child| {
+                let mut limits = recovery_decompression_budget_limits();
+                limits.max_retained_bytes = bytes;
+                limits.max_work_bytes = work;
+                let mut original = crate::TelemetryRecoveryBudget::new(limits, expiry)
+                    .expect("independent original budget before same actual setup");
+                let input = Bytes::from(
+                    original
+                        .read_file(&path)
+                        .expect("same actual original file read"),
+                );
+                let index = crate::decompress_recovered_log_frame_until(
+                    input,
+                    frame.structural.len(),
+                    COUNT,
+                    recovery_decompression_policy(),
+                    original,
+                )
+                .expect("same outer native")
+                .prepare_sections_until(structural_section_limits())
+                .expect("same sections")
+                .prepare_offsets_until(structural_offset_limits())
+                .expect("same offsets")
+                .prepare_timestamps_until(structural_timestamp_limits())
+                .expect("same actual Pco")
+                .prepare_index_until(structural_index_limits())
+                .expect("same actual index");
+                let prior = index.recovery_usage();
+                (prior, index.prepare_metadata_bytes_until(child))
+            };
+            let ample = recovery_decompression_budget_limits();
+            let (prior, observed) = run(
+                ample.max_retained_bytes,
+                ample.max_work_bytes,
+                recovery_decompression_policy(),
+            );
+            let observed = observed.expect("actual full cumulative observation");
+            let spent = observed.recovery_usage();
+            let calls = observed.usage().stream_calls;
+            drop(observed);
+            let (same_prior, exact) = run(
+                spent.retained_bytes,
+                spent.work_bytes,
+                recovery_decompression_policy(),
+            );
+            assert_eq!(same_prior, prior);
+            let exact = exact.expect("exact original cumulative caps");
+            assert_eq!(exact.recovery_usage(), spent);
+            assert_eq!(exact.is_absent(), !typed);
+            drop(exact);
+            for (bytes, work) in [
+                (spent.retained_bytes - 1, spent.work_bytes),
+                (spent.retained_bytes, spent.work_bytes - 1),
+            ] {
+                let (same_prior, refused) = run(bytes, work, recovery_decompression_policy());
+                assert_eq!(same_prior, prior);
+                let error = refused.expect_err(
+                    "one-less original cumulative allowance refuses actual next effect",
+                );
+                assert!(has_original_limits(&error));
+                assert_eq!(error.original_expiry(), expiry);
+                assert_eq!(error.parent_index().index(), Some(&frame.index));
+                assert!(error.parent_index().parent_timestamps().has_native_file());
+                assert!(error.parent_index().parent_timestamps().has_end_source());
+                assert_eq!(error.recovery_usage().read_bytes, prior.read_bytes);
+                assert_eq!(error.recovery_usage().json_values, prior.json_values);
+                assert_eq!(error.recovery_usage().records, prior.records);
+                if !typed {
+                    assert!(!error.creation_entered() && !error.has_native_context());
+                    assert_eq!(error.usage().stream_calls, 0);
+                    assert_eq!(error.recovery_usage(), prior);
+                }
+            }
+            if typed {
+                assert!(calls > 1);
+                let mut limits = recovery_decompression_policy();
+                limits.max_stream_calls = calls;
+                let (_, exact) = run(ample.max_retained_bytes, ample.max_work_bytes, limits);
+                assert_eq!(
+                    exact
+                        .expect("exact actual call ceiling")
+                        .usage()
+                        .stream_calls,
+                    calls
+                );
+                limits.max_stream_calls -= 1;
+                let (_, short) = run(ample.max_retained_bytes, ample.max_work_bytes, limits);
+                let short = short.expect_err("one-less stops before the next actual call");
+                assert_eq!(short.usage().stream_calls, calls - 1);
+                assert!(short.has_native_context() && !short.output_prefix().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_bytes_late_unwind_retains_actual_empty_or_native_result_before_postcheck() {
+        for typed in [false, true] {
+            let frame = frame(typed);
+            let outer = zstd::bulk::compress(&frame.structural, 1).expect("actual producer");
+            let phases = if typed {
+                &[
+                    "decompression-output",
+                    "decompression-context",
+                    "decompression-init",
+                    "decompression-parameter",
+                    "decompression-step",
+                    "structural-child-result",
+                ][..]
+            } else {
+                &["structural-child-result"][..]
+            };
+            for &phase in phases {
+                for panic in [false, true] {
+                    let expiry = Instant::now() + Duration::from_millis(200);
+                    let index = parent(&frame.structural, &outer, expiry);
+                    let pointer = index
+                        .parent_timestamps()
+                        .parent_offsets()
+                        .parent_sections()
+                        .structural_bytes()
+                        .expect("actual retained source")
+                        .as_ptr();
+                    let _hook = Hook;
+                    TARGET.set(Some((phase, 0, panic)));
+                    let error = index
+                        .prepare_metadata_bytes_until(recovery_decompression_policy())
+                        .expect_err("actual late/unwound metadata byte operation never accepted");
+                    assert!(
+                        OBSERVED.get(),
+                        "requested real metadata child phase was reached"
+                    );
+                    assert_eq!(error.has_panic(), panic);
+                    assert_eq!(error.original_expiry(), expiry);
+                    assert_eq!(
+                        error
+                            .parent_index()
+                            .parent_timestamps()
+                            .parent_offsets()
+                            .parent_sections()
+                            .structural_bytes()
+                            .expect("same original actual backing")
+                            .as_ptr(),
+                        pointer
+                    );
+                    assert!(error.parent_index().parent_timestamps().has_native_file());
+                    assert!(error.parent_index().parent_timestamps().has_end_source());
+                    if phase == "structural-child-result" {
+                        assert!(error.child_succeeded());
+                        assert_eq!(error.is_absent(), !typed);
+                        if typed {
+                            assert!(matches!(error.last_stream_result(), Some(Ok(0))));
+                        }
+                    }
+                    if !typed {
+                        assert!(!error.creation_entered() && !error.has_native_context());
+                        assert!(
+                            error.init_result().is_none() && error.parameter_result().is_none()
+                        );
+                        assert_eq!(error.usage().stream_calls, 0);
+                    } else if phase != "decompression-output" {
+                        assert!(error.has_native_context());
+                        if matches!(
+                            phase,
+                            "decompression-init" | "decompression-parameter" | "decompression-step"
+                        ) {
+                            assert!(matches!(error.init_result(), Some(Ok(_))));
+                        }
+                        if matches!(phase, "decompression-parameter" | "decompression-step") {
+                            assert!(matches!(error.parameter_result(), Some(Ok(_))));
+                        }
+                        if phase == "decompression-step" {
+                            assert!(error.last_stream_result().is_some());
+                        }
+                    }
+                }
+            }
+            if typed {
+                let mut corrupt = lane(&frame.structural);
+                corrupt[8] |= 0x08;
+                let (source, outer) = with_lane(&frame.structural, &corrupt);
+                for panic in [false, true] {
+                    let expiry = Instant::now() + Duration::from_millis(200);
+                    let index = parent(&source, &outer, expiry);
+                    let _hook = Hook;
+                    TARGET.set(Some(("decompression-step", 0, panic)));
+                    let error = index
+                        .prepare_metadata_bytes_until(recovery_decompression_policy())
+                        .expect_err("real native Err survives later expiry or observer unwind");
+                    assert!(OBSERVED.get());
+                    assert!(matches!(error.last_stream_result(), Some(Err(_))));
+                    assert_eq!(error.has_panic(), panic);
+                    assert!(error.has_native_context());
+                    assert!(!error.initialized_output().is_empty());
+                    assert_eq!(error.original_expiry(), expiry);
+                    assert!(error.parent_index().parent_timestamps().has_native_file());
+                    assert!(error.parent_index().parent_timestamps().has_end_source());
+                }
+            }
+            let expiry = Instant::now() + Duration::from_millis(200);
+            let index = parent(&frame.structural, &outer, expiry);
+            while Instant::now() < expiry {
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+            let error = index
+                .prepare_metadata_bytes_until(recovery_decompression_policy())
+                .expect_err("same original expired E cannot be refreshed even on an absent lane");
+            assert!(!error.child_succeeded() && !error.creation_entered());
+            assert_eq!(error.original_expiry(), expiry);
+        }
+    }
+}

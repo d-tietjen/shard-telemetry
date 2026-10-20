@@ -88,12 +88,14 @@ pub use fast_telemetry::{FastTelemetryConfig, FastTelemetryExportReport, FastTel
 #[cfg(unix)]
 pub use ingest_pack::{
     PreparedRecoveredLogFrame, PreparedRecoveredStructuralIndex,
-    PreparedRecoveredStructuralOffsets, PreparedRecoveredStructuralSections,
-    PreparedRecoveredStructuralTimestamps, RecoveredStructuralIndexLimits,
-    RecoveredStructuralIndexUsage, RecoveredStructuralOffsetLimits, RecoveredStructuralOffsetUsage,
-    RecoveredStructuralSection, RecoveredStructuralSectionLimits, RecoveredStructuralSectionUsage,
-    RecoveredStructuralTimestampLimits, RecoveredStructuralTimestampUsage,
-    RetainedRecoveredLogFrameError, RetainedRecoveredStructuralIndexError,
+    PreparedRecoveredStructuralMetadataBytes, PreparedRecoveredStructuralOffsets,
+    PreparedRecoveredStructuralSections, PreparedRecoveredStructuralTimestamps,
+    RecoveredStructuralIndexLimits, RecoveredStructuralIndexUsage,
+    RecoveredStructuralMetadataByteUsage, RecoveredStructuralOffsetLimits,
+    RecoveredStructuralOffsetUsage, RecoveredStructuralSection, RecoveredStructuralSectionLimits,
+    RecoveredStructuralSectionUsage, RecoveredStructuralTimestampLimits,
+    RecoveredStructuralTimestampUsage, RetainedRecoveredLogFrameError,
+    RetainedRecoveredStructuralIndexError, RetainedRecoveredStructuralMetadataByteError,
     RetainedRecoveredStructuralOffsetError, RetainedRecoveredStructuralSectionError,
     RetainedRecoveredStructuralTimestampError, decompress_recovered_log_frame_until,
 };

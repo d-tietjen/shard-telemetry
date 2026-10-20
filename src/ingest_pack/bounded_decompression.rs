@@ -761,14 +761,14 @@ impl FrameStreamState {
 }
 /// Retained second stream state borrowing the complete parent's original work.
 /// This stops at the finite native byte extent; it does not validate STLG or rows.
-#[cfg(test)]
+#[cfg(unix)]
 pub(super) struct ScopedFrameStream {
     state: FrameStreamState,
     entered: bool,
     // Keep the actual native context after every result/output owner.
     context: Option<DCtx<'static>>,
 }
-#[cfg(test)]
+#[cfg(unix)]
 impl ScopedFrameStream {
     pub(super) fn new(
         input: Bytes,

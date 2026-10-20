@@ -161,18 +161,56 @@ state and its actual native context, preserving their destruction order. Its
 STLG conversion, section validation, result custody and public entrypoints
 remain in that wrapper. Fixed fees use the actual owned wrapper/error sizes.
 
-The test-only scoped composition owner retains a separate context and its
-complete native results/output while borrowing the complete parent's original
-recovery work. Both its type and implementation are compiled only for tests.
-Its unchanged test continuation fee covers the actual parent/child/result
-carriers. It stops at the admitted raw native byte extent; no STLG, MessagePack
-or row acceptance is implied. An entered test attempt cannot reset or replace
-its retained context. The future real retained-row consumer is still unwired;
-there is no production scoped owner, retry or work/context extractor.
+The scoped composition owner retains a separate context and its complete
+native results/output while borrowing the complete parent's original recovery
+work. Its production consumer reconstructs the finite typed-metadata byte
+extent below. Its continuation fee covers the actual parent/child/result
+carriers. It does not validate STLG, MessagePack or typed rows. An entered
+attempt cannot reset or replace its retained context. The real retained-row
+consumer remains unwired; there is no retry or work/context extractor.
 
 Observed native context excess remains admitted before further work, and a
 refusal retains the actual context and produced bytes. The production
 `FrameStreamState` refactor still requires normal native layout and frame
-qualification. Test-only composition does not qualify a production scoped owner
-or row consumer, and these source-derived fees do not bound allocator RSS or a
+qualification. The metadata-byte producer requires its own normal layout, native and retained
+regression gates; source-derived fees do not bound allocator RSS or a
 process-abort stack.
+
+
+## Retained typed-metadata byte extent
+
+An accepted recovered structural index can be consumed into an absent-metadata
+owner or an exact native metadata-byte owner on its original spent recovery
+ledger and expiry. The complete index/Pco/section/outer-context parent remains
+owned after the metadata context, result and output state. This is an opaque
+byte prerequisite: MessagePack, packed metadata row counts, typed rows and query
+or HA ownership are not accepted by it.
+
+An empty encoded metadata lane enters no second decoder and intentionally does
+not validate unused native decoder ceilings. It still requires the actual
+accepted parent, original expiry and full continuation framing admission. A
+nonempty lane captures its original four-byte little-endian raw length, checks
+the separate64MiB safety ceiling and uses its entire compressed remainder with
+the unchanged bounded stream limits. The caller's limits are never clipped or
+normalized. A nonempty declared-zero raw length has an explicit unsupported
+outcome; it is distinct from the ordinary absent lane. Modern/skippable and
+concatenated input, exact output extent and compressed trailing-garbage refusal
+follow the existing bounded native loop. Decompressed trailing MessagePack
+bytes remain retained; no MessagePack EOF rule is introduced.
+
+Actual complete continuation/prepared/error/closure framing is paid before
+metadata effects. Native fixed framing is then zero because those actual
+carriers are already covered; the original stream's three local framing entries
+and all input/output/sentinel/step/context/excess/per-call fees remain. Original
+cumulative work is never reset or extracted. Success can consume the child and
+continue another frame on that same ledger/E; terminal errors retain their
+actual partial output, results, initialized destination and context without a
+retry. Process abort and unreturned library transitions cannot be reconstructed.
+
+The scoped stream now has this production consumer under the existing Unix
+recovery boundary. Native decoder constructors, ordinary STLG finalization,
+legacy/window restrictions and ordinary bulk/Serde decoding remain unchanged.
+Normal canonical formatting, strict Clippy, native/retained regression, release,
+actual carrier/layout and production-frame gates apply. This byte stage supplies
+no std String-format allocation proof, typed-row visitor, service/host/HA or
+release-gate acceptance.

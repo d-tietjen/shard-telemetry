@@ -231,6 +231,23 @@ macro_rules! views {
 }
 impl PreparedRecoveredStructuralIndex {
     views!();
+    /// Consume this accepted index into absent metadata or exact native bytes.
+    /// The same original work/E and complete parent remain retained; MessagePack
+    /// and typed rows are not decoded or accepted by this byte producer.
+    /// Absent metadata does not validate unused native decoder limits.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain complete parent and actual metadata native outcome inline"
+    )]
+    pub fn prepare_metadata_bytes_until(
+        self,
+        limits: crate::OwnedLogDecompressionLimits,
+    ) -> Result<
+        super::recovery_metadata::PreparedRecoveredStructuralMetadataBytes,
+        super::recovery_metadata::RetainedRecoveredStructuralMetadataByteError,
+    > {
+        super::recovery_metadata::prepare_metadata_bytes_until(self, limits)
+    }
     /// Consume completed index/parents and decode the next frame on SAME spent work/E.
     #[allow(
         clippy::result_large_err,
