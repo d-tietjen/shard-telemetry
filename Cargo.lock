@@ -2391,7 +2391,7 @@ dependencies = [
 [[package]]
 name = "ordered-segment-map"
 version = "0.2.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=e630c40e4c8430bc2371d687c2c72fde8b8e4014#e630c40e4c8430bc2371d687c2c72fde8b8e4014"
 dependencies = [
  "hashbrown 0.17.1",
  "xxhash-rust",
@@ -3234,8 +3234,10 @@ dependencies = [
 [[package]]
 name = "shard-stream-core"
 version = "0.2.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=e630c40e4c8430bc2371d687c2c72fde8b8e4014#e630c40e4c8430bc2371d687c2c72fde8b8e4014"
 dependencies = [
+ "bytes",
+ "rustix",
  "serde",
  "shardlog",
 ]
@@ -3243,10 +3245,13 @@ dependencies = [
 [[package]]
 name = "shard-stream-engine"
 version = "0.2.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=e630c40e4c8430bc2371d687c2c72fde8b8e4014#e630c40e4c8430bc2371d687c2c72fde8b8e4014"
 dependencies = [
+ "blake3",
  "bytes",
  "ordered-segment-map",
+ "serde",
+ "serde_json",
  "shard-stream-core",
  "shard-stream-protocol",
  "shardlog",
@@ -3256,7 +3261,7 @@ dependencies = [
 [[package]]
 name = "shard-stream-protocol"
 version = "0.2.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=e630c40e4c8430bc2371d687c2c72fde8b8e4014#e630c40e4c8430bc2371d687c2c72fde8b8e4014"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -3338,12 +3343,13 @@ dependencies = [
 [[package]]
 name = "shardlog"
 version = "0.2.0"
-source = "git+https://github.com/d-tietjen/shard-stream.git?rev=fef8695b1724e04e10aa26e500e68b8b535efa13#fef8695b1724e04e10aa26e500e68b8b535efa13"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=e630c40e4c8430bc2371d687c2c72fde8b8e4014#e630c40e4c8430bc2371d687c2c72fde8b8e4014"
 dependencies = [
  "blake3",
  "bytes",
  "crc32fast",
  "fs2",
+ "rustix",
  "serde",
  "serde_json",
  "xxhash-rust",

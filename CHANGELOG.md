@@ -6,6 +6,12 @@ and protocol interfaces when called out in release notes.
 
 ## [Unreleased]
 
+### Changed
+
+- Pin source builds to merged shard-stream commit
+  `e630c40e4c8430bc2371d687c2c72fde8b8e4014` for bounded recovery, query lineage and
+  origin progress. Registry dependency requirements remain `=0.2.0`.
+
 ## [0.2.0] - 2026-09-07
 
 ### Added
