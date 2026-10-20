@@ -151,3 +151,28 @@ same already-spent ledger/E. Terminal error exposes only immutable observations,
 including an index completed before late expiry/unwind; its presence alone does
 not mean acceptance. Catching unwind does not make a process-abort build return
 from panic. These APIs do not establish whole replay/factory or host completion.
+
+
+## Internal scoped stream state
+
+The native streaming loop borrows an existing `FrameWork` at its admission
+boundaries. The owned structural wrapper retains that work between its data
+state and its actual native context, preserving their destruction order. Its
+STLG conversion, section validation, result custody and public entrypoints
+remain in that wrapper. Fixed fees use the actual owned wrapper/error sizes.
+
+The test-only scoped composition owner retains a separate context and its
+complete native results/output while borrowing the complete parent's original
+recovery work. Both its type and implementation are compiled only for tests.
+Its unchanged test continuation fee covers the actual parent/child/result
+carriers. It stops at the admitted raw native byte extent; no STLG, MessagePack
+or row acceptance is implied. An entered test attempt cannot reset or replace
+its retained context. The future real retained-row consumer is still unwired;
+there is no production scoped owner, retry or work/context extractor.
+
+Observed native context excess remains admitted before further work, and a
+refusal retains the actual context and produced bytes. The production
+`FrameStreamState` refactor still requires normal native layout and frame
+qualification. Test-only composition does not qualify a production scoped owner
+or row consumer, and these source-derived fees do not bound allocator RSS or a
+process-abort stack.

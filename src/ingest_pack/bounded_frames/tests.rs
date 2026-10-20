@@ -3394,3 +3394,346 @@ fn recovered_index_malformed_wire_retains_genuine_complete_parent_and_codec_erro
     assert!(refused.recovery_usage().work_bytes > before.work_bytes);
     assert!(refused.index().is_none() && !refused.child_succeeded());
 }
+
+mod scoped_stream {
+    use super::*;
+    use crate::ingest_pack::bounded_decompression::{
+        Failure as StreamFailure, FrameContinuation, PreparedDecompressedFrame, ScopedFrameStream,
+    };
+    use crate::ingest_pack::recovery_decompression::RecoveryFrameWork;
+
+    type Held = FrameContinuation<
+        crate::PreparedRecoveredStructuralIndex,
+        ScopedFrameStream,
+        StreamFailure<crate::TelemetryRecoveryError>,
+        crate::TelemetryRecoveryError,
+    >;
+
+    fn payload() -> (Vec<u8>, Vec<u8>) {
+        let raw = rmp_serde::to_vec(&vec![
+            crate::TelemetryValue::String(Arc::from(
+                "actual nested typed payload; not a structural frame ".repeat(64),
+            )),
+            crate::TelemetryValue::Bytes(Arc::from(
+                (0..512).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+            )),
+        ])
+        .expect("actual existing MessagePack typed-value producer");
+        let compressed = zstd::bulk::compress(&raw, 1).expect("actual nested zstd producer");
+        (raw, compressed)
+    }
+
+    fn parent(
+        frame: &crate::IndexedStructuralBlock,
+        compressed: &[u8],
+        expiry: Instant,
+    ) -> crate::PreparedRecoveredStructuralIndex {
+        actual_recovery_index_parent(&frame.structural, compressed, 96, expiry)
+            .prepare_index_until(structural_index_limits())
+            .expect("actual complete outer/native/Pco/index parent")
+    }
+
+    fn run(
+        parent: crate::PreparedRecoveredStructuralIndex,
+        input: Bytes,
+        expected: usize,
+        limits: FrameDecompressionLimits,
+    ) -> Held {
+        let child = ScopedFrameStream::new(input, expected, 96, limits);
+        PreparedDecompressedFrame::<RecoveryFrameWork>::continue_owned_until(
+            parent,
+            child,
+            |_structural, work, child, fixed| child.run(work, fixed),
+        )
+    }
+
+    #[test]
+    fn scoped_stream_uses_real_index_parent_and_same_spent_original_work() {
+        let frame = actual_recovery_index_frame();
+        let outer = zstd::bulk::compress(&frame.structural, 1).expect("actual outer producer");
+        let (raw, compressed) = payload();
+        assert_eq!(zstd::bulk::decompress(&compressed, raw.len()).unwrap(), raw);
+        assert!(!raw.starts_with(crate::structural::STRUCTURAL_BLOCK_MAGIC));
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let parent = parent(&frame, &outer, expiry);
+        let before = parent.recovery_usage();
+        let pointer = parent
+            .parent_timestamps()
+            .parent_offsets()
+            .parent_sections()
+            .structural_bytes()
+            .expect("complete real structural owner")
+            .as_ptr();
+        let held = run(
+            parent,
+            Bytes::from(compressed.clone()),
+            raw.len(),
+            decompression_policy(),
+        );
+        assert!(held.accepted());
+        assert!(held.child.creation_entered() && held.child.has_native_context());
+        assert!(held.child.init_result().is_some_and(|r| r.is_ok()));
+        assert!(held.child.parameter_result().is_some_and(|r| r.is_ok()));
+        assert_eq!(held.child.last_stream_result(), Some(&Ok(0)));
+        assert!(held.child.stream_calls() > 1);
+        assert_eq!(held.child.input(), compressed);
+        assert_eq!(held.child.output_prefix(), raw);
+        assert_eq!(held.child.initialized_output().len(), raw.len() + 1);
+        assert_eq!(held.parent.index(), Some(&frame.index));
+        assert_eq!(held.parent.original_expiry(), expiry);
+        assert_eq!(
+            held.parent
+                .parent_timestamps()
+                .parent_offsets()
+                .parent_sections()
+                .structural_bytes()
+                .unwrap()
+                .as_ptr(),
+            pointer
+        );
+        assert!(held.parent.parent_timestamps().has_native_file());
+        assert!(held.parent.parent_timestamps().has_end_source());
+        let spent = held.parent.recovery_usage();
+        assert_eq!(spent.work_bytes - before.work_bytes, held.child.usage().2);
+        assert_eq!(
+            spent.retained_bytes - before.retained_bytes,
+            held.child.usage().0
+        );
+        assert_eq!(spent.read_bytes, before.read_bytes);
+        assert_eq!(spent.records, before.records);
+        assert_eq!(spent.json_values, before.json_values);
+        let FrameContinuation {
+            child,
+            initial,
+            actual,
+            post,
+            panic,
+            parent,
+            ..
+        } = held;
+        drop((child, initial, actual, post, panic));
+        let next = parent
+            .decompress_next_until(
+                Bytes::from(outer),
+                frame.structural.len(),
+                96,
+                recovery_decompression_policy(),
+            )
+            .expect("same already-spent original work after scoped child owners drop");
+        assert_eq!(next.original_expiry(), expiry);
+        assert_eq!(next.structural_bytes(), Some(frame.structural.as_slice()));
+        assert!(next.recovery_usage().work_bytes > spent.work_bytes);
+        assert!(next.recovery_usage().retained_bytes > spent.retained_bytes);
+    }
+
+    #[test]
+    fn scoped_stream_native_error_keeps_real_partial_bytes_and_context() {
+        let frame = actual_recovery_index_frame();
+        let outer = zstd::bulk::compress(&frame.structural, 1).expect("actual outer producer");
+        let (raw, compressed) = payload();
+        let mut invalid = compressed.clone();
+        invalid[4] |= 0x08; // Existing genuine reserved descriptor-bit native failure.
+        let mut input = compressed;
+        input.extend_from_slice(&invalid);
+        assert!(zstd::bulk::decompress(&input, raw.len() + 1).is_err());
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let held = run(
+            parent(&frame, &outer, expiry),
+            Bytes::from(input.clone()),
+            raw.len() + 1,
+            decompression_policy(),
+        );
+        assert!(!held.accepted() && held.panic.is_none());
+        assert!(matches!(
+            held.actual.as_ref(),
+            Some(Err(StreamFailure::Native))
+        ));
+        assert!(held.child.last_stream_result().is_some_and(|r| r.is_err()));
+        assert!(held.child.stream_calls() > 1);
+        assert_eq!(held.child.input(), input);
+        assert_eq!(held.child.output_prefix(), raw);
+        assert!(held.child.has_native_context());
+        assert!(held.child.init_result().is_some_and(|r| r.is_ok()));
+        assert_eq!(held.parent.index(), Some(&frame.index));
+        assert_eq!(held.parent.original_expiry(), expiry);
+        assert!(held.parent.parent_timestamps().has_native_file());
+        assert!(held.parent.parent_timestamps().has_end_source());
+    }
+
+    #[test]
+    fn scoped_stream_original_expiry_and_unwind_keep_actual_state_and_results() {
+        let frame = actual_recovery_index_frame();
+        let outer = zstd::bulk::compress(&frame.structural, 1).expect("actual outer producer");
+        let (raw, compressed) = payload();
+        for phase in [
+            "decompression-output",
+            "decompression-context",
+            "decompression-init",
+            "decompression-parameter",
+            "decompression-step",
+            "structural-child-result",
+        ] {
+            for panic in [false, true] {
+                let expiry = Instant::now() + Duration::from_millis(200);
+                let parent = parent(&frame, &outer, expiry);
+                let _hook = Hook;
+                TARGET.set(Some((phase, 0, panic)));
+                let held = run(
+                    parent,
+                    Bytes::from(compressed.clone()),
+                    raw.len(),
+                    decompression_policy(),
+                );
+                assert!(OBSERVED.get(), "actual phase was entered: {phase}");
+                assert!(!held.accepted());
+                assert_eq!(held.panic.is_some(), panic);
+                assert_eq!(held.parent.original_expiry(), expiry);
+                assert_eq!(held.parent.index(), Some(&frame.index));
+                assert_eq!(held.child.input(), compressed);
+                assert!(!held.child.initialized_output().is_empty());
+                assert_eq!(
+                    held.child.has_native_context(),
+                    phase != "decompression-output"
+                );
+                if phase == "decompression-step" || phase == "structural-child-result" {
+                    assert!(held.child.stream_calls() > 0);
+                }
+                if phase == "structural-child-result" {
+                    assert!(held.actual.as_ref().is_some_and(|r| r.is_ok()));
+                    assert_eq!(held.child.output_prefix(), raw);
+                    assert_eq!(held.child.last_stream_result(), Some(&Ok(0)));
+                } else if panic {
+                    assert!(held.actual.is_none());
+                } else {
+                    assert!(held.actual.as_ref().is_some_and(|r| r.is_err()));
+                }
+                if !panic {
+                    assert!(held.post.as_ref().is_some_and(|r| r.is_err()));
+                }
+                assert!(held.parent.parent_timestamps().has_native_file());
+                assert!(held.parent.parent_timestamps().has_end_source());
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_stream_exact_and_one_less_original_caps_and_call_ceiling() {
+        let frame = actual_recovery_index_frame();
+        let outer = zstd::bulk::compress(&frame.structural, 1).expect("actual outer producer");
+        let (raw, compressed) = payload();
+        let directory = Directory::new();
+        let path = directory.0.join("same-scoped-native-source.zst");
+        fs::write(&path, &outer).expect("same real source before original ledger admission");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let replay = |bytes, work, child_limits| {
+            let mut limits = recovery_decompression_budget_limits();
+            limits.max_retained_bytes = bytes;
+            limits.max_work_bytes = work;
+            let mut original = crate::TelemetryRecoveryBudget::new(limits, expiry)
+                .expect("independent original ledger before same fixed physical setup");
+            let input = Bytes::from(
+                original
+                    .read_file(&path)
+                    .expect("same actual physical read"),
+            );
+            let parent = crate::decompress_recovered_log_frame_until(
+                input,
+                frame.structural.len(),
+                96,
+                recovery_decompression_policy(),
+                original,
+            )
+            .expect("same actual outer native")
+            .prepare_sections_until(structural_section_limits())
+            .expect("same sections")
+            .prepare_offsets_until(structural_offset_limits())
+            .expect("same offsets")
+            .prepare_timestamps_until(structural_timestamp_limits())
+            .expect("same actual Pco")
+            .prepare_index_until(structural_index_limits())
+            .expect("same real index parent");
+            let prior = parent.recovery_usage();
+            (
+                prior,
+                run(
+                    parent,
+                    Bytes::from(compressed.clone()),
+                    raw.len(),
+                    child_limits,
+                ),
+            )
+        };
+        let ample = recovery_decompression_budget_limits();
+        let (prior, observed) = replay(
+            ample.max_retained_bytes,
+            ample.max_work_bytes,
+            decompression_policy(),
+        );
+        assert!(observed.accepted());
+        let cumulative = observed.parent.recovery_usage();
+        let calls = observed.child.stream_calls();
+        let local = observed.child.usage();
+        assert!(calls > 1);
+        drop(observed);
+        let (same_prior, exact) = replay(
+            cumulative.retained_bytes,
+            cumulative.work_bytes,
+            decompression_policy(),
+        );
+        assert_eq!(same_prior, prior);
+        assert!(exact.accepted());
+        assert_eq!(exact.parent.recovery_usage(), cumulative);
+        assert_eq!(exact.child.output_prefix(), raw);
+        drop(exact);
+        for (bytes, work) in [
+            (cumulative.retained_bytes - 1, cumulative.work_bytes),
+            (cumulative.retained_bytes, cumulative.work_bytes - 1),
+        ] {
+            let (same_prior, refused) = replay(bytes, work, decompression_policy());
+            assert_eq!(same_prior, prior);
+            assert!(!refused.accepted() && refused.panic.is_none());
+            assert!(matches!(
+                refused.actual.as_ref(),
+                Some(Err(StreamFailure::Refused(
+                    crate::TelemetryRecoveryError::Limits
+                )))
+            ));
+            assert_eq!(refused.parent.original_expiry(), expiry);
+            assert_eq!(refused.parent.index(), Some(&frame.index));
+            assert_eq!(refused.child.input(), compressed);
+            assert!(!refused.child.initialized_output().is_empty());
+            if bytes < cumulative.retained_bytes {
+                assert!(!refused.child.creation_entered());
+                assert!(!refused.child.has_native_context());
+                assert_eq!(refused.child.stream_calls(), 0);
+                assert!(refused.child.init_result().is_none());
+            } else {
+                assert!(refused.child.has_native_context());
+                assert!(refused.child.stream_calls() > 0);
+                assert!(!refused.child.output_prefix().is_empty());
+            }
+        }
+        let mut exact_calls = decompression_policy();
+        exact_calls.max_stream_calls = calls;
+        let (_, exact) = replay(ample.max_retained_bytes, ample.max_work_bytes, exact_calls);
+        assert!(exact.accepted());
+        assert_eq!(exact.child.stream_calls(), calls);
+        drop(exact);
+        exact_calls.max_stream_calls -= 1;
+        let (_, short) = replay(ample.max_retained_bytes, ample.max_work_bytes, exact_calls);
+        assert!(!short.accepted());
+        assert_eq!(short.child.stream_calls(), calls - 1);
+        assert!(short.child.has_native_context());
+        assert!(!short.child.output_prefix().is_empty());
+        let mut short_work = decompression_policy();
+        short_work.max_work_bytes = local.2 - 1;
+        let (_, short) = replay(ample.max_retained_bytes, ample.max_work_bytes, short_work);
+        assert!(!short.accepted());
+        assert!(matches!(
+            short.actual.as_ref(),
+            Some(Err(StreamFailure::Limits))
+        ));
+        assert!(short.child.has_native_context());
+        assert!(!short.child.output_prefix().is_empty());
+    }
+}
