@@ -197,3 +197,158 @@ fn assert_isolated_log_correlations(store: &DurableTelemetryStore, queries: &[Co
         }
     }
 }
+
+#[test]
+fn durable_trace_correlations_require_the_third_identity_before_limit_and_after_restart() {
+    use opentelemetry_proto::tonic::{
+        collector::trace::v1::ExportTraceServiceRequest,
+        common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
+        trace::v1::{ResourceSpans, ScopeSpans, Span},
+    };
+    use prost::Message;
+
+    let directory = std::env::temp_dir().join(format!(
+        "shard-telemetry-three-key-correlations-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let config = DurableTelemetryConfig {
+        data_directory: directory.clone(),
+        object_store_directory: None,
+        s3_object_store: None,
+        recovery_journal: true,
+        retention: None,
+        shard_count: 1,
+        tenant_partitions: 1,
+        append_linger: Duration::ZERO,
+        stripe: StripeConfig::default(),
+        indexed_ack_timeout: Duration::from_secs(30),
+    };
+    let limits = DurableTelemetryLimits {
+        append_submission_threads: Some(1),
+        durable_sink_threads: Some(1),
+        ..DurableTelemetryLimits::default()
+    };
+    let store = DurableTelemetryStore::open_with_local_limits(config.clone(), limits.clone())
+        .expect("actual store");
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: ["wrong", "wanted", "wanted"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, scope)| ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: scope.to_owned(),
+                        ..Default::default()
+                    }),
+                    spans: vec![Span {
+                        trace_id: vec![1; 16],
+                        span_id: vec![u8::try_from(index + 1).expect("span ID"); 8],
+                        name: format!("span-{index}"),
+                        start_time_unix_nano: 10,
+                        end_time_unix_nano: 20,
+                        attributes: vec![KeyValue {
+                            key: "required".to_owned(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("yes".to_owned())),
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }],
+    };
+    store
+        .append_trace_events(
+            crate::OtlpTelemetryDecoder
+                .decode_traces("tenant-a", &request.encode_to_vec())
+                .expect("validated trace events"),
+            true,
+        )
+        .expect("actual indexed append");
+    let spans = store
+        .query_traces(&crate::TraceQuery {
+            tenant: Arc::from("tenant-a"),
+            limit: 10,
+            ..Default::default()
+        })
+        .expect("actual span coordinates");
+    assert_eq!(spans.len(), 3);
+    let wanted = spans
+        .iter()
+        .find(|span| span.name.as_ref() == "span-1")
+        .expect("wanted span");
+    let absent_scope = ScopeContext {
+        name: Arc::from("absent"),
+        ..Default::default()
+    };
+    let required =
+        crate::TelemetryAttribute::new("required", crate::TelemetryValue::String(Arc::from("yes")));
+    let missing = crate::TelemetryAttribute::new(
+        "required",
+        crate::TelemetryValue::String(Arc::from("missing")),
+    );
+    let two = CorrelationQuery::new("tenant-a")
+        .with_trace_id(wanted.trace_id)
+        .with_resource_id(wanted.resource_id())
+        .for_signal(TelemetrySignal::Traces);
+    let three = two.clone().with_scope_id(wanted.scope_id());
+    let mut expected = spans
+        .iter()
+        .filter(|span| span.scope_id() == wanted.scope_id())
+        .map(|span| span.record_ref)
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(expected.len(), 2);
+    let assert_conjunction = |store: &DurableTelemetryStore| {
+        for query in [three.clone(), three.clone().with_attribute(&required)] {
+            assert_eq!(
+                store.query_correlations(&query).expect("all matches"),
+                expected
+            );
+            let first = query.clone().with_limit(1);
+            assert_eq!(
+                store.query_correlations(&first).expect("first page"),
+                vec![expected[0]]
+            );
+            assert_eq!(
+                store
+                    .query_correlations(&first.after(expected[0]))
+                    .expect("second page"),
+                vec![expected[1]]
+            );
+            assert!(
+                store
+                    .query_correlations(&query.with_scope_id(absent_scope.id()))
+                    .expect("missing third identity")
+                    .is_empty()
+            );
+        }
+        assert!(
+            store
+                .query_correlations(&two.clone().with_attribute(&missing))
+                .expect("missing third attribute")
+                .is_empty()
+        );
+        assert!(
+            store
+                .query_correlations(&three.clone().with_attribute(&missing))
+                .expect("missing fourth attribute")
+                .is_empty()
+        );
+    };
+    assert_conjunction(&store);
+    drop(store);
+    let recovered = DurableTelemetryStore::open_with_local_limits(config, limits)
+        .expect("actual journal-backed restart");
+    assert_conjunction(&recovered);
+    drop(recovered);
+    fs::remove_dir_all(directory).expect("remove fixture");
+}
