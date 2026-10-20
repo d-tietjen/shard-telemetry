@@ -214,3 +214,56 @@ Normal canonical formatting, strict Clippy, native/retained regression, release,
 actual carrier/layout and production-frame gates apply. This byte stage supplies
 no std String-format allocation proof, typed-row visitor, service/host/HA or
 release-gate acceptance.
+
+
+## Retained typed packed metadata
+
+`PreparedRecoveredStructuralMetadataBytes::prepare_packed_metadata_until` consumes
+that complete parent into one schema-typed packed-metadata arena. The original
+recovery ledger and expiry remain shared across setup, both native streams,
+sections, offsets, timestamps, index and this typed parse. Successful owners can
+consume the same spent ledger into another actual frame. Refused owners retain
+partial arena drafts, actual callback values/ranges captured before admission,
+actual MessagePack/UTF8/reservation outcomes, the original
+refusal, caught unwind and all complete native parents; they expose no retry or
+mutable work/context extractor.
+
+The arena contains scalar values, ordered links and ranges into the retained
+raw backing. It covers the six packed tables, fourteen row fields and all nine
+`TelemetryValue` variants without constructing additional Arc-backed models.
+Bytes encoded as scalar arrays retain each decoded byte; they are not mistaken
+for a contiguous source payload. Named/map structs, unsigned numeric identifiers,
+missing optional map fields, ignored fields and the ordinary fixed-ID array/BIN
+distinction follow the same borrowed RMP parser. Fixed IDs read exactly sixteen
+or eight elements: the parser rejects excess actual-array elements but permits
+excess BIN bytes as its ordinary derived path does. The complete raw first-value
+tail remains retained; there is no invented consumed-byte cursor or parser retry.
+Dictionary references, conflicting ID-source validation, template/body/field
+reconstruction and final typed log rows remain later operations.
+
+Traversal limits bound input, authoritative records, nodes, recursion, callbacks,
+allocation requests/slots and explicit work. Every active draft is owned before
+a fallible child. A distinct delivered-input observation is stored in its already
+admitted node before callback fees, expiry checks or shape/range validation; it
+is never labeled an accepted typed value. Actual scalar/range/capture slots are
+prepaid before the deserializer invocation. The source frame tables include
+their own actual storage, and actual bridge closure values are measured before
+the child's complete framing admission. Actual `try_reserve_exact` results and returned-capacity excess
+remain retained on refusal. A single preadmitted static `&str` error conversion
+stops a visitor refusal; no default Serde formatting, derived leaf decoder or
+native enum adapter runs inside this path. UTF8 work is admitted before the
+borrowed parser can scan strings. The closed private adapter graph distinguishes
+the binary RMP deserializer from its BIN-element scalar adapter on each actual
+seed entry; this is not a general claim about arbitrary Serde deserializers.
+The original parser's default depth ceiling is preserved in addition to the
+child's finite seed-depth limit.
+
+An absent metadata lane enters no MessagePack parser and does not validate
+unused parser ceilings; original-expiry checks and complete continuation framing
+still apply. A present malformed or zero-length lane is not treated as absent.
+These source/configuration-specific request and copy fees are not allocator RSS,
+portable ABI, total CPU-time or process-stack limits. Unwind retention does not
+apply to process abort. Canonical CONTRIBUTING gates and actual normal profile
+qualification remain required for source changes. This arena grants no query,
+HA, serving, atomic-append or release authority, and does not complete the owned
+service/product attachment or a whole configured partition traversal.

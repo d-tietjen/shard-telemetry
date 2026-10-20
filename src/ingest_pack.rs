@@ -14,6 +14,8 @@ mod recovery_metadata;
 #[cfg(unix)]
 mod recovery_offsets;
 #[cfg(unix)]
+mod recovery_packed_metadata;
+#[cfg(unix)]
 mod recovery_sections;
 #[cfg(unix)]
 mod recovery_timestamps;
@@ -40,6 +42,13 @@ pub use recovery_metadata::{
 pub use recovery_offsets::{
     PreparedRecoveredStructuralOffsets, RecoveredStructuralOffsetLimits,
     RecoveredStructuralOffsetUsage, RetainedRecoveredStructuralOffsetError,
+};
+#[cfg(unix)]
+pub use recovery_packed_metadata::{
+    PreparedRecoveredPackedMetadata, RecoveredPackedInput, RecoveredPackedMetadataLimits,
+    RecoveredPackedMetadataUsage, RecoveredPackedNode, RecoveredPackedNodeKind,
+    RecoveredPackedRecord, RecoveredPackedRejection, RecoveredPackedValue,
+    RetainedRecoveredPackedMetadataError,
 };
 #[cfg(unix)]
 pub use recovery_sections::{

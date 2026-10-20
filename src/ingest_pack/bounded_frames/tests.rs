@@ -4319,3 +4319,1232 @@ mod metadata_bytes {
         }
     }
 }
+
+mod packed_metadata {
+    use super::*;
+    use crate::{
+        RecoveredPackedInput as I, RecoveredPackedNodeKind as K, RecoveredPackedRecord as R,
+        RecoveredPackedValue as V,
+    };
+    use serde::ser::{SerializeMap, SerializeSeq};
+    use serde::{Serialize, Serializer};
+    use std::result::Result;
+    const COUNT: u32 = 12;
+    fn limits() -> crate::RecoveredPackedMetadataLimits {
+        crate::RecoveredPackedMetadataLimits {
+            max_input_bytes: 1 << 20,
+            max_records: 1 << 16,
+            max_nodes: 1 << 18,
+            max_depth: 128,
+            max_callbacks: 1 << 20,
+            max_output_bytes: 1 << 26,
+            max_slots: 1 << 22,
+            max_work_bytes: 1 << 27,
+        }
+    }
+    fn frame(typed: bool) -> crate::IndexedStructuralBlock {
+        let mut records = actual_timestamp_records(
+            &(0..u64::from(COUNT))
+                .map(|i| 10_000 + i)
+                .collect::<Vec<_>>(),
+        );
+        let attributes = Arc::new(vec![
+            crate::TelemetryAttribute {
+                key: Arc::from("duplicate"),
+                key_strindex: -2,
+                value: None,
+            },
+            crate::TelemetryAttribute::new("duplicate", crate::TelemetryValue::Empty),
+        ]);
+        let values = vec![
+            crate::TelemetryValue::Empty,
+            crate::TelemetryValue::String(Arc::from("typed real text")),
+            crate::TelemetryValue::Boolean(true),
+            crate::TelemetryValue::Integer(i64::MIN),
+            crate::TelemetryValue::DoubleBits(0x7ff8_0000_0000_0042),
+            crate::TelemetryValue::Bytes(Arc::from([0, 127, 128, 255])),
+            crate::TelemetryValue::Array(Arc::new(vec![
+                crate::TelemetryValue::Integer(-7),
+                crate::TelemetryValue::String(Arc::from("nested")),
+            ])),
+            crate::TelemetryValue::Map(Arc::clone(&attributes)),
+            crate::TelemetryValue::StringTableIndex(i32::MIN),
+        ];
+        for (i, record) in records.iter_mut().enumerate() {
+            if typed {
+                record.body = Some(values[i % values.len()].clone());
+                record.attributes = Arc::clone(&attributes);
+                record.resource = Arc::new(crate::ResourceContext {
+                    attributes: Arc::clone(&attributes),
+                    dropped_attributes_count: 7,
+                    schema_url: Arc::from("resource schema"),
+                    entity_refs: Arc::new(vec![crate::TelemetryEntityRef {
+                        schema_url: Arc::from("entity schema"),
+                        entity_type: Arc::from("worker"),
+                        id_keys: Arc::new(vec![Arc::from("id")]),
+                        description_keys: Arc::new(vec![Arc::from("description")]),
+                    }]),
+                });
+                record.scope = Arc::new(crate::ScopeContext {
+                    name: Arc::from("scope"),
+                    version: Arc::from("v1"),
+                    attributes: Arc::clone(&attributes),
+                    dropped_attributes_count: 11,
+                    schema_url: Arc::from("scope schema"),
+                });
+                record.observed_timestamp_unix_nanos = record.timestamp_unix_nanos.wrapping_sub(2);
+                record.severity_number = -1;
+                record.severity_text = Arc::from("severity");
+                record.flags = u32::MAX;
+                record.dropped_attributes_count = 17;
+                record.trace_id = Some(crate::TraceId::from_bytes([1; 16]).expect("real ID"));
+                record.span_id = Some(crate::SpanId::from_bytes([2; 8]).expect("real ID"));
+                record.event_name = Arc::from("real.typed.event");
+            } else {
+                record.observed_timestamp_unix_nanos = 0;
+                record.body = None;
+                record.attributes = Arc::default();
+                record.resource = Arc::default();
+                record.scope = Arc::default();
+                record.severity_number = 0;
+                record.severity_text = Arc::default();
+                record.dropped_attributes_count = 0;
+                record.flags = 0;
+                record.trace_id = None;
+                record.span_id = None;
+                record.event_name = Arc::default();
+            }
+        }
+        crate::encode_indexed_structural_records(&records)
+            .expect("real complete structural producer")
+    }
+    fn parent(
+        source: &[u8],
+        outer: &[u8],
+        expiry: Instant,
+    ) -> crate::PreparedRecoveredStructuralMetadataBytes {
+        actual_recovery_index_parent(source, outer, COUNT, expiry)
+            .prepare_index_until(structural_index_limits())
+            .expect("real index")
+            .prepare_metadata_bytes_until(recovery_decompression_policy())
+            .expect("real second native metadata decoder")
+    }
+    fn lane(source: &[u8]) -> Vec<u8> {
+        let outer = zstd::bulk::compress(source, 1).expect("real codec");
+        actual_offset_sections(
+            &outer,
+            source.len(),
+            COUNT,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .section_bytes(crate::RecoveredStructuralSection::TypedMetadata)
+        .expect("real section")
+        .to_vec()
+    }
+    fn with_raw(frame: &crate::IndexedStructuralBlock, raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let outer = zstd::bulk::compress(&frame.structural, 1).expect("real codec");
+        let sections = actual_offset_sections(
+            &outer,
+            frame.structural.len(),
+            COUNT,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let mut metadata = u32::try_from(raw.len())
+            .expect("finite fixture")
+            .to_le_bytes()
+            .to_vec();
+        metadata
+            .extend_from_slice(&zstd::bulk::compress(raw, 1).expect("actual metadata producer"));
+        let mut source = crate::structural::STRUCTURAL_BLOCK_MAGIC.to_vec();
+        append_section_extent(&mut source, COUNT as usize);
+        for kind in STRUCTURAL_SECTION_KINDS {
+            let bytes = if kind == crate::RecoveredStructuralSection::TypedMetadata {
+                metadata.as_slice()
+            } else {
+                sections.section_bytes(kind).expect("same original section")
+            };
+            append_section_extent(&mut source, bytes.len());
+            source.extend_from_slice(bytes);
+        }
+        let outer = zstd::bulk::compress(&source, 1).expect("real complete framed input");
+        (source, outer)
+    }
+    #[allow(
+        clippy::result_large_err,
+        reason = "test oracle keeps the actual complete inline native/parser error owner"
+    )]
+    fn run(
+        frame: &crate::IndexedStructuralBlock,
+        raw: &[u8],
+    ) -> Result<crate::PreparedRecoveredPackedMetadata, crate::RetainedRecoveredPackedMetadataError>
+    {
+        let (source, outer) = with_raw(frame, raw);
+        parent(&source, &outer, Instant::now() + Duration::from_secs(30))
+            .prepare_packed_metadata_until(limits())
+    }
+    // Serialize ONLY the typed arena's public immutable views. Compare these
+    // complete canonical bytes with the actual ordinary derived Packed value.
+    fn field(
+        view: &crate::PreparedRecoveredPackedMetadata,
+        parent: usize,
+        wanted: usize,
+    ) -> Option<usize> {
+        let mut next = view.nodes().get(parent)?.first_child();
+        while let Some(index) = next {
+            let node = view.nodes().get(index)?;
+            if node.field() == Some(wanted) {
+                return Some(index);
+            }
+            next = node.next_sibling();
+        }
+        None
+    }
+    struct View<'a>(&'a crate::PreparedRecoveredPackedMetadata, usize);
+    impl Serialize for View<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            let node = &self.0.nodes()[self.1];
+            match node.kind() {
+                K::Nil | K::Optional(false) => s.serialize_none(),
+                K::Optional(true) => {
+                    View(self.0, field(self.0, self.1, 0).expect("actual child")).serialize(s)
+                }
+                K::Boolean(v) => s.serialize_bool(*v),
+                K::Signed(v) => s.serialize_i64(*v),
+                K::Unsigned(v) => s.serialize_u64(*v),
+                K::Text(range) => s.serialize_str(
+                    std::str::from_utf8(self.0.source_bytes(range.clone()).expect("same backing"))
+                        .expect("validated text"),
+                ),
+                K::Sequence => {
+                    let mut seq = s.serialize_seq(None)?;
+                    let mut next = node.first_child();
+                    while let Some(index) = next {
+                        seq.serialize_element(&View(self.0, index))?;
+                        next = self.0.nodes()[index].next_sibling();
+                    }
+                    seq.end()
+                }
+                K::Record(record) => {
+                    let n = match record {
+                        R::Metadata => 6,
+                        R::Row => 14,
+                        R::Attribute => 3,
+                        R::Resource => 4,
+                        R::Scope => 5,
+                        R::Entity => 4,
+                    };
+                    let mut seq = s.serialize_seq(Some(n))?;
+                    for ordinal in 0..n {
+                        if let Some(index) = field(self.0, self.1, ordinal) {
+                            seq.serialize_element(&View(self.0, index))?;
+                        } else {
+                            seq.serialize_element(&Option::<()>::None)?;
+                        }
+                    }
+                    seq.end()
+                }
+                K::Value(tag) => {
+                    let (index, name) = match tag {
+                        V::Empty => (0, "Empty"),
+                        V::String => (1, "String"),
+                        V::Boolean => (2, "Boolean"),
+                        V::Integer => (3, "Integer"),
+                        V::DoubleBits => (4, "DoubleBits"),
+                        V::Bytes => (5, "Bytes"),
+                        V::Array => (6, "Array"),
+                        V::Map => (7, "Map"),
+                        V::StringTableIndex => (8, "StringTableIndex"),
+                    };
+                    if *tag == V::Empty {
+                        s.serialize_unit_variant("TelemetryValue", index, name)
+                    } else {
+                        s.serialize_newtype_variant(
+                            "TelemetryValue",
+                            index,
+                            name,
+                            &View(self.0, field(self.0, self.1, 0).expect("actual payload")),
+                        )
+                    }
+                }
+                other => panic!("unexpected accepted canonical node {other:?}"),
+            }
+        }
+    }
+    fn parity(actual: &crate::PreparedRecoveredPackedMetadata, raw: &[u8]) {
+        let ordinary: crate::structural::PackedLogMetadata =
+            rmp_serde::from_slice(raw).expect("actual ordinary typed decoder");
+        assert_eq!(
+            rmp_serde::to_vec(&View(actual, 0)).expect("actual arena views"),
+            rmp_serde::to_vec(&ordinary).expect("actual ordinary value")
+        );
+        assert_eq!(actual.parser_result().map(|r| r.is_ok()), Some(true));
+        assert_eq!(actual.usage().syntax_calls, 0);
+    }
+    #[derive(Clone)]
+    enum Wire {
+        Nil,
+        Bool(bool),
+        U(u64),
+        I(i64),
+        F32(f32),
+        F64(f64),
+        Text(&'static str),
+        Bin(Vec<u8>),
+        Seq(Vec<Wire>),
+        Map(Vec<(Wire, Wire)>),
+    }
+    impl Serialize for Wire {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            match self {
+                Self::Nil => s.serialize_none(),
+                Self::Bool(v) => s.serialize_bool(*v),
+                Self::U(v) => s.serialize_u64(*v),
+                Self::I(v) => s.serialize_i64(*v),
+                Self::F32(v) => s.serialize_f32(*v),
+                Self::F64(v) => s.serialize_f64(*v),
+                Self::Text(v) => s.serialize_str(v),
+                Self::Bin(v) => s.serialize_bytes(v),
+                Self::Seq(v) => {
+                    let mut seq = s.serialize_seq(Some(v.len()))?;
+                    for v in v {
+                        seq.serialize_element(v)?;
+                    }
+                    seq.end()
+                }
+                Self::Map(v) => {
+                    let mut map = s.serialize_map(Some(v.len()))?;
+                    for (k, v) in v {
+                        map.serialize_entry(k, v)?;
+                    }
+                    map.end()
+                }
+            }
+        }
+    }
+    fn row(trace: Wire, span: Wire) -> Wire {
+        Wire::Seq(vec![
+            Wire::I(-1),
+            Wire::U(0),
+            Wire::U(0),
+            Wire::U(0),
+            Wire::U(0),
+            Wire::I(i64::from(i32::MIN)),
+            Wire::U(0),
+            Wire::U(u64::from(u32::MAX)),
+            Wire::U(0),
+            trace,
+            Wire::Bool(false),
+            span,
+            Wire::Bool(false),
+            Wire::U(0),
+        ])
+    }
+    fn packed(body: Wire, first: Wire) -> Wire {
+        let mut rows = vec![Wire::Nil; COUNT as usize];
+        rows[0] = first;
+        Wire::Seq(vec![
+            body,
+            Wire::Seq(vec![]),
+            Wire::Seq(vec![]),
+            Wire::Seq(vec![]),
+            Wire::Seq(vec![]),
+            Wire::Seq(rows),
+        ])
+    }
+    fn raw(wire: &Wire) -> Vec<u8> {
+        rmp_serde::to_vec(wire).expect("real Serde/RMP producer")
+    }
+    fn original_limits(error: &(dyn std::error::Error + 'static)) -> bool {
+        let mut next = Some(error);
+        while let Some(error) = next {
+            if matches!(
+                error.downcast_ref::<crate::TelemetryRecoveryError>(),
+                Some(crate::TelemetryRecoveryError::Limits)
+            ) {
+                return true;
+            }
+            next = error.source();
+        }
+        false
+    }
+
+    #[test]
+    fn packed_metadata_real_producer_full_typed_arena_and_same_spent_continuation() {
+        let frame = frame(true);
+        let metadata = lane(&frame.structural);
+        let n = u32::from_le_bytes(metadata[..4].try_into().expect("real header")) as usize;
+        let raw = zstd::bulk::decompress(&metadata[4..], n).expect("ordinary byte oracle");
+        let outer = zstd::bulk::compress(&frame.structural, 1).expect("real codec");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let bytes = parent(&frame.structural, &outer, expiry);
+        let pointer = bytes.raw_bytes().expect("actual output").as_ptr();
+        let before = bytes.recovery_usage();
+        let held = bytes
+            .prepare_packed_metadata_until(limits())
+            .expect("actual production typed method");
+        parity(&held, &raw);
+        assert_eq!(held.raw_bytes().expect("retained output").as_ptr(), pointer);
+        assert_eq!(held.original_expiry(), expiry);
+        assert!(held.parent_metadata().has_native_context());
+        assert!(
+            held.parent_metadata()
+                .parent_index()
+                .parent_timestamps()
+                .has_end_source()
+        );
+        assert!(held.recovery_usage().work_bytes > before.work_bytes);
+        assert_eq!(held.recovery_usage().records, before.records);
+        assert_eq!(held.recovery_usage().json_values, before.json_values);
+        assert!(held.nodes().iter().all(|n| n.returned_ok() == Some(true)));
+        assert!(held.nodes().iter().all(|n| n.delivered().is_some()));
+        assert!(!held.has_owned_callback());
+        for tag in [
+            V::Empty,
+            V::String,
+            V::Boolean,
+            V::Integer,
+            V::DoubleBits,
+            V::Bytes,
+            V::Array,
+            V::Map,
+            V::StringTableIndex,
+        ] {
+            assert!(
+                held.nodes().iter().any(|n| n.kind() == &K::Value(tag)),
+                "actual producer variant {tag:?}"
+            );
+        }
+        let nodes = held.nodes();
+        for actual in [
+            I::Signed(i128::from(i64::MIN)),
+            I::Unsigned(255),
+            I::Unsigned(0x7ff8_0000_0000_0042),
+            I::Boolean(true),
+        ] {
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.delivered() == Some(&actual)
+                        && node.returned_ok() == Some(true))
+            );
+        }
+        let text = nodes.iter().find(|node| {
+            matches!(node.kind(), K::Text(_))
+                && held.source_bytes(node.captured_input().expect("actual text capture"))
+                    == Some(&b"typed real text"[..])
+        });
+        assert!(
+            text.is_some(),
+            "successful actual borrowed text retains its source bytes"
+        );
+        assert!(nodes.iter().any(|n| matches!(n.kind(), K::Unsigned(255))));
+        assert!(
+            nodes
+                .iter()
+                .any(|n| matches!(n.kind(), K::Signed(i64::MIN)))
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|n| matches!(n.kind(), K::Unsigned(0x7ff8_0000_0000_0042)))
+        );
+        let spent = held.recovery_usage();
+        let next = held
+            .decompress_next_until(
+                Bytes::from(outer),
+                frame.structural.len(),
+                COUNT,
+                recovery_decompression_policy(),
+            )
+            .expect("same original work enters next real frame");
+        assert_eq!(next.original_expiry(), expiry);
+        assert!(next.recovery_usage().work_bytes > spent.work_bytes);
+    }
+    #[test]
+    fn packed_metadata_named_numeric_binary_and_fixed_id_domains_match_ordinary() {
+        let frame = frame(true);
+        let base = packed(
+            Wire::Seq(vec![
+                Wire::U(0),
+                Wire::Map(vec![(Wire::U(1), Wire::Bin(b"valid BIN text".to_vec()))]),
+            ]),
+            row(Wire::Bin(vec![0; 17]), Wire::Bin(vec![0; 9])),
+        );
+        let bytes = raw(&base);
+        let accepted = run(&frame, &bytes).expect("actual numeric enum and excess BIN IDs");
+        parity(&accepted, &bytes);
+        let binary_text = accepted
+            .nodes()
+            .iter()
+            .find(|node| {
+                matches!(node.kind(), K::Text(_))
+                    && matches!(node.delivered(), Some(I::Borrowed { text: false, .. }))
+            })
+            .expect("actual BIN text callback");
+        assert_eq!(
+            accepted.source_bytes(binary_text.captured_input().expect("real BIN range")),
+            Some(&b"valid BIN text"[..])
+        );
+        assert_eq!(binary_text.returned_ok(), Some(true));
+        let ordinary: crate::structural::PackedLogMetadata =
+            rmp_serde::from_slice(&bytes).expect("actual ordinary");
+        let named = rmp_serde::to_vec_named(&ordinary).expect("actual named producer");
+        parity(&run(&frame, &named).expect("real named structs"), &named);
+        if let Wire::Seq(values) = base {
+            let numeric = Wire::Map(
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| (Wire::U(i as u64), v))
+                    .collect(),
+            );
+            let bytes = raw(&numeric);
+            parity(
+                &run(&frame, &bytes).expect("numeric field identifiers"),
+                &bytes,
+            );
+        }
+        for wire in [
+            packed(Wire::Bin(vec![0]), Wire::Nil),
+            packed(
+                Wire::Seq(vec![]),
+                row(Wire::Seq(vec![Wire::U(0); 17]), Wire::Nil),
+            ),
+            packed(
+                Wire::Seq(vec![]),
+                row(Wire::Nil, Wire::Seq(vec![Wire::U(0); 9])),
+            ),
+            packed(Wire::Seq(vec![]), row(Wire::Bin(vec![0; 15]), Wire::Nil)),
+        ] {
+            let bytes = raw(&wire);
+            assert!(rmp_serde::from_slice::<crate::structural::PackedLogMetadata>(&bytes).is_err());
+            let error =
+                run(&frame, &bytes).expect_err("actual ordinary invalid shape remains rejected");
+            assert!(error.parser_result().is_some_and(|r| r.is_err()));
+            assert!(error.usage().syntax_calls <= 1);
+        }
+        let minimal = packed(Wire::Seq(vec![]), Wire::Nil);
+        let Wire::Seq(fields) = minimal else {
+            panic!("fixed fixture")
+        };
+        let mut map = fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (Wire::U(i as u64), v))
+            .collect::<Vec<_>>();
+        map.push((
+            Wire::Bin(vec![255]),
+            Wire::Map(vec![(
+                Wire::U(1),
+                Wire::Seq(vec![Wire::Bool(true), Wire::Nil]),
+            )]),
+        ));
+        let bytes = raw(&Wire::Map(map));
+        parity(
+            &run(&frame, &bytes).expect("unknown invalid UTF8 BIN field ignored as ordinary"),
+            &bytes,
+        );
+        let Wire::Seq(row_fields) = row(Wire::Nil, Wire::Nil) else {
+            panic!("fixed row fixture")
+        };
+        let row_without_options = Wire::Map(
+            row_fields
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 9 && *i != 11)
+                .map(|(i, v)| (Wire::U(i as u64), v))
+                .collect(),
+        );
+        let absent_value_attribute = Wire::Map(vec![
+            (Wire::U(0), Wire::Text("key")),
+            (Wire::U(1), Wire::I(-7)),
+        ]);
+        let value = Wire::Map(vec![(
+            Wire::Text("Map"),
+            Wire::Seq(vec![absent_value_attribute]),
+        )]);
+        let bytes = raw(&packed(Wire::Seq(vec![value]), row_without_options));
+        parity(
+            &run(&frame, &bytes).expect("ordinary missing Option fields in named maps"),
+            &bytes,
+        );
+        let Wire::Seq(fields) = packed(Wire::Seq(vec![]), Wire::Nil) else {
+            panic!("fixed fixture")
+        };
+        let mut named = fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (Wire::U(i as u64), v))
+            .collect::<Vec<_>>();
+        named.push((Wire::Text("unknown key"), Wire::Text("extension value")));
+        let mut bytes = raw(&Wire::Map(named));
+        let key_at = bytes
+            .windows(b"unknown key".len())
+            .position(|v| v == b"unknown key")
+            .expect("actual key");
+        bytes[key_at] = 255;
+        parity(
+            &run(&frame, &bytes).expect("ordinary invalid STR unknown field fallback"),
+            &bytes,
+        );
+        let value_at = bytes
+            .windows(b"extension value".len())
+            .position(|v| v == b"extension value")
+            .expect("actual ignored value");
+        bytes.splice(
+            value_at - 1..value_at + b"extension value".len(),
+            [0xd4, 7, 255],
+        );
+        let extension = run(&frame, &bytes)
+            .expect("actual borrowed Ext adapters occur only in charged unknown-field skip");
+        parity(&extension, &bytes);
+        assert!(
+            extension
+                .nodes()
+                .iter()
+                .any(|node| matches!(node.delivered(), Some(I::Map(Some(7)))))
+        );
+        assert!(
+            extension
+                .nodes()
+                .iter()
+                .any(|node| node.delivered() == Some(&I::Newtype)
+                    && node.returned_ok() == Some(true))
+        );
+        assert!(extension.nodes().iter().any(
+            |node| node.delivered() == Some(&I::Signed(7)) && node.returned_ok() == Some(true)
+        ));
+        let payload = extension
+            .nodes()
+            .iter()
+            .find(|node| {
+                matches!(
+                    node.delivered(),
+                    Some(I::Borrowed {
+                        len: 1,
+                        text: false,
+                        ..
+                    })
+                )
+            })
+            .expect("actual borrowed Ext payload");
+        assert_eq!(
+            extension.source_bytes(payload.captured_input().expect("real Ext payload range")),
+            Some(&[255][..])
+        );
+        let Wire::Seq(mut bad_row) = row(Wire::Nil, Wire::Nil) else {
+            panic!("actual row fixture")
+        };
+        bad_row[5] = Wire::U(u64::MAX);
+        let bytes = raw(&packed(Wire::Seq(vec![]), Wire::Seq(bad_row)));
+        let rejected = run(&frame, &bytes)
+            .expect_err("real wide scalar is delivered before numeric rejection");
+        assert!(rejected.nodes().iter().any(|node| node.delivered()
+            == Some(&I::Unsigned(u128::from(u64::MAX)))
+            && node.kind() == &K::Pending
+            && node.returned_ok() == Some(false)));
+        let bytes = raw(&packed(
+            Wire::Seq(vec![Wire::Map(vec![(Wire::Text("Boolean"), Wire::U(7))])]),
+            Wire::Nil,
+        ));
+        let rejected = run(&frame, &bytes).expect_err("real wrong-shape scalar survives rejection");
+        assert!(
+            rejected
+                .nodes()
+                .iter()
+                .any(|node| node.delivered() == Some(&I::Unsigned(7))
+                    && node.kind() == &K::Pending
+                    && node.returned_ok() == Some(false))
+        );
+        let bytes = raw(&packed(Wire::Bin(vec![0]), Wire::Nil));
+        let rejected =
+            run(&frame, &bytes).expect_err("real U8 adapter value is observed before enum refusal");
+        assert!(
+            rejected
+                .nodes()
+                .iter()
+                .any(|node| node.delivered() == Some(&I::Unsigned(0))
+                    && node.kind() == &K::Pending
+                    && node.returned_ok() == Some(false))
+        );
+    }
+    #[test]
+    fn packed_metadata_malformed_eof_utf8_and_first_value_tails_retain_actual_results() {
+        let frame = frame(true);
+        let valid = raw(&packed(
+            Wire::Seq(vec![Wire::Map(vec![(
+                Wire::Text("String"),
+                Wire::Text("unique scalar text"),
+            )])]),
+            Wire::Nil,
+        ));
+        let mut tail = valid.clone();
+        tail.extend_from_slice(&[0xc1, 0xff, 0x91, 0x01]);
+        let accepted = run(&frame, &tail).expect("ordinary first-value tail retained");
+        parity(&accepted, &tail);
+        assert_eq!(accepted.raw_bytes(), Some(tail.as_slice()));
+        for cut in 1..valid.len() {
+            let bytes = &valid[..cut];
+            assert!(rmp_serde::from_slice::<crate::structural::PackedLogMetadata>(bytes).is_err());
+            let error = run(&frame, bytes).expect_err("genuine EOF of actual accepted value");
+            assert!(error.parser_result().is_some_and(|r| r.is_err()));
+            assert_eq!(error.raw_bytes(), Some(bytes));
+            assert!(error.parent_metadata().has_native_context());
+            assert!(error.usage().syntax_calls <= 1);
+        }
+        let mut corrupt = valid.clone();
+        let at = corrupt
+            .windows(b"unique scalar text".len())
+            .position(|v| v == b"unique scalar text")
+            .expect("actual scalar");
+        corrupt[at] = 255;
+        let error = run(&frame, &corrupt).expect_err("actual native invalid STR UTF8");
+        assert!(matches!(
+            error.parser_result(),
+            Some(Err(rmp_serde::decode::Error::Utf8Error(_)))
+        ));
+        assert_eq!(error.usage().syntax_calls, 1);
+        let delivered = error
+            .nodes()
+            .iter()
+            .find(|node| node.captured_input().is_some_and(|r| r.contains(&at)))
+            .expect("actual rejected UTF8 delivery");
+        assert!(matches!(
+            delivered.delivered(),
+            Some(I::Borrowed {
+                len: 18,
+                text: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            error.source_bytes(delivered.captured_input().expect("actual corrupt range")),
+            Some(&corrupt[at..at + b"unique scalar text".len()])
+        );
+        assert_eq!(delivered.kind(), &K::Pending);
+        assert_eq!(delivered.returned_ok(), Some(false));
+        for bytes in [
+            vec![0xc1],
+            vec![0xdc],
+            vec![0xdc, 0],
+            vec![0x96, 0xdb, 0, 0, 0],
+            vec![0x96, 0xc4, 255],
+            vec![0x96, 0xd1, 0],
+            vec![0x96, 0xd9, 255],
+            vec![0x96, 0xde, 0],
+        ] {
+            let error = run(&frame, &bytes).expect_err("real marker/length/data refusal");
+            assert!(error.parser_result().is_some_and(|r| r.is_err()));
+            assert_eq!(error.raw_bytes(), Some(bytes.as_slice()));
+            assert!(error.usage().syntax_calls <= 1);
+            if bytes.len() <= 2 {
+                assert!(error.nodes().iter().all(|node| node.delivered().is_none()));
+            }
+        }
+    }
+    #[test]
+    fn packed_metadata_exact_and_one_less_original_cumulative_work_and_storage() {
+        let frame = frame(true);
+        let outer = zstd::bulk::compress(&frame.structural, 1).expect("real producer");
+        let directory = Directory::new();
+        let path = directory.0.join("same-typed-arena-parent.zst");
+        fs::write(&path, &outer).expect("same fixed physical setup");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let replay = |bytes, work| {
+            let mut cap = recovery_decompression_budget_limits();
+            cap.max_retained_bytes = bytes;
+            cap.max_work_bytes = work;
+            let mut original = crate::TelemetryRecoveryBudget::new(cap, expiry)
+                .expect("independent ORIGINAL before setup");
+            let input = Bytes::from(original.read_file(&path).expect("identical real read"));
+            let parent = crate::decompress_recovered_log_frame_until(
+                input,
+                frame.structural.len(),
+                COUNT,
+                recovery_decompression_policy(),
+                original,
+            )
+            .expect("real outer")
+            .prepare_sections_until(structural_section_limits())
+            .expect("sections")
+            .prepare_offsets_until(structural_offset_limits())
+            .expect("offsets")
+            .prepare_timestamps_until(structural_timestamp_limits())
+            .expect("actual Pco")
+            .prepare_index_until(structural_index_limits())
+            .expect("actual index")
+            .prepare_metadata_bytes_until(recovery_decompression_policy())
+            .expect("actual second native");
+            let first = parent
+                .prepare_packed_metadata_until(limits())
+                .expect("first full typed parse uses this original ledger");
+            let after_first = first.recovery_usage();
+            let parent = first
+                .decompress_next_until(
+                    Bytes::copy_from_slice(&outer),
+                    frame.structural.len(),
+                    COUNT,
+                    recovery_decompression_policy(),
+                )
+                .expect("same spent work enters second native frame")
+                .prepare_sections_until(structural_section_limits())
+                .expect("second real sections")
+                .prepare_offsets_until(structural_offset_limits())
+                .expect("second real offsets")
+                .prepare_timestamps_until(structural_timestamp_limits())
+                .expect("second real Pco")
+                .prepare_index_until(structural_index_limits())
+                .expect("second real index")
+                .prepare_metadata_bytes_until(recovery_decompression_policy())
+                .expect("second real metadata decoder");
+            let prior = parent.recovery_usage();
+            assert!(prior.work_bytes > after_first.work_bytes);
+            (prior, parent.prepare_packed_metadata_until(limits()))
+        };
+        let ample = recovery_decompression_budget_limits();
+        let (prior, observed) = replay(ample.max_retained_bytes, ample.max_work_bytes);
+        let observed = observed.expect("actual finite observation");
+        let total = observed.recovery_usage();
+        let nodes = observed.nodes().len();
+        let final_delivery = observed
+            .nodes()
+            .last()
+            .expect("actual last scalar")
+            .delivered()
+            .expect("actual delivered scalar")
+            .clone();
+        drop(observed);
+        let (same, exact) = replay(total.retained_bytes, total.work_bytes);
+        assert_eq!(same, prior);
+        let exact = exact.expect("exact actual cumulative original cap");
+        assert_eq!(exact.recovery_usage(), total);
+        assert_eq!(exact.nodes().len(), nodes);
+        drop(exact);
+        for (bytes, work) in [
+            (total.retained_bytes - 1, total.work_bytes),
+            (total.retained_bytes, total.work_bytes - 1),
+        ] {
+            let (same, limited) = replay(bytes, work);
+            assert_eq!(same, prior);
+            let error = limited.expect_err("one-less original cumulative parent cap refuses");
+            assert!(original_limits(&error));
+            assert_eq!(error.original_expiry(), expiry);
+            assert!(error.parent_metadata().has_native_context());
+            assert!(
+                error
+                    .parent_metadata()
+                    .parent_index()
+                    .parent_timestamps()
+                    .has_end_source()
+            );
+            assert!(error.usage().syntax_calls <= 1);
+            assert!(!error.nodes().is_empty());
+            if work < total.work_bytes {
+                let last = error
+                    .nodes()
+                    .last()
+                    .expect("actual scalar reached before parent-work refusal");
+                assert_eq!(last.delivered(), Some(&final_delivery));
+                assert_eq!(last.kind(), &K::Pending);
+            }
+        }
+    }
+    #[test]
+    fn packed_metadata_local_limits_refuse_before_next_actual_call_or_reserve() {
+        let frame = frame(true);
+        let outer = zstd::bulk::compress(&frame.structural, 1).expect("real producer");
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let observed = parent(&frame.structural, &outer, expiry)
+            .prepare_packed_metadata_until(limits())
+            .expect("actual local observation");
+        let usage = observed.usage();
+        let final_delivery = observed
+            .nodes()
+            .last()
+            .expect("actual final callback")
+            .delivered()
+            .expect("actual scalar")
+            .clone();
+        let mut exact = limits();
+        exact.max_output_bytes = usage.output_bytes;
+        exact.max_slots = usage.slots;
+        exact.max_work_bytes = usage.work_bytes;
+        exact.max_callbacks = usage.callbacks;
+        drop(observed);
+        let exact = parent(&frame.structural, &outer, expiry)
+            .prepare_packed_metadata_until(exact)
+            .expect("exact local actual fees");
+        assert_eq!(exact.usage(), usage);
+        drop(exact);
+        for axis in 0..7 {
+            let mut cap = limits();
+            match axis {
+                0 => cap.max_output_bytes = usage.output_bytes - 1,
+                1 => cap.max_work_bytes = usage.work_bytes - 1,
+                2 => cap.max_callbacks = usage.callbacks - 1,
+                3 => cap.max_nodes = 1,
+                4 => cap.max_depth = 1,
+                5 => cap.max_slots = usage.slots - 1,
+                6 => cap.max_records = COUNT as usize - 1,
+                _ => unreachable!(),
+            };
+            let error = parent(&frame.structural, &outer, expiry)
+                .prepare_packed_metadata_until(cap)
+                .expect_err("local finite boundary refuses");
+            assert!(error.usage().syntax_calls <= 1);
+            assert!(error.parent_metadata().has_native_context());
+            assert!(!error.nodes().is_empty() || error.usage().seed_calls == 0);
+            if axis == 2 {
+                let last = error
+                    .nodes()
+                    .last()
+                    .expect("actual final delivered scalar before callback limit");
+                assert_eq!(last.delivered(), Some(&final_delivery));
+                assert_eq!(last.kind(), &K::Pending);
+                assert_eq!(last.returned_ok(), Some(false));
+            }
+            if error.usage().seed_calls == 0 {
+                assert!(error.nodes().iter().all(|node| node.delivered().is_none()));
+            }
+        }
+        let bytes = vec![0x96, 0xdd, 255, 255, 255, 255];
+        let error = run(&frame, &bytes)
+            .expect_err("absurd untrusted array hint cannot allocate from size hint");
+        assert_eq!(error.nodes().len(), 3);
+        assert_eq!(error.usage().seed_calls, 3);
+        assert!(matches!(
+            error.parser_result(),
+            Some(Err(rmp_serde::decode::Error::InvalidMarkerRead(_)))
+        ));
+    }
+    #[test]
+    fn packed_metadata_late_unwind_retains_partial_actual_parser_and_complete_parents() {
+        let frame = frame(true);
+        let outer = zstd::bulk::compress(&frame.structural, 1).expect("real producer");
+        for phase in [
+            "packed-reservation",
+            "packed-node",
+            "packed-callback",
+            "packed-scalar",
+            "packed-result",
+            "structural-child-result",
+            "packed-bytes-delivered",
+            "packed-bool-delivered",
+            "packed-signed-delivered",
+            "packed-unsigned-delivered",
+            "packed-none-delivered",
+            "packed-some-delivered",
+            "packed-sequence-delivered",
+        ] {
+            for panic in [false, true] {
+                let expiry = Instant::now() + Duration::from_millis(200);
+                let metadata = parent(&frame.structural, &outer, expiry);
+                let pointer = metadata
+                    .raw_bytes()
+                    .expect("actual native backing")
+                    .as_ptr();
+                let _hook = Hook;
+                TARGET.set(Some((phase, 0, panic)));
+                let error = metadata
+                    .prepare_packed_metadata_until(limits())
+                    .expect_err("real late/unwind must veto");
+                assert!(OBSERVED.get(), "actual requested phase entered {phase}");
+                assert_eq!(error.has_panic(), panic);
+                assert_eq!(error.original_expiry(), expiry);
+                assert_eq!(
+                    error.raw_bytes().expect("same raw native output").as_ptr(),
+                    pointer
+                );
+                assert!(error.parent_metadata().has_native_context());
+                assert!(
+                    error
+                        .parent_metadata()
+                        .parent_index()
+                        .parent_timestamps()
+                        .has_end_source()
+                );
+                if phase == "packed-reservation" {
+                    assert!(matches!(error.reservation_result(), Some(Ok(()))));
+                }
+                if phase == "packed-result" || phase == "structural-child-result" {
+                    assert!(matches!(error.parser_result(), Some(Ok(()))));
+                }
+                if phase == "structural-child-result" {
+                    assert!(error.child_succeeded());
+                }
+                if phase == "packed-callback" {
+                    assert!(error.nodes().iter().any(|node| matches!(
+                        node.delivered(),
+                        Some(I::Sequence(Some(6)))
+                    ) && node.kind() == &K::Pending));
+                }
+                if phase == "packed-bytes-delivered" {
+                    let node = error
+                        .nodes()
+                        .iter()
+                        .find(|node| {
+                            matches!(node.delivered(), Some(I::Borrowed { text: true, .. }))
+                        })
+                        .expect("actual str delivery retained before admission");
+                    assert_eq!(
+                        error.source_bytes(node.captured_input().expect("actual delivered range")),
+                        Some(&b"Empty"[..])
+                    );
+                    assert_eq!(node.kind(), &K::Pending);
+                    assert_eq!(node.returned_ok(), if panic { None } else { Some(false) });
+                }
+                let expected = match phase {
+                    "packed-bool-delivered" => Some(I::Boolean(true)),
+                    "packed-signed-delivered" => Some(I::Signed(i128::from(i64::MIN))),
+                    "packed-unsigned-delivered" => Some(I::Unsigned(0x7ff8_0000_0000_0042)),
+                    "packed-none-delivered" => Some(I::None),
+                    "packed-some-delivered" => Some(I::Some),
+                    "packed-sequence-delivered" => Some(I::Sequence(Some(6))),
+                    _ => None,
+                };
+                if let Some(expected) = expected {
+                    assert!(
+                        error
+                            .nodes()
+                            .iter()
+                            .any(|node| node.delivered() == Some(&expected)
+                                && node.kind() == &K::Pending
+                                && node.returned_ok() == if panic { None } else { Some(false) }),
+                        "actual delivered value survives callback refusal/unwind {phase}"
+                    );
+                }
+                assert!(error.usage().syntax_calls <= 1);
+            }
+        }
+        for (wire, phase, expected) in [
+            (
+                Wire::F32(f32::from_bits(0x7fc0_0042)),
+                "packed-float32-delivered",
+                I::Float32(0x7fc0_0042),
+            ),
+            (
+                Wire::F64(f64::from_bits(0x7ff8_0000_0000_0042)),
+                "packed-float64-delivered",
+                I::Float64(0x7ff8_0000_0000_0042),
+            ),
+        ] {
+            let Wire::Seq(fields) = packed(Wire::Seq(vec![]), Wire::Nil) else {
+                panic!("real fixture")
+            };
+            let mut fields = fields
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (Wire::U(i as u64), v))
+                .collect::<Vec<_>>();
+            fields.push((Wire::Text("ignored float"), wire));
+            let raw = raw(&Wire::Map(fields));
+            let (source, outer) = with_raw(&frame, &raw);
+            for panic in [false, true] {
+                let expiry = Instant::now() + Duration::from_millis(200);
+                let metadata = parent(&source, &outer, expiry);
+                let _hook = Hook;
+                TARGET.set(Some((phase, 0, panic)));
+                let error = metadata.prepare_packed_metadata_until(limits()).expect_err(
+                    "actual delivered ignored float is retained before callback failure",
+                );
+                assert!(OBSERVED.get());
+                assert_eq!(error.has_panic(), panic);
+                assert!(
+                    error
+                        .nodes()
+                        .iter()
+                        .any(|node| node.delivered() == Some(&expected)
+                            && node.kind() == &K::Pending
+                            && node.returned_ok() == if panic { None } else { Some(false) })
+                );
+                assert_eq!(error.original_expiry(), expiry);
+                assert_eq!(error.raw_bytes(), Some(raw.as_slice()));
+                assert!(error.parent_metadata().has_native_context());
+            }
+        }
+        let Wire::Seq(fields) = packed(Wire::Seq(vec![]), Wire::Nil) else {
+            panic!("real packed fixture")
+        };
+        let mut fields = fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (Wire::U(i as u64), v))
+            .collect::<Vec<_>>();
+        fields.push((Wire::U(99), Wire::Nil));
+        let map_raw = raw(&Wire::Map(fields.clone()));
+        fields.last_mut().expect("actual ignored field").1 = Wire::Text("extension payload");
+        let mut extension_raw = raw(&Wire::Map(fields));
+        let at = extension_raw
+            .windows(b"extension payload".len())
+            .position(|v| v == b"extension payload")
+            .expect("actual ignored value");
+        extension_raw.splice(at - 1..at + b"extension payload".len(), [0xd4, 7, 255]);
+        let bin_raw = raw(&packed(
+            Wire::Seq(vec![Wire::Map(vec![(
+                Wire::U(1),
+                Wire::Bin(b"delivered binary text".to_vec()),
+            )])]),
+            Wire::Nil,
+        ));
+        for (raw, phase) in [
+            (map_raw.clone(), "packed-map-delivered"),
+            (map_raw, "packed-unit-delivered"),
+            (extension_raw, "packed-newtype-delivered"),
+            (bin_raw, "packed-bytes-delivered"),
+        ] {
+            let (source, outer) = with_raw(&frame, &raw);
+            for panic in [false, true] {
+                let expiry = Instant::now() + Duration::from_millis(200);
+                let metadata = parent(&source, &outer, expiry);
+                let pointer = metadata
+                    .raw_bytes()
+                    .expect("actual second native output")
+                    .as_ptr();
+                let _hook = Hook;
+                TARGET.set(Some((phase, 0, panic)));
+                let error = metadata
+                    .prepare_packed_metadata_until(limits())
+                    .expect_err("actual container or BIN arrival retained before admission");
+                assert!(OBSERVED.get(), "actual requested delivery {phase}");
+                assert_eq!(error.has_panic(), panic);
+                assert_eq!(error.original_expiry(), expiry);
+                assert_eq!(
+                    error.raw_bytes().expect("same native output").as_ptr(),
+                    pointer
+                );
+                assert!(error.parent_metadata().has_native_context());
+                assert!(
+                    error
+                        .parent_metadata()
+                        .parent_index()
+                        .parent_timestamps()
+                        .has_end_source()
+                );
+                let node = error
+                    .nodes()
+                    .iter()
+                    .find(|node| match phase {
+                        "packed-map-delivered" => node.delivered() == Some(&I::Map(Some(7))),
+                        "packed-unit-delivered" => node.delivered() == Some(&I::Unit),
+                        "packed-newtype-delivered" => node.delivered() == Some(&I::Newtype),
+                        "packed-bytes-delivered" => {
+                            matches!(node.delivered(), Some(I::Borrowed { text: false, .. }))
+                        }
+                        _ => unreachable!(),
+                    })
+                    .expect("actual requested callback value retained");
+                assert_eq!(node.kind(), &K::Pending);
+                assert_eq!(node.returned_ok(), if panic { None } else { Some(false) });
+                if phase == "packed-bytes-delivered" {
+                    assert_eq!(
+                        error
+                            .source_bytes(node.captured_input().expect("real delivered BIN range")),
+                        Some(&b"delivered binary text"[..])
+                    );
+                }
+                assert!(error.usage().syntax_calls <= 1);
+            }
+        }
+        let (corrupt_source, corrupt_outer) = with_raw(&frame, &[0xc1]);
+        for panic in [false, true] {
+            let expiry = Instant::now() + Duration::from_millis(200);
+            let metadata = parent(&corrupt_source, &corrupt_outer, expiry);
+            let _hook = Hook;
+            TARGET.set(Some(("packed-result", 0, panic)));
+            let error = metadata
+                .prepare_packed_metadata_until(limits())
+                .expect_err("actual native Err retained before late/unwind");
+            assert!(OBSERVED.get());
+            assert_eq!(error.has_panic(), panic);
+            assert!(matches!(
+                error.parser_result(),
+                Some(Err(rmp_serde::decode::Error::TypeMismatch(_)))
+            ));
+            assert_eq!(error.raw_bytes(), Some(&[0xc1][..]));
+            assert!(error.parent_metadata().has_native_context());
+        }
+        let expiry = Instant::now() + Duration::from_millis(200);
+        let metadata = parent(&frame.structural, &outer, expiry);
+        while Instant::now() < expiry {
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        let error = metadata
+            .prepare_packed_metadata_until(limits())
+            .expect_err("original E cannot be renewed");
+        assert_eq!(error.usage().seed_calls, 0);
+        assert!(error.parser_result().is_none());
+        assert!(error.nodes().is_empty());
+        assert_eq!(error.original_expiry(), expiry);
+    }
+    #[test]
+    fn packed_metadata_two_frames_and_absent_lane_keep_original_work_and_native_custody() {
+        for typed in [false, true] {
+            let frame = frame(typed);
+            let outer = zstd::bulk::compress(&frame.structural, 1).expect("real producer");
+            let expiry = Instant::now() + Duration::from_secs(30);
+            if !typed {
+                for n in [0, usize::MAX] {
+                    let policy = crate::RecoveredPackedMetadataLimits {
+                        max_input_bytes: n,
+                        max_records: n,
+                        max_nodes: n,
+                        max_depth: n,
+                        max_callbacks: n,
+                        max_output_bytes: n,
+                        max_slots: n,
+                        max_work_bytes: n,
+                    };
+                    let absent = parent(&frame.structural, &outer, expiry)
+                        .prepare_packed_metadata_until(policy)
+                        .expect("no parser means unused parser ceilings are unvalidated");
+                    assert!(absent.is_absent());
+                    assert_eq!(absent.usage().seed_calls, 0);
+                    assert_eq!(absent.original_expiry(), expiry);
+                    assert!(absent.usage().continuation_bytes > 0);
+                }
+            }
+            let mut current = parent(&frame.structural, &outer, expiry);
+            let before = current.recovery_usage();
+            let mut previous = before;
+            for _ in 0..2 {
+                let accepted = current
+                    .prepare_packed_metadata_until(limits())
+                    .expect("actual complete typed/absent stage");
+                assert_eq!(accepted.is_absent(), !typed);
+                assert_eq!(accepted.original_expiry(), expiry);
+                assert!(accepted.recovery_usage().work_bytes > previous.work_bytes);
+                if !typed {
+                    assert!(accepted.nodes().is_empty());
+                    assert!(accepted.parser_result().is_none());
+                    assert_eq!(accepted.usage().seed_calls, 0);
+                    assert_eq!(accepted.usage().syntax_calls, 0);
+                    assert!(!accepted.parent_metadata().has_native_context());
+                } else {
+                    assert!(accepted.parent_metadata().has_native_context());
+                }
+                previous = accepted.recovery_usage();
+                current = accepted
+                    .decompress_next_until(
+                        Bytes::copy_from_slice(&outer),
+                        frame.structural.len(),
+                        COUNT,
+                        recovery_decompression_policy(),
+                    )
+                    .expect("same original full continuation")
+                    .prepare_sections_until(structural_section_limits())
+                    .expect("same sections")
+                    .prepare_offsets_until(structural_offset_limits())
+                    .expect("same offsets")
+                    .prepare_timestamps_until(structural_timestamp_limits())
+                    .expect("same original Pco")
+                    .prepare_index_until(structural_index_limits())
+                    .expect("same original index")
+                    .prepare_metadata_bytes_until(recovery_decompression_policy())
+                    .expect("same original metadata native");
+                assert!(current.recovery_usage().work_bytes > previous.work_bytes);
+            }
+            assert_eq!(current.recovery_usage().records, before.records);
+            assert_eq!(current.recovery_usage().json_values, before.json_values);
+        }
+    }
+}

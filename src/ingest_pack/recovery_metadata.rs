@@ -315,6 +315,120 @@ macro_rules! views {
     };
 }
 impl PreparedRecoveredStructuralMetadataBytes {
+    /// Scoped raw bytes and original work for the consuming packed-metadata child.
+    pub(super) fn continue_raw_until<C, E>(
+        self,
+        child: C,
+        operation: impl FnOnce(
+            Option<&[u8]>,
+            &mut RecoveryFrameWork,
+            &mut C,
+            Option<usize>,
+        ) -> std::result::Result<(), E>,
+    ) -> FrameContinuation<Self, C, E, TelemetryRecoveryError> {
+        use std::cell::Cell;
+        use std::mem::size_of_val;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let fixed = size_of::<FrameContinuation<Self, C, E, TelemetryRecoveryError>>()
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(size_of_val(&operation)))
+            .filter(|bytes| *bytes <= isize::MAX as usize);
+        let check = <RecoveryFrameWork as FrameWork>::check;
+        let check_parent = move |frame: &mut PreparedDecompressedFrame<RecoveryFrameWork>| {
+            frame.with_scoped_work(check)
+        };
+        // Actual framing-only control objects, including this table itself.
+        // The Cell is local arithmetic, never a work owner or a back-reference.
+        let controls = [
+            size_of::<Cell<Option<usize>>>(),
+            size_of::<Option<usize>>(), // original fixed local
+            size_of::<Option<usize>>(), // actual propagated get() value
+            size_of_val(&check),
+            size_of_val(&check_parent),
+            size_of::<[usize; 6]>(),
+        ];
+        let framing = Cell::new(controls.into_iter().fold(fixed, |sum, bytes| {
+            sum.and_then(|sum| sum.checked_add(bytes))
+        }));
+        let mut continued = FrameContinuation {
+            child,
+            initial: None,
+            actual: None,
+            post: None,
+            panic: None,
+            entered: false,
+            parent: self,
+        };
+        let catcher = || {
+            continued.initial = Some(continued.parent.held.parent.with_frame(check_parent));
+            if continued
+                .initial
+                .as_ref()
+                .is_some_and(|result| result.is_ok())
+            {
+                let metadata = &continued.parent.held.child;
+                let work_operation = |work: &mut RecoveryFrameWork| {
+                    continued.entered = true;
+                    continued.actual = Some(operation(
+                        metadata
+                            .stream
+                            .as_ref()
+                            .map(ScopedFrameStream::output_prefix),
+                        work,
+                        &mut continued.child,
+                        framing.get(),
+                    ));
+                    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+                    super::bounded_frames::observe_decompression(
+                        work.original_expiry(),
+                        "structural-child-result",
+                    );
+                };
+                framing.set(
+                    framing
+                        .get()
+                        .and_then(|bytes| bytes.checked_add(size_of_val(&work_operation))),
+                );
+                let frame_operation = move |frame: &mut PreparedDecompressedFrame<
+                    RecoveryFrameWork,
+                >| { frame.with_scoped_work(work_operation) };
+                framing.set(
+                    framing
+                        .get()
+                        .and_then(|bytes| bytes.checked_add(size_of_val(&frame_operation))),
+                );
+                continued.parent.held.parent.with_frame(frame_operation);
+            }
+        };
+        // Measure the actual closure after construction and before it can enter
+        // the owned child. No assumption about capture layout or zero size.
+        framing.set(
+            framing
+                .get()
+                .and_then(|bytes| bytes.checked_add(size_of_val(&catcher))),
+        );
+        let caught = catch_unwind(AssertUnwindSafe(catcher));
+        if let Err(panic) = caught {
+            continued.panic = Some(panic);
+        }
+        continued.post = Some(continued.parent.held.parent.with_frame(check_parent));
+        continued
+    }
+    /// Decode one typed packed-metadata arena on the same spent work and E.
+    /// This does not assemble log rows or establish query/serving ownership.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain complete metadata/native parent and actual typed child inline"
+    )]
+    pub fn prepare_packed_metadata_until(
+        self,
+        limits: super::recovery_packed_metadata::RecoveredPackedMetadataLimits,
+    ) -> std::result::Result<
+        super::recovery_packed_metadata::PreparedRecoveredPackedMetadata,
+        super::recovery_packed_metadata::RetainedRecoveredPackedMetadataError,
+    > {
+        super::recovery_packed_metadata::prepare(self, limits)
+    }
     views!();
     /// Complete exact native bytes; None denotes the ordinary absent lane.
     /// These bytes have not been parsed or accepted as PackedLogMetadata.

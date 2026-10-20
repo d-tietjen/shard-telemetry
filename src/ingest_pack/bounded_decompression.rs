@@ -256,6 +256,11 @@ impl<W: FrameWork> PreparedDecompressedFrame<W> {
         );
         continued
     }
+    /// Scoped internal admission for a consuming retained metadata child.
+    #[cfg(unix)]
+    pub(super) fn with_scoped_work<T>(&mut self, operation: impl FnOnce(&mut W) -> T) -> T {
+        operation(&mut self.retained.work)
+    }
     #[cfg(unix)]
     pub(super) fn work(&self) -> &W {
         &self.retained.work
