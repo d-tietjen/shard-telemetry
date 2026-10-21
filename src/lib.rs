@@ -16,6 +16,7 @@ mod dictionary;
 mod embedded;
 mod envelope;
 mod error;
+mod evidence;
 #[cfg(feature = "fast-telemetry")]
 mod fast_telemetry;
 mod ingest_pack;
@@ -83,6 +84,13 @@ pub use embedded::{
 };
 pub use envelope::{MAX_TELEMETRY_ENVELOPE_BYTES, TelemetryEnvelope};
 pub use error::{TelemetryError, TelemetryResult};
+pub use evidence::{
+    EVIDENCE_DATASET_VERSION, EvidenceAdmission, EvidenceBatchContext, EvidenceClock,
+    EvidenceCommitReference, EvidenceCompleteness, EvidenceEventIdentity, EvidenceExportError,
+    EvidenceExportLimits, EvidenceLossInterval, EvidenceLossReason, EvidenceLossStatus,
+    EvidenceOwner, EvidencePublication, MAX_EVIDENCE_EVENTS, MAX_EVIDENCE_MANIFEST_BYTES,
+    MAX_EVIDENCE_OBJECT_BYTES, PreparedEvidenceBatch,
+};
 #[cfg(feature = "fast-telemetry")]
 pub use fast_telemetry::{FastTelemetryConfig, FastTelemetryExportReport, FastTelemetryExporter};
 #[cfg(unix)]
