@@ -4,13 +4,23 @@ All notable changes to ShardTelemetry will be documented here. The project follo
 Semantic Versioning after `1.0.0`; pre-1.0 releases may change unstable storage
 and protocol interfaces when called out in release notes.
 
-## [Unreleased]
+## [0.3.0] - Unreleased
 
 ### Changed
 
-- Pin source builds to merged shard-stream commit
-  `e630c40e4c8430bc2371d687c2c72fde8b8e4014` for bounded recovery, query lineage and
-  origin progress. Registry dependency requirements remain `=0.2.0`.
+- Pin source builds to shard-stream `0.3.0` candidate commit
+  `830df7afe56259b78cb1f0c018488d9e6407bb08` for bounded recovery, query lineage and
+  origin progress. Exact registry dependency requirements are `=0.3.0`;
+  registry publication and release qualification remain pending.
+
+### Compatibility
+
+- The exhaustive public `NativeOpcode` enum adds `AppendUntracked`,
+  `QueryLogsPage` and `ProviderStatus`; downstream exhaustive matches must
+  handle them.
+- `DurableTelemetryLimits` and `OtlpSinkConfig` add public capacity and recovery
+  configuration fields. Existing complete struct literals need those fields.
+  These Rust API changes use the new `0.3` dependency line.
 
 ### Fixed
 
