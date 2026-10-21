@@ -417,6 +417,7 @@ thread_local! {
     static COPY_PANIC: Cell<bool> = const { Cell::new(false) };
     static JOURNAL_LATE: Cell<bool> = const { Cell::new(false) };
     static JOURNAL_PANIC: Cell<bool> = const { Cell::new(false) };
+    static JOURNAL_HOOK_ENTRIES: Cell<usize> = const { Cell::new(0) };
     static PROMOTION_PAID: Cell<Option<usize>> = const { Cell::new(None) };
 }
 pub(super) fn before_copy(source: &[DurableAppend], work: &NativeResumeWork) {
@@ -461,6 +462,7 @@ pub(super) fn after_copy(expiry: Instant) {
     }
 }
 pub(super) fn after_journal(expiry: Instant) {
+    JOURNAL_HOOK_ENTRIES.set(JOURNAL_HOOK_ENTRIES.get() + 1);
     if JOURNAL_PANIC.get() {
         panic!("actual journal result retained before unwind");
     }
@@ -476,6 +478,7 @@ impl Drop for Hooks {
         COPY_PANIC.set(false);
         JOURNAL_LATE.set(false);
         JOURNAL_PANIC.set(false);
+        JOURNAL_HOOK_ENTRIES.set(0);
         PROMOTION_PAID.set(None);
     }
 }
@@ -842,10 +845,12 @@ fn actual_complete_journal_outcome_survives_late_or_panicking_callback_bridge() 
     for panic in [false, true] {
         let (directory, journal) = setup();
         with_work(Duration::from_millis(200), move |work| {
+            let callback_observed_at = Instant::now();
             JOURNAL_LATE.set(!panic);
             JOURNAL_PANIC.set(panic);
             let hooks = Hooks;
             let source = input(0);
+            let append_started_at = Instant::now();
             let error = append_journal_until(
                 &journal,
                 source.expected,
@@ -855,11 +860,25 @@ fn actual_complete_journal_outcome_survives_late_or_panicking_callback_bridge() 
                 work,
             )
             .expect_err("actual complete inner result precedes callback refusal");
+            let observed_at = Instant::now();
+            let journal_hook_entries = JOURNAL_HOOK_ENTRIES.get();
             drop(hooks);
             let carrier = journal_error(&error);
             let Some(Ok(actual)) = &carrier.outcome else {
-                panic!("original complete journal outcome retained");
+                panic!(
+                    "original complete journal outcome retained; expected_panic={panic}; \
+                     completed_result_hook_entries={journal_hook_entries}; \
+                     callback_observed_at={callback_observed_at:?}; \
+                     append_started_at={append_started_at:?}; observed_at={observed_at:?}; \
+                     original_expiry={:?}; usage={:?}; carrier={carrier:?}",
+                    work.absolute_expiry(),
+                    work.usage()
+                );
             };
+            assert_eq!(
+                journal_hook_entries, 1,
+                "completed-result bridge hook entered"
+            );
             assert_eq!(
                 actual.transaction().appends[0].payload.as_ptr(),
                 source.appends[0].payload.as_ptr()
