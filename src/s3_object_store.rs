@@ -1,3 +1,5 @@
+mod transport;
+
 use std::future::Future;
 use std::io::Read;
 use std::ops::Range;
@@ -7,14 +9,13 @@ use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 
 use bytes::Bytes;
-use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     Attribute, AttributeValue, Attributes, DynObjectStore, Error as CloudError, ObjectStore,
     ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
 
 use crate::tier::hash_file;
@@ -47,6 +48,26 @@ pub struct S3ObjectStoreConfig {
     pub allow_http: bool,
     /// Uses virtual-hosted-style requests instead of path-style requests.
     pub virtual_hosted_style: bool,
+}
+
+/// Explicit HTTP request and provider retry policy for an S3 adapter.
+///
+/// Defaults match the pinned provider's normal 30s request, 5s connect, 180s
+/// retry window and ten retries. Using this value is opt-in; the old constructors
+/// continue honoring their environment-derived timeouts. Credentials keep their
+/// existing provider chain and may require additional requests or refresh work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S3ObjectStoreTransportLimits {
+    /// Positive timeout for one HTTP request, including its response body.
+    pub request_timeout_ms: u64,
+    /// Positive connection timeout, no greater than the request timeout.
+    pub connect_timeout_ms: u64,
+    /// Positive provider retry window, checked after failures before further retries.
+    ///
+    /// This does not preempt an in-flight request or clamp a pending backoff.
+    pub retry_timeout_ms: u64,
+    /// Maximum additional provider requests after the first attempt; zero disables retries.
+    pub max_retries: usize,
 }
 
 impl S3ObjectStoreConfig {
@@ -117,54 +138,22 @@ impl S3ObjectStore {
         config: S3ObjectStoreConfig,
         configured_threads: Option<usize>,
     ) -> TelemetryResult<Self> {
-        config.validate()?;
-        let worker_threads = configured_threads.unwrap_or(DEFAULT_RUNTIME_WORKER_THREADS);
-        if !(1..=MAX_RUNTIME_WORKER_THREADS).contains(&worker_threads) {
-            return Err(TelemetryError::InvalidConfiguration(
-                "S3 runtime worker threads must be in 1..=64".into(),
-            ));
-        }
-        let mut builder = AmazonS3Builder::from_env()
-            .with_bucket_name(&config.bucket)
-            .with_allow_http(config.allow_http)
-            .with_virtual_hosted_style_request(config.virtual_hosted_style);
-        if let Some(region) = &config.region {
-            builder = builder.with_region(region);
-        }
-        if let Some(endpoint) = &config.endpoint {
-            builder = builder.with_endpoint(endpoint);
-        }
-        let store = builder
-            .build()
-            .map_err(|error| cloud_error("configure", &config.bucket, error))?;
-        let store: Arc<DynObjectStore> = Arc::new(store);
-        let (sender, mut receiver) = unbounded_channel::<CloudTask>();
-        std::thread::Builder::new()
-            .name("shard-telemetry-s3".into())
-            .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(worker_threads)
-                    .enable_all()
-                    .thread_name("shard-telemetry-s3-io")
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        eprintln!("shard-telemetry could not start S3 runtime: {error}");
-                        return;
-                    }
-                };
-                runtime.block_on(async move {
-                    while let Some(task) = receiver.recv().await {
-                        tokio::spawn(task(Arc::clone(&store)));
-                    }
-                });
-            })
-            .map_err(|error| TelemetryError::ObjectStore(format!("start S3 runtime: {error}")))?;
-        Ok(Self {
-            sender,
-            prefix: Arc::from(config.prefix),
-        })
+        Self::open_configured(config, configured_threads, None)
+    }
+
+    /// Builds an S3 client with explicit HTTP request and provider retry limits.
+    ///
+    /// Only request/connect timeouts and retry count/window override the standard
+    /// environment-derived client. Existing constructors preserve their existing
+    /// environment policy. These are per-request controls, not an end-to-end bound
+    /// on queue waits, credential refresh, multiple requests or file I/O. Retain
+    /// physical upload ownership until the synchronous operation actually returns.
+    pub fn open_with_limits(
+        config: S3ObjectStoreConfig,
+        configured_threads: Option<usize>,
+        limits: S3ObjectStoreTransportLimits,
+    ) -> TelemetryResult<Self> {
+        Self::open_configured(config, configured_threads, Some(limits))
     }
 
     fn object_path(&self, key: &str) -> TelemetryResult<ObjectPath> {
