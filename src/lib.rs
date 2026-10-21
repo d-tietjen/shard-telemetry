@@ -192,7 +192,7 @@ pub use remote_write::{
 };
 pub use resident::NativeResidentLimits;
 pub use rollup::LifetimeMetricRollup;
-pub use s3_object_store::{S3ObjectStore, S3ObjectStoreConfig};
+pub use s3_object_store::{S3ObjectStore, S3ObjectStoreConfig, S3ObjectStoreTransportLimits};
 pub use signal_ingest::{
     DockerLogRecord, DockerLogStream, decode_log_envelope, prepare_docker_log_envelope,
     prepare_docker_log_envelope_with_context, prepare_log_envelope,

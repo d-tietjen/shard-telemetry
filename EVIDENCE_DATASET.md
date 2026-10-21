@@ -108,6 +108,42 @@ is returned even when late, with `completed_after_deadline=true`. A late data PU
 cannot start the next call. Configure transport timeouts and retain ownership of
 the synchronous call until it returns.
 
+## Explicit S3 transport policy
+
+`S3ObjectStore::open_with_limits(config, configured_threads, limits)` accepts an
+`S3ObjectStoreTransportLimits` value with positive request, connect and retry-window
+milliseconds and a finite additional retry count. A connect timeout cannot exceed
+the request timeout. For example, a host that owns retries can select
+`max_retries: 0` while setting its per-request timeouts explicitly. The default
+value matches the pinned provider's 30s request, 5s connect, 180s retry window and
+ten retries. The existing `open` and `open_with_threads` paths continue using their
+environment-derived policy without applying this new default.
+
+The opt-in constructor overrides only the HTTP request/connect timeouts and the
+provider retry count/window. Existing proxy, TLS, read-timeout, user-agent and other
+client settings remain intact. In the pinned `object_store` version, the standard
+environment builder has no retry/backoff configuration key; its default backoff
+is preserved. Credentials still use the existing environment/workload/ECS/instance
+chain. Credential refresh, cache locks, token-file reads and additional credential
+requests occur outside an individual S3 request's retry timer; instance-metadata
+connect policy can also differ.
+
+A provider retry window is checked after failures before another retry. It does
+not preempt an in-flight request or clamp a pending backoff. An immutable retry
+may also require a separate GET to verify an existing object's size and digest.
+These HTTP controls do not establish a whole-call wall-clock, queue, memory,
+credential-refresh or upload-concurrency bound. A host must retain its physical
+upload permit until the synchronous call actually returns, keep the exact prepared
+key/bytes for uncertain failures, and retain the verified late-success behavior
+described above. Bounded admission, durable spool/restart, source-incarnation and
+remote-commit-or-authorized-loss retention remain host integration work.
+
+The transport regression fixtures use the actual provider and an owned unsigned
+loopback HTTP endpoint for stalls, 503 retry counts, immutable conflict/GET
+verification and a final manifest response after the caller's deadline. They do
+not qualify production credential refresh, real S3, Runtime admission or complete
+end-to-end timing.
+
 ## Bounds and remaining integration
 
 Positive caller limits can lower the format ceilings of 1 MiB encoded STEL,

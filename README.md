@@ -284,6 +284,15 @@ journal alone cannot release sealed trace and metric payloads from resident
 storage. Configurations that omit the RAM budget preserve their existing
 journal-only or memory-only choices.
 
+Standalone S3 callers can opt into `S3ObjectStore::open_with_limits` with
+`S3ObjectStoreTransportLimits` to set HTTP request/connect timeouts and provider
+retry count/window. Existing config struct literals and constructors retain their
+environment behavior; the opt-in policy preserves other proxy/TLS/client settings.
+These per-request controls do not bound credential refresh, queue waits or an
+entire upload. Retain ownership until each synchronous call actually returns. See
+[the transport contract](EVIDENCE_DATASET.md#explicit-s3-transport-policy) for
+retry, credential and late-success boundaries.
+
 RAM-budget mode supplies `DurableTelemetryLimits.native_resident` as well.
 For allowance `R` and the sum `N` of logical trace and metric partitions,
 `NativeResidentLimits` reserves `R/4` for sealed payloads: each uniquely owned
