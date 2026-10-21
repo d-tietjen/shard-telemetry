@@ -13,6 +13,8 @@ impl DurableTelemetryStore {
             };
             let watermarks = self.engine.watermarks(partition).map_err(engine_error)?;
             let retained_start = checkpoint.next_offset.min(watermarks.last_stable_offset);
+            let retained_start =
+                self.metric_rollup_retained_start(partition, watermarks.log_start, retained_start)?;
             if retained_start <= watermarks.log_start {
                 continue;
             }
