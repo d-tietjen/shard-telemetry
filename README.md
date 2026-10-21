@@ -32,6 +32,9 @@ process, and contributor expectations are public and linked below.
   lifecycle-owned, durable node-local telemetry store.
 - A store-and-forward UpstreamOffloader for forwarding durable embedded
   envelopes to a central ShardTelemetry service.
+- An explicit [immutable evidence publication primitive](EVIDENCE_DATASET.md)
+  for already admitted, organization-split STEL batches; host export lifecycle
+  and central snapshot querying require their own integration.
 - Explicit compatibility boundaries for Loki, Prometheus/PromQL, Tempo/TraceQL,
   and ClickHouse integrations.
 

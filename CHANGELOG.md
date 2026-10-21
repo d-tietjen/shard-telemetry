@@ -6,6 +6,13 @@ and protocol interfaces when called out in release notes.
 
 ## [0.3.0] - Unreleased
 
+### Added
+
+- Bounded, explicitly admitted immutable STEL evidence publication using existing
+  object storage, original source identities and a manifest-last commit. Service
+  admission, durable export/retention lifecycle and central querying remain host
+  integration requirements; existing telemetry modes are unchanged.
+
 ### Changed
 
 - Pin source builds to shard-stream `0.3.0` candidate commit

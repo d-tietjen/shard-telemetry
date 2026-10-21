@@ -36,7 +36,7 @@ implementation and behavior tests in `src/name/`. Use `name.rs` with a sibling
 | Log storage | `stripe`, `structural`, `query_index` | Appends, storage lanes, indexes, query paths, and format codecs. |
 | Durability | `telemetry_store`, `sink`, `tier` | Engine attachment, append and retention paths, sink workers, catalog transactions, object storage, and cache I/O. |
 | Signals and query APIs | `metric`, `trace`, `analytics`, `loki_api`, `prometheus_api`, `native_protocol`, `traceql` | Signal codecs and indexes, analytical projections, API parsing and responses, wire messages, and query evaluation. |
-| Runtime and tools | `telemetry`, `usage_ledger`, `locality`, `embedded`, `native_server`, `correlation`, `offload`, `promql` and the structural/signal benchmark binaries | Models and routing, accounting and recovery, placement, lifecycle, protocol dispatch, cross-signal navigation, transfer, evaluation, and benchmark workloads. |
+| Runtime and tools | `telemetry`, `usage_ledger`, `locality`, `embedded`, `native_server`, `correlation`, `offload`, `evidence`, `promql` and the structural/signal benchmark binaries | Models and routing, accounting and recovery, placement, lifecycle, protocol dispatch, cross-signal navigation, transfer, immutable evidence publication, evaluation, and benchmark workloads. |
 
 When moving code, keep serialization, query ordering, protocol responses, CLI
 flags, and public exports stable. Place new tests next to the behavior they
