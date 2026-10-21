@@ -310,6 +310,224 @@ fn assert_signal_windows(store: &DurableTelemetryStore) {
     );
 }
 
+#[test]
+fn object_reclamation_keeps_metrics_appended_after_the_rollup_checkpoint() {
+    for existing_checkpoint in [true, false] {
+        assert_metric_reclamation_after_checkpoint(true, existing_checkpoint);
+    }
+}
+
+#[test]
+fn physical_retention_keeps_metrics_appended_after_the_rollup_checkpoint() {
+    for existing_checkpoint in [true, false] {
+        assert_metric_reclamation_after_checkpoint(false, existing_checkpoint);
+    }
+}
+
+fn assert_metric_reclamation_after_checkpoint(object_tier: bool, existing_checkpoint: bool) {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock for unique fixture path")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "shard-telemetry-rollup-reclamation-{}-{nonce}-{object_tier}-{existing_checkpoint}",
+        std::process::id(),
+    ));
+    let config = DurableTelemetryConfig {
+        data_directory: directory.clone(),
+        object_store_directory: object_tier.then(|| directory.join("objects")),
+        s3_object_store: None,
+        recovery_journal: true,
+        retention: None,
+        shard_count: 1,
+        tenant_partitions: 1,
+        append_linger: Duration::ZERO,
+        stripe: StripeConfig::default(),
+        indexed_ack_timeout: Duration::from_secs(30),
+    };
+    let limits = DurableTelemetryLimits {
+        max_lifetime_rollup_series: Some(8),
+        max_lifetime_rollup_bytes: 1024 * 1024,
+        ..DurableTelemetryLimits::default()
+    };
+    let tier = ObjectTierConfig {
+        target_group_payload_bytes: 1,
+        ..ObjectTierConfig::default()
+    };
+    let open = || {
+        DurableTelemetryStore::open_with_object_tier_config_and_local_limits(
+            config.clone(),
+            tier,
+            limits.clone(),
+        )
+        .expect("real journal-backed store")
+    };
+    let store = open();
+    if existing_checkpoint {
+        store
+            .append_metric_point(reclamation_metric_point(1), true)
+            .expect("initial indexed metric");
+    }
+    store.flush(Duration::from_secs(30)).expect("initial flush");
+    drop(store);
+
+    // Reopen the actual coordinator/index journals and persisted rollup catalog
+    // before placing a new complete batch after the last rollup snapshot.
+    let store = open();
+    let partition = TopicPartition::new(crate::METRICS_TOPIC_ID, LogicalPartitionId::new(0));
+    let expected_checkpoint = existing_checkpoint.then_some(LogicalOffset::new(1));
+    assert_eq!(
+        store
+            .lifetime_rollups
+            .as_ref()
+            .expect("enabled rollups")
+            .lock()
+            .expect("catalog")
+            .checkpoint(partition),
+        expected_checkpoint
+    );
+    let original_start = store.engine.watermarks(partition).expect("WAL").log_start;
+    let ack = store
+        .append_metric_points(
+            vec![reclamation_metric_point(2), reclamation_metric_point(3)],
+            true,
+        )
+        .expect("new complete indexed metric batch");
+    let ack = ack.partitions.first().expect("metric acknowledgement");
+    assert_eq!(ack.topic_partition, partition);
+    assert_eq!(ack.first_offset, if existing_checkpoint { 1 } else { 0 });
+    assert_eq!(ack.last_offset - ack.first_offset, 1);
+    let indexed_end = LogicalOffset::new(ack.last_offset + 1);
+    assert_eq!(
+        store
+            .engine
+            .durable_sink_checkpoint(partition)
+            .expect("index checkpoint")
+            .expect("indexed batch")
+            .next_offset,
+        indexed_end
+    );
+
+    // These are the actual production stages following a flush's rollup
+    // snapshot. Ordering the new append here reproduces the race without a
+    // sleep, retry, fake checkpoint, or production-only synchronization hook.
+    if object_tier {
+        store
+            .service
+            .flush_object_tier()
+            .expect("object publication");
+        store.reclaim_source_packs().expect("source reclamation");
+    } else {
+        store
+            .compact_retention_after_flush([0, 0, 500])
+            .expect("post-flush expired-metric scan");
+    }
+    let start_after_maintenance = store.engine.watermarks(partition).expect("WAL").log_start;
+    store
+        .checkpoint_lifetime_rollups()
+        .expect("new metric batch must remain available after source maintenance");
+    let initial_points = if existing_checkpoint { 1 } else { 0 };
+    let initial_total = if existing_checkpoint { 1 } else { 0 };
+    assert_reclamation_rollup(&store, initial_points + 2, initial_total + 5);
+    assert_eq!(
+        start_after_maintenance,
+        expected_checkpoint.unwrap_or(original_start)
+    );
+
+    // Once the complete batch is really persisted in the rollup catalog, both
+    // paths must release it at its actual batch boundary rather than pin forever.
+    finish_reclamation(&store, object_tier);
+    assert_eq!(
+        store.engine.watermarks(partition).expect("WAL").log_start,
+        indexed_end
+    );
+    drop(store);
+    let store = open();
+    assert_reclamation_rollup(&store, initial_points + 2, initial_total + 5);
+    let ack = store
+        .append_metric_point(reclamation_metric_point(4), true)
+        .expect("new metric after reclaimed-WAL restart");
+    assert_eq!(
+        ack.partitions
+            .first()
+            .expect("restarted acknowledgement")
+            .first_offset,
+        indexed_end.get()
+    );
+    finish_reclamation(&store, object_tier);
+    assert_eq!(
+        store.engine.watermarks(partition).expect("WAL").log_start,
+        LogicalOffset::new(indexed_end.get() + 1)
+    );
+    assert_reclamation_rollup(&store, initial_points + 3, initial_total + 9);
+    drop(store);
+    let store = open();
+    assert_reclamation_rollup(&store, initial_points + 3, initial_total + 9);
+    drop(store);
+    fs::remove_dir_all(directory).expect("remove fixture");
+}
+
+fn finish_reclamation(store: &DurableTelemetryStore, object_tier: bool) {
+    if object_tier {
+        store
+            .flush(Duration::from_secs(30))
+            .expect("checkpointed reclamation");
+    } else {
+        store
+            .compact_retention_before(500)
+            .expect("checkpointed retention");
+    }
+}
+
+fn assert_reclamation_rollup(store: &DurableTelemetryStore, points: u64, total: i64) {
+    let rollups = store
+        .query_lifetime_metric_rollups("tenant-a", Some("reclamation_total"))
+        .expect("complete lifetime outcome");
+    assert_eq!(rollups.len(), 1);
+    assert_eq!(rollups[0].observed_points, points);
+    assert_eq!(rollups[0].reset_count, 0);
+    assert_eq!(
+        rollups[0].outcome,
+        crate::MetricValue::Sum(crate::NumberValue::Integer(total))
+    );
+    assert!(
+        store
+            .query_lifetime_metric_rollups("tenant-b", Some("reclamation_total"))
+            .expect("other tenant")
+            .is_empty()
+    );
+}
+
+fn reclamation_metric_point(value: i64) -> crate::DurableMetricPoint {
+    crate::DurableMetricPoint {
+        stream_shard_id: ShardId::new(0),
+        record_ref: crate::TelemetryRecordRef::for_signal(
+            crate::TelemetrySignal::Metrics,
+            TopicPartition::new(crate::METRICS_TOPIC_ID, LogicalPartitionId::new(0)),
+            LogicalOffset::new(0),
+        ),
+        identity: Arc::new(crate::MetricIdentity {
+            tenant: Arc::from("tenant-a"),
+            resource: Arc::new(crate::ResourceContext::default()),
+            scope: Arc::new(crate::ScopeContext::default()),
+            name: Arc::from("reclamation_total"),
+            unit: Arc::from("1"),
+            kind: crate::MetricKind::Sum {
+                temporality: 1,
+                monotonic: true,
+            },
+            point_attributes: Arc::new(Vec::new()),
+        }),
+        description: Arc::from("synthetic retention regression"),
+        metadata: Arc::new(Vec::new()),
+        start_time_unix_nanos: 0,
+        timestamp_unix_nanos: u64::try_from(value).expect("positive fixture timestamp"),
+        flags: 0,
+        value: crate::MetricValue::Sum(crate::NumberValue::Integer(value)),
+        exemplars: Arc::new(Vec::new()),
+    }
+}
+
 fn analytics_rows(store: &DurableTelemetryStore, request: &AnalyticsScanRequest) -> usize {
     let mut rows = 0;
     store

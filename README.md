@@ -224,6 +224,10 @@ and exemplars follow their parent metric point. Maintenance removes complete
 expired signal groups and safely checkpoints their WAL offsets; restart keeps
 the same windows. Retention requires a recovery journal or immutable object
 tier. Lifetime metric rollups keep their separate aggregate semantics.
+When lifetime rollups are enabled, both object-backed WAL reclamation and
+time-based physical retention keep metric source batches until their rollup
+checkpoint is persisted. An indexed append arriving after a flush's rollup
+snapshot remains available for the next checkpoint, including after restart.
 
 Correlation lookups enforce the requested tenant in both navigation indexes
 and cold log reads, including when tenants share a partition, trace ID, or label.

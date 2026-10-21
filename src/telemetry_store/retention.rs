@@ -1,6 +1,30 @@
 use super::*;
 
 impl DurableTelemetryStore {
+    /// Keeps raw metric batches until the enabled lifetime catalog has durably
+    /// incorporated them. Appends can advance the index after flush checkpoints
+    /// rollups, so the index checkpoint alone cannot release metric source WAL.
+    pub(super) fn metric_rollup_retained_start(
+        &self,
+        partition: TopicPartition,
+        log_start: LogicalOffset,
+        proposed: LogicalOffset,
+    ) -> Result<LogicalOffset, LokiApiError> {
+        if partition.topic_id != crate::METRICS_TOPIC_ID {
+            return Ok(proposed);
+        }
+        let Some(lifetime_rollups) = &self.lifetime_rollups else {
+            return Ok(proposed);
+        };
+        let catalog = lifetime_rollups
+            .lock()
+            .map_err(|_| LokiApiError::internal("lifetime metric rollup lock poisoned"))?;
+        // Checkpoints are published to this catalog only after persist succeeds.
+        // With no checkpoint, none of this partition's raw points are accounted
+        // for yet. Never advance its source boundary on the index alone.
+        Ok(proposed.min(catalog.checkpoint(partition).unwrap_or(log_start)))
+    }
+
     /// Incorporates every not-yet-checkpointed metric WAL point into the
     /// crash-safe local lifetime rollup catalog.
     ///
@@ -159,6 +183,16 @@ impl DurableTelemetryStore {
         cutoffs: [u64; 3],
     ) -> Result<RetentionReport, LokiApiError> {
         self.flush(self.indexed_ack_timeout)?;
+        self.compact_retention_after_flush(cutoffs)
+    }
+
+    /// Runs the physical maintenance phase after the caller's completed flush.
+    /// New appends may already be indexed by this point; each metric truncation
+    /// must still respect the separately persisted lifetime-rollup checkpoint.
+    pub(super) fn compact_retention_after_flush(
+        &self,
+        cutoffs: [u64; 3],
+    ) -> Result<RetentionReport, LokiApiError> {
         let mut report = RetentionReport {
             cutoff_timestamp_unix_nanos: cutoffs.into_iter().min().unwrap_or(0),
             ..RetentionReport::default()
@@ -253,6 +287,8 @@ impl DurableTelemetryStore {
                         scan_offset = retained_start;
                     }
                 }
+                let retained_start =
+                    self.metric_rollup_retained_start(partition, original_start, retained_start)?;
                 if retained_start > original_start {
                     self.engine
                         .truncate_partition(partition, retained_start)
