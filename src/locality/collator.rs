@@ -1,6 +1,46 @@
 use super::*;
 
 impl CompressionBlockCollator {
+    // The consuming stripe producer keeps this real, initially empty owner
+    // before reserving its actual table. Ordinary construction below is unchanged.
+    pub(crate) fn empty_for_stripe_setup(
+        config: CompressionLocalityConfig,
+        target_block_bytes: u64,
+    ) -> TelemetryResult<Self> {
+        config.validate().map_err(TelemetryError::InvalidConfig)?;
+        if target_block_bytes == 0 {
+            return Err(TelemetryError::InvalidConfig(
+                "locality target_block_bytes must be nonzero",
+            ));
+        }
+        let allocated_state_bytes = estimated_state_bytes(&config);
+        Ok(Self {
+            config,
+            target_block_bytes,
+            shards: Vec::new(),
+            split_explorations: [SplitExploration::default(); SPLIT_EXPLORATION_SLOTS],
+            stats: CompressionLocalityStats {
+                allocated_state_bytes,
+                ..CompressionLocalityStats::default()
+            },
+        })
+    }
+
+    pub(crate) fn reserve_for_stripe_setup(
+        &mut self,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.shards
+            .try_reserve_exact(self.config.max_compression_shards)
+    }
+
+    pub(crate) fn stripe_setup_capacity(&self) -> usize {
+        self.shards.capacity()
+    }
+
+    pub(crate) fn stripe_setup_slot_bytes() -> usize {
+        std::mem::size_of::<CompressionShard>()
+    }
+
     /// Creates preallocated collation state for one stripe.
     pub fn new(
         config: CompressionLocalityConfig,

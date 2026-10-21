@@ -10,6 +10,8 @@ impl MetricStripe {
         }
         Ok(Self {
             head_budget_bytes,
+            query_work_limits: None,
+            resident_payload_limit: None,
             head_bytes: 0,
             out_of_order_nanos: DEFAULT_OUT_OF_ORDER_NANOS,
             chunk_bytes: DEFAULT_CHUNK_BYTES,
@@ -338,6 +340,9 @@ impl MetricStripe {
 
     /// Queries exact raw hot and immutable-chunk points with index pushdown.
     pub fn query(&self, query: &MetricQuery) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        if let Some(limits) = self.query_work_limits {
+            return self.query_bounded(query, limits, None);
+        }
         let limit = query.limit.max(1);
         if let Some(series) = query.series {
             return self.query_exact_series(query, series, limit);
@@ -394,6 +399,12 @@ impl MetricStripe {
         query: &MetricQuery,
         timestamps: &[u64],
     ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        if query.series.is_none() || timestamps.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(limits) = self.query_work_limits {
+            return self.query_bounded(query, limits, Some(timestamps));
+        }
         let Some(series) = query.series else {
             return Ok(Vec::new());
         };
@@ -767,6 +778,25 @@ impl MetricStripe {
     }
 
     pub(super) fn seal_series(&mut self, series: SeriesFingerprint) -> TelemetryResult<()> {
+        if let Some(limit) = self.resident_payload_limit
+            && let Some(head) = self.series.get(&series)
+            && !head.points.is_empty()
+        {
+            let points = head.points.values().cloned().collect::<Vec<_>>();
+            let encoded = encode_metric_chunk(&points)?;
+            let retained = self
+                .pending_chunks
+                .iter()
+                .filter(|chunk| chunk.topic_partition == head.topic_partition)
+                .fold(0_u64, |total, chunk| {
+                    total.saturating_add(u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX))
+                });
+            if retained.saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX)) > limit {
+                return Err(TelemetryError::InvalidConfig(
+                    "sealed metric payload capacity exhausted",
+                ));
+            }
+        }
         let Some(head) = self.series.get_mut(&series) else {
             return Ok(());
         };
@@ -852,5 +882,9 @@ impl MetricStripe {
             .flatten()
             .map(|chunk| u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX))
             .sum()
+    }
+
+    pub(crate) fn set_resident_payload_limit(&mut self, limit: Option<u64>) {
+        self.resident_payload_limit = limit;
     }
 }

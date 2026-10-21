@@ -4,7 +4,36 @@ All notable changes to ShardTelemetry will be documented here. The project follo
 Semantic Versioning after `1.0.0`; pre-1.0 releases may change unstable storage
 and protocol interfaces when called out in release notes.
 
-## [Unreleased]
+## [0.3.0] - Unreleased
+
+### Added
+
+- Bounded, explicitly admitted immutable STEL evidence publication using existing
+  object storage, original source identities and a manifest-last commit. Service
+  admission, durable export/retention lifecycle and central querying remain host
+  integration requirements; existing telemetry modes are unchanged.
+
+### Changed
+
+- Pin source builds to shard-stream `0.3.0` candidate commit
+  `830df7afe56259b78cb1f0c018488d9e6407bb08` for bounded recovery, query lineage and
+  origin progress. Exact registry dependency requirements are `=0.3.0`;
+  registry publication and release qualification remain pending.
+
+### Compatibility
+
+- The exhaustive public `NativeOpcode` enum adds `AppendUntracked`,
+  `QueryLogsPage` and `ProviderStatus`; downstream exhaustive matches must
+  handle them.
+- `DurableTelemetryLimits` and `OtlpSinkConfig` add public capacity and recovery
+  configuration fields. Existing complete struct literals need those fields.
+  These Rust API changes use the new `0.3` dependency line.
+
+### Fixed
+
+- Preserve every requested identity in correlation intersections with three or
+  more keys, including scope and typed attributes, before applying retention,
+  cursors, and result limits.
 
 ## [0.2.0] - 2026-09-07
 

@@ -22,10 +22,12 @@ use crate::{
 };
 
 mod codec;
+mod query_bounded;
 mod query_helpers;
 mod stripe;
 #[cfg(test)]
 mod tests;
+pub(crate) use codec::decode_trace_block_with_work_limits;
 use codec::*;
 pub(crate) use codec::{TraceProjection, decode_trace_block_matching};
 pub use codec::{decode_trace_block, encode_trace_block};
@@ -365,6 +367,8 @@ pub enum TraceApplyOutcome {
 #[derive(Debug)]
 pub struct TraceStripe {
     head_budget_bytes: usize,
+    query_work_limits: Option<crate::NativeQueryWorkLimits>,
+    resident_payload_limit: Option<u64>,
     head_bytes: usize,
     idle_nanos: u64,
     late_grace_nanos: u64,

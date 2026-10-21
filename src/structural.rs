@@ -11,7 +11,15 @@ use pco::{ChunkConfig, DeltaSpec, ModeSpec};
 use serde::{Deserialize, Serialize};
 use shard_stream_core::LogicalOffset;
 
+mod bounded_index;
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use bounded_index::with_recovery_phase;
+#[cfg(unix)]
+pub(crate) use bounded_index::{EmbeddedIndexFailure, EmbeddedIndexState};
 mod decoder;
+pub(crate) use bounded_index::{
+    EmbeddedIndexDecodeLimits, PreparedEmbeddedFrameIndex, RetainedEmbeddedIndexError,
+};
 pub(crate) use decoder::*;
 mod encoder;
 use encoder::*;
@@ -19,6 +27,27 @@ mod index;
 use index::*;
 mod lanes;
 use lanes::*;
+mod message_core;
+#[cfg(all(test, unix))]
+pub(crate) use message_core::message_test_wire_fixture;
+#[cfg(unix)]
+pub(crate) fn validate_message_body_layout(
+    index: &EmbeddedFrameIndex,
+    templates: usize,
+    records: usize,
+) -> TelemetryResult<()> {
+    decoder::validate_body_layout(index, templates, records)
+}
+#[cfg(unix)]
+pub(crate) use message_core::{
+    BodyInput, BodyRecord, BodyState, CoreFailure, FragmentHooks, HelperResult, LaneHooks,
+    LaneState, TemplateHooks, TemplateState, WireHooks, WireSource, WireState, replay_body,
+    scan_body_record, visit_lane, visit_templates,
+};
+#[cfg(unix)]
+pub(crate) fn require_message_payload_consumed(input: &[u8], cursor: usize) -> TelemetryResult<()> {
+    wire::require_consumed(input, cursor)
+}
 mod wire;
 use wire::*;
 
@@ -27,7 +56,8 @@ use crate::{
     TelemetryError, TelemetryResult, TelemetryValue, TraceId,
 };
 
-const STRUCTURAL_BLOCK_MAGIC: &[u8; 4] = b"STLG";
+/// Canonical frame marker shared with bounded structural-section admission.
+pub(crate) const STRUCTURAL_BLOCK_MAGIC: &[u8; 4] = b"STLG";
 const DIRECT_ATTRIBUTE_VALUE: u8 = 0;
 const DICTIONARY_ATTRIBUTE_VALUE: u8 = 1;
 const TIMESTAMP_PCO_LEVEL: usize = 8;
@@ -836,6 +866,15 @@ pub fn encode_indexed_structural_records<R: StructuralRecordView>(
 pub fn decode_embedded_frame_index(encoded: &[u8]) -> TelemetryResult<EmbeddedFrameIndex> {
     let (record_count, embedded_index) = structural_sections(encoded)?;
     decode_embedded_frame_index_section(embedded_index, record_count)
+}
+
+/// Borrow the ordinary validated final section without decoding its values.
+/// The section is last and structural_sections checks complete consumption.
+pub(crate) fn structural_embedded_index_range(
+    encoded: &[u8],
+) -> TelemetryResult<(usize, std::ops::Range<usize>)> {
+    let (records, index) = structural_sections(encoded)?;
+    Ok((records, encoded.len() - index.len()..encoded.len()))
 }
 
 pub(crate) fn decode_embedded_frame_index_section(

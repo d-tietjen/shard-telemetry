@@ -11,6 +11,7 @@ impl DurableTelemetryStore {
         batch: &crate::NativeTelemetryBatch,
         wait_for_index: bool,
     ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        self.check_append_partition_sizes(&batch.partitions)?;
         let encoded = batch
             .encode()
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
@@ -49,6 +50,7 @@ impl DurableTelemetryStore {
         wait_for_index: bool,
         retry_id: u128,
     ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        self.check_append_partition_sizes(&batch.partitions)?;
         let encoded = batch
             .encode_native_append()
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
@@ -568,6 +570,11 @@ impl DurableTelemetryStore {
                 "native telemetry batch requires at least one partition",
             ));
         }
+        self.check_append_encoded_sizes(
+            partitions
+                .iter()
+                .map(|partition| partition.envelope_range.len()),
+        )?;
         if self.append_gate.is_some() {
             for partition in partitions {
                 let envelope = wire.slice(partition.envelope_range.clone());

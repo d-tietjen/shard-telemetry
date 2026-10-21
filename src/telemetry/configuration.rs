@@ -45,7 +45,8 @@ pub struct ShardTelemetryConfig {
     pub traces: SignalConfig,
     /// Metric storage and query limits.
     pub metrics: SignalConfig,
-    /// Maximum decompressed OTLP request body.
+    /// Maximum decompressed OTLP request body. In-process normalized appends
+    /// apply this ceiling to the sum of exact encoded durable envelope bytes.
     pub max_otlp_request_bytes: usize,
     /// Maximum partition appends executing concurrently per request.
     pub max_parallel_partition_appends: NonZeroU16,

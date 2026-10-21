@@ -36,6 +36,36 @@ fn embedded_budget_builder_bounds_local_and_s3_managed_storage() {
             .is_some()
     );
     assert_eq!(local.object_tier.retirement_grace, Duration::ZERO);
+    for ram_first in [true, false] {
+        let config = EmbeddedTelemetryConfig::bounded_local(
+            std::env::temp_dir().join("shard-telemetry-unused-small-ssd-config"),
+            Duration::from_secs(60),
+        );
+        let small_ssd = if ram_first {
+            config
+                .with_max_ram_bytes(64 * 1024 * 1024)
+                .with_max_ssd_bytes(1024 * 1024)
+        } else {
+            config
+                .with_max_ssd_bytes(1024 * 1024)
+                .with_max_ram_bytes(64 * 1024 * 1024)
+        };
+        small_ssd
+            .validate()
+            .expect("either builder order clamps to the smaller group allowance");
+        let resident = small_ssd
+            .local_limits
+            .native_resident
+            .expect("resident policy");
+        assert!(
+            resident.max_payload_bytes_per_partition
+                <= small_ssd.object_tier.max_group_payload_bytes
+        );
+        assert!(
+            resident.append_work.max_encoded_block_bytes as u64
+                <= resident.publication_target_bytes()
+        );
+    }
 
     let archived = EmbeddedTelemetryConfig::bounded(
         std::env::temp_dir().join("shard-telemetry-unused-s3-budget-config"),
@@ -85,6 +115,128 @@ fn embedded_budget_builder_bounds_local_and_s3_managed_storage() {
 }
 
 #[test]
+fn ram_budgets_disable_retained_correlation_navigation_and_reject_overrides() {
+    let config = EmbeddedTelemetryConfig::bounded_local(
+        std::env::temp_dir().join("shard-telemetry-unused-correlation-budget"),
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        config.local_limits.correlations,
+        crate::CorrelationConfig::default()
+    );
+    for ram in [8 * 1024 * 1024, 64 * 1024 * 1024] {
+        let bounded = config.clone().with_max_ram_bytes(ram);
+        assert_eq!(
+            bounded.local_limits.correlations,
+            crate::CorrelationConfig::disabled()
+        );
+        bounded.validate().expect("RAM budget");
+        let mut override_limits = bounded.local_limits.clone();
+        override_limits.correlations = crate::CorrelationConfig::default();
+        assert!(
+            bounded
+                .with_local_limits(override_limits)
+                .validate()
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn ram_budget_requires_an_immutable_tier_even_with_a_recovery_journal() {
+    let mut config = EmbeddedTelemetryConfig::bounded_local(
+        std::env::temp_dir().join("shard-telemetry-unused-no-tier-budget"),
+        Duration::from_secs(60),
+    );
+    config.store.object_store_directory = None;
+    config.store.recovery_journal = true;
+    config
+        .validate()
+        .expect("unbudgeted journal-only configuration remains supported");
+    let error = config
+        .with_max_ram_bytes(8 * 1024 * 1024)
+        .validate()
+        .expect_err("a journal cannot release sealed native payloads");
+    assert!(error.to_string().contains("immutable object tier"));
+}
+
+#[test]
+fn native_query_work_limits_scale_across_physical_owners_and_reject_unsafe_overrides() {
+    for ram in [8 * 1024 * 1024, 64 * 1024 * 1024] {
+        let mut config = EmbeddedTelemetryConfig::bounded_local(
+            std::env::temp_dir().join("shard-telemetry-unused-query-work-budget"),
+            Duration::from_secs(60),
+        );
+        config.store.shard_count = 4;
+        config.store.tenant_partitions = 1;
+        let bounded = config.with_max_ram_bytes(ram);
+        bounded.validate().expect("physical-owner work policy");
+        let work = bounded.local_limits.native_query_work.expect("finite work");
+        assert_eq!(work.max_winner_bytes as u64 * 4, ram / 16);
+        assert_eq!(work.max_encoded_block_bytes as u64 * 4, ram / 16);
+        assert!(work.max_winner_records > 0);
+        for kind in ["missing", "rows", "bytes", "zero"] {
+            let mut local_limits = bounded.local_limits.clone();
+            if kind == "missing" {
+                local_limits.native_query_work = None;
+            } else {
+                let limits = local_limits.native_query_work.as_mut().expect("work");
+                match kind {
+                    "rows" => limits.max_winner_records += 1,
+                    "bytes" => limits.max_winner_bytes += 1,
+                    "zero" => limits.max_decoded_records = 0,
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                bounded
+                    .clone()
+                    .with_local_limits(local_limits)
+                    .validate()
+                    .is_err(),
+                "{kind}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_resident_policy_cannot_be_removed_or_enlarged_after_ram_configuration() {
+    let mut config = EmbeddedTelemetryConfig::bounded_local(
+        std::env::temp_dir().join("shard-telemetry-unused-resident-budget"),
+        Duration::from_secs(60),
+    );
+    assert!(config.local_limits.native_resident.is_none());
+    config.store.tenant_partitions = 256;
+    let bounded = config.with_max_ram_bytes(64 * 1024 * 1024);
+    bounded
+        .validate()
+        .expect("partition and owner reserves fit");
+    for kind in ["missing", "partition", "decoded", "encoded"] {
+        let mut limits = bounded.local_limits.clone();
+        if kind == "missing" {
+            limits.native_resident = None;
+        } else {
+            let resident = limits.native_resident.as_mut().expect("resident limits");
+            match kind {
+                "partition" => resident.max_payload_bytes_per_partition += 1,
+                "decoded" => resident.append_work.max_winner_bytes += 1,
+                "encoded" => resident.append_work.max_encoded_block_bytes += 1,
+                _ => unreachable!(),
+            }
+        }
+        assert!(
+            bounded
+                .clone()
+                .with_local_limits(limits)
+                .validate()
+                .is_err(),
+            "{kind}"
+        );
+    }
+}
+
+#[test]
 fn direct_embedded_log_path_is_lifecycle_checked_and_avoids_the_native_listener() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -108,6 +260,8 @@ fn direct_embedded_log_path_is_lifecycle_checked_and_avoids_the_native_listener(
             indexed_ack_timeout: Duration::from_secs(30),
         }))
         .expect("runtime opens");
+    assert_eq!(runtime.telemetry_partition_count(), 1);
+    assert_eq!(runtime.maximum_append_bytes(), 1024 * 1024);
     let event = OtlpLogEvent {
         timestamp_unix_nanos: 42,
         message: Arc::from("embedded fast path"),

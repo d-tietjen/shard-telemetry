@@ -1,5 +1,12 @@
 //! Loki API ownership: stable store contract and models, routing, ingestion, LogQL, and handlers.
 //! `loki_api/` separates HTTP routes, parsing, evaluation, and operational endpoints.
+//!
+//! Hosts may attach `axum::Extension<Arc<dyn NativeRequestGate>>` to Loki tail
+//! requests. The actual session retains that same gate and checks each encoded
+//! initial/live/lag message after sink readiness, before enqueueing it. It does
+//! not recapture owners or confer authority, nor retain a permission atomically
+//! through later transport writes. With no extension, existing tail behavior
+//! remains. Optional analytical deferred bodies require their own integration.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -165,6 +172,12 @@ pub struct LokiQueryResult {
 
 /// Storage contract used by the Loki-compatible protocol boundary.
 pub trait LokiStore: Send + Sync + std::fmt::Debug {
+    /// Optional raw protocol request ceiling for a bounded native backend.
+    /// Reference/unbudgeted stores retain the caller's existing API policy.
+    fn maximum_ingest_request_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Atomically accepts one normalized push for a tenant.
     fn push(&self, tenant: &str, entries: Vec<LokiEntry>) -> Result<(), LokiApiError>;
 
@@ -483,6 +496,12 @@ impl std::fmt::Display for LokiApiError {
 impl std::error::Error for LokiApiError {}
 
 impl LokiApiError {
+    /// Returns whether invalid input must be rejected without retrying it.
+    #[must_use]
+    pub fn is_bad_request(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST
+    }
+
     /// Creates a retryable storage/control-plane availability error for an
     /// embedded backend implementation.
     pub fn backend_unavailable(message: impl Into<String>) -> Self {

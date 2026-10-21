@@ -13,6 +13,8 @@ impl DurableTelemetryStore {
             };
             let watermarks = self.engine.watermarks(partition).map_err(engine_error)?;
             let retained_start = checkpoint.next_offset.min(watermarks.last_stable_offset);
+            let retained_start =
+                self.metric_rollup_retained_start(partition, watermarks.log_start, retained_start)?;
             if retained_start <= watermarks.log_start {
                 continue;
             }
@@ -88,7 +90,7 @@ impl DurableTelemetryStore {
                 let page_limit =
                     crate::analytics::DEFAULT_SCAN_BATCH_ROWS.min(limit.saturating_sub(emitted));
                 let event_relation = request.relation == AnalyticsRelation::SpanEvents;
-                let query = crate::TraceQuery {
+                let mut query = crate::TraceQuery {
                     tenant: Arc::clone(&request.tenant),
                     partition,
                     start_offset: next_offset.map(LogicalOffset::new),
@@ -109,6 +111,13 @@ impl DurableTelemetryStore {
                     min_duration_nanos: None,
                     limit: page_limit,
                 };
+                if let Some(cutoff) = self.signal_retention_cutoff(crate::TelemetrySignal::Traces) {
+                    query.start_time_unix_nanos = Some(
+                        query
+                            .start_time_unix_nanos
+                            .map_or(cutoff, |start| start.max(cutoff)),
+                    );
+                }
                 let targeted_shard = self.physical_shard_count.and_then(|shard_count| {
                     partition
                         .map(|partition| ShardId::new(partition.partition_id.get() % shard_count))
@@ -279,7 +288,7 @@ impl DurableTelemetryStore {
                 let page_limit =
                     crate::analytics::DEFAULT_SCAN_BATCH_ROWS.min(limit.saturating_sub(emitted));
                 let exemplar_relation = request.relation == AnalyticsRelation::MetricExemplars;
-                let query = crate::MetricQuery {
+                let mut query = crate::MetricQuery {
                     tenant: Arc::clone(&request.tenant),
                     // A bounded exact-series scan needs no continuation cursor.
                     // Leaving the partition unset selects the timestamp-ordered,
@@ -308,6 +317,14 @@ impl DurableTelemetryStore {
                         .flatten(),
                     limit: page_limit,
                 };
+                if let Some(cutoff) = self.signal_retention_cutoff(crate::TelemetrySignal::Metrics)
+                {
+                    query.start_time_unix_nanos = Some(
+                        query
+                            .start_time_unix_nanos
+                            .map_or(cutoff, |start| start.max(cutoff)),
+                    );
+                }
                 let points = if let Some(shard_count) = self.physical_shard_count
                     && request.series_id.is_some()
                 {

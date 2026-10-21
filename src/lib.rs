@@ -16,6 +16,7 @@ mod dictionary;
 mod embedded;
 mod envelope;
 mod error;
+mod evidence;
 #[cfg(feature = "fast-telemetry")]
 mod fast_telemetry;
 mod ingest_pack;
@@ -30,15 +31,20 @@ mod offload;
 mod otlp;
 mod otlp_server;
 mod otlp_signal;
+mod owned_append_pool;
 mod production;
 mod prometheus_api;
 mod prometheus_protocol;
 mod prometheus_xor;
 mod promql;
+mod provider_status;
 mod query;
 mod query_index;
+mod query_work;
 mod realtime_dictionary;
+mod recovery;
 mod remote_write;
+mod resident;
 mod rollup;
 mod s3_object_store;
 mod signal_ingest;
@@ -78,8 +84,34 @@ pub use embedded::{
 };
 pub use envelope::{MAX_TELEMETRY_ENVELOPE_BYTES, TelemetryEnvelope};
 pub use error::{TelemetryError, TelemetryResult};
+pub use evidence::{
+    EVIDENCE_DATASET_VERSION, EvidenceAdmission, EvidenceBatchContext, EvidenceClock,
+    EvidenceCommitReference, EvidenceCompleteness, EvidenceEventIdentity, EvidenceExportError,
+    EvidenceExportLimits, EvidenceLossInterval, EvidenceLossReason, EvidenceLossStatus,
+    EvidenceOwner, EvidencePublication, MAX_EVIDENCE_EVENTS, MAX_EVIDENCE_MANIFEST_BYTES,
+    MAX_EVIDENCE_OBJECT_BYTES, PreparedEvidenceBatch,
+};
 #[cfg(feature = "fast-telemetry")]
 pub use fast_telemetry::{FastTelemetryConfig, FastTelemetryExportReport, FastTelemetryExporter};
+#[cfg(unix)]
+pub use ingest_pack::{
+    PreparedRecoveredLogFrame, PreparedRecoveredMessages, PreparedRecoveredPackedMetadata,
+    PreparedRecoveredStructuralIndex, PreparedRecoveredStructuralMetadataBytes,
+    PreparedRecoveredStructuralOffsets, PreparedRecoveredStructuralSections,
+    PreparedRecoveredStructuralTimestamps, RecoveredMessageBytes, RecoveredMessageLimits,
+    RecoveredMessageUsage, RecoveredPackedInput, RecoveredPackedMetadataLimits,
+    RecoveredPackedMetadataUsage, RecoveredPackedNode, RecoveredPackedNodeKind,
+    RecoveredPackedRecord, RecoveredPackedRejection, RecoveredPackedValue,
+    RecoveredStructuralIndexLimits, RecoveredStructuralIndexUsage,
+    RecoveredStructuralMetadataByteUsage, RecoveredStructuralOffsetLimits,
+    RecoveredStructuralOffsetUsage, RecoveredStructuralSection, RecoveredStructuralSectionLimits,
+    RecoveredStructuralSectionUsage, RecoveredStructuralTimestampLimits,
+    RecoveredStructuralTimestampUsage, RetainedRecoveredLogFrameError,
+    RetainedRecoveredMessageError, RetainedRecoveredPackedMetadataError,
+    RetainedRecoveredStructuralIndexError, RetainedRecoveredStructuralMetadataByteError,
+    RetainedRecoveredStructuralOffsetError, RetainedRecoveredStructuralSectionError,
+    RetainedRecoveredStructuralTimestampError, decompress_recovered_log_frame_until,
+};
 pub use locality::{
     CompressionBlockAssignment, CompressionBlockCollator, CompressionBlockScore,
     CompressionLocalityConfig, CompressionLocalityRecord, CompressionLocalityStats,
@@ -124,6 +156,10 @@ pub use offload::{
 pub use otlp::{OtlpLogDecoder, OtlpLogEvent};
 pub use otlp_server::{OtlpIngestService, OtlpReceiverConfig, otlp_http_router, serve_otlp_grpc};
 pub use otlp_signal::{OtlpMetricEvent, OtlpSpanEvent, OtlpTelemetryDecoder};
+pub use owned_append_pool::{
+    TelemetryAppendPool, TelemetryAppendPoolLimits, TelemetryAppendPoolSetupError,
+    TelemetryAppendPoolSetupFailure, TelemetryTaskRegistry,
+};
 pub use production::{
     ProductionMetricsSnapshot, ProductionRuntime, ServiceLifecycle, ServiceState,
     SingleTenantConfig,
@@ -132,15 +168,29 @@ pub use prometheus_api::{PrometheusApiConfig, PrometheusService, prometheus_rout
 pub use promql::{
     PromqlEngine, PromqlError, PromqlLimits, PromqlSample, PromqlSeries, PromqlValue,
 };
+pub use provider_status::{
+    LocalPartitionPopulation, LocalPartitionProgress, LocalPartitionStatus,
+    MAX_PROVIDER_STATUS_PARTITIONS, MAX_PROVIDER_STATUS_REQUEST_BYTES,
+    MAX_PROVIDER_STATUS_RESPONSE_BYTES, ProviderCoverage, ProviderStatusPartition,
+    ProviderStatusRequest, ProviderStatusResponse, decode_native_provider_status_request,
+    decode_native_provider_status_response, encode_native_provider_status_request,
+    encode_native_provider_status_response,
+};
 pub use query_index::{BlockQueryIndex, PersistentQueryIndex, QueryBlockMetadata, QueryHit};
+pub use query_work::NativeQueryWorkLimits;
 pub use realtime_dictionary::{
     RealtimeDictionaryConfig, RealtimeDictionaryObserver, RealtimeDictionaryStats,
     RealtimeDictionaryTrainer,
+};
+pub use recovery::{
+    TelemetryRecoveryBudget, TelemetryRecoveryBuffer, TelemetryRecoveryError,
+    TelemetryRecoveryLimits, TelemetryRecoveryUsage,
 };
 pub use remote_write::{
     DecodedRemoteWrite, METRIC_FLAG_STALE, PROMETHEUS_STALE_NAN_BITS, RemoteWriteDecoder,
     RemoteWriteStats, RemoteWriteVersion,
 };
+pub use resident::NativeResidentLimits;
 pub use rollup::LifetimeMetricRollup;
 pub use s3_object_store::{S3ObjectStore, S3ObjectStoreConfig};
 pub use signal_ingest::{
@@ -150,7 +200,18 @@ pub use signal_ingest::{
     prepare_metric_envelope_with_protocol, prepare_trace_envelope,
 };
 pub use sink::{OtlpSinkConfig, SinkObjectTierConfig, TelemetryService, TelemetrySinkFactory};
-pub use stripe::{IndexReceipt, LogStripe, ShardStreamDurableSink, ShardTelemetry, StripeConfig};
+#[cfg(unix)]
+pub use sink::{
+    OwnedLogApplyLimits, OwnedLogDecompressionLimits, OwnedLogFactoryLimits, OwnedLogReplayLimits,
+    OwnedLogReplayPlan, OwnedLogShard, OwnedLogSinkFactory, RetainedOwnedLogFactoryError,
+};
+#[cfg(unix)]
+pub use sink_journal::{AnchoredJournalLimits, AnchoredSinkJournal, RetainedAnchoredJournalError};
+pub use stripe::{
+    IndexReceipt, LogStripe, LogStripeSetupFailure, LogStripeSetupLimits,
+    LogStripeSetupObservation, PreparedLogStripe, RetainedLogStripeSetupError,
+    ShardStreamDurableSink, ShardTelemetry, StripeConfig,
+};
 pub use structural::{
     DecodedStructuralRecord, EmbeddedFrameIndex, IndexedStructuralBlock, StructuralLogMetadataRef,
     StructuralRecordView, decode_embedded_frame_index, decode_structural_block,
@@ -170,7 +231,7 @@ pub(crate) use telemetry::{
 pub use telemetry_store::{
     DurableTelemetryConfig, DurableTelemetryLimits, DurableTelemetryStore, FetchedTelemetryBatch,
     LifetimeRollupReport, RetentionReport, TelemetryAppendDurability, TelemetryAppendGate,
-    TelemetryHostAttachment,
+    TelemetryEngineAttachment, TelemetryHostAttachment, TelemetryRecoveredCatalogs,
 };
 pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};
 pub use tier::{

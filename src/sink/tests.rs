@@ -24,14 +24,192 @@ use shard_stream_engine::{
 use shard_stream_protocol::{AppendRequest, Durability};
 
 use crate::{
-    LocalObjectStore, MetricExemplar, MetricIdentity, MetricKind, MetricValue, NumberValue,
-    OtlpMetricEvent, OtlpTelemetryDecoder, ResourceContext, ScopeContext,
-    SharedTelemetryObjectStore, TelemetryRecordRef,
+    CorrelationBlockFilter, LocalObjectStore, MetricExemplar, MetricIdentity, MetricKind,
+    MetricValue, NumberValue, OtlpMetricEvent, OtlpTelemetryDecoder, ResourceContext, ScopeContext,
+    SharedTelemetryObjectStore, SignalTierPayload, TelemetryRecordRef,
 };
 
 use super::*;
 
-struct TempDir(PathBuf);
+pub(super) struct TempDir(pub(super) PathBuf);
+
+#[test]
+fn manual_native_query_work_rejects_retained_navigation_before_factory_allocation() {
+    let config = OtlpSinkConfig {
+        native_query_work: Some(crate::NativeQueryWorkLimits::for_ram_budget(
+            8 * 1024 * 1024,
+            1,
+        )),
+        ..OtlpSinkConfig::default()
+    };
+    let error = match TelemetrySinkFactory::new([ShardId::new(0)], config) {
+        Err(error) => error,
+        Ok(owner) => {
+            drop(owner);
+            panic!("explicit work policy cannot enable unbounded posting materialization");
+        }
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("disabled retained correlation navigation")
+    );
+}
+
+#[test]
+fn bounded_correlation_top_k_handles_late_earlier_offsets_in_real_groups() {
+    let directory = TempDir::new("late-native-query-groups");
+    let signals = ShardTelemetryConfig::default();
+    let trace = crate::TraceId::from_bytes([17; 16]).expect("trace");
+    let partition = TelemetryRouter::from_config(&signals).trace("tenant-a", trace);
+    let work = crate::NativeQueryWorkLimits::for_ram_budget(8 * 1024 * 1024, 1);
+    let cache = SsdCacheConfig {
+        chunk_bytes: 1_024,
+        max_read_bytes: 512 * 1_024,
+        ..SsdCacheConfig::default()
+    };
+    let config = OtlpSinkConfig {
+        signals,
+        correlations: CorrelationConfig::disabled(),
+        native_query_work: Some(work),
+        object_tier: Some(SinkObjectTierConfig {
+            store: SharedTelemetryObjectStore::from(
+                LocalObjectStore::open(directory.0.join("objects")).expect("object store"),
+            ),
+            spool_directory: directory.0.join("spool"),
+            control_cache_directory: directory.0.join("control"),
+            payload_cache_directory: directory.0.join("payload"),
+            partitions: vec![partition],
+            tier: ObjectTierConfig::default(),
+            control_cache: cache,
+            payload_cache: cache,
+            warm_local_cache_on_publish: false,
+        }),
+        ..OtlpSinkConfig::default()
+    };
+    let expected = [0, 50].map(|offset| {
+        TelemetryRecordRef::for_signal(
+            TelemetrySignal::Traces,
+            partition,
+            LogicalOffset::new(offset),
+        )
+    });
+    {
+        let factory =
+            TelemetrySinkFactory::new([ShardId::new(0)], config.clone()).expect("factory");
+        {
+            let mut stripes = factory.available.lock().expect("unopened owner");
+            let stripe = stripes.get_mut(&ShardId::new(0)).expect("stripe");
+            for (sequence, offset) in [(0, 50), (1, 0)] {
+                let request = ExportTraceServiceRequest {
+                    resource_spans: vec![ResourceSpans {
+                        scope_spans: vec![ScopeSpans {
+                            spans: vec![Span {
+                                trace_id: trace.as_bytes().to_vec(),
+                                span_id: (offset + 1_u64).to_be_bytes().to_vec(),
+                                name: "late publication".into(),
+                                start_time_unix_nano: 10,
+                                end_time_unix_nano: 11,
+                                ..Span::default()
+                            }],
+                            ..ScopeSpans::default()
+                        }],
+                        ..ResourceSpans::default()
+                    }],
+                };
+                let event = OtlpTelemetryDecoder
+                    .decode_traces("tenant-a", &request.encode_to_vec())
+                    .expect("validated native span")
+                    .remove(0);
+                let span =
+                    event.into_durable(ShardId::new(0), partition, LogicalOffset::new(offset));
+                let payload = SignalTierPayload {
+                    resident_id: sequence + 1,
+                    topic_partition: partition,
+                    min_signal_identity: u128::from_be_bytes(*trace.as_bytes()),
+                    max_signal_identity: u128::from_be_bytes(*trace.as_bytes()),
+                    first_offset: offset,
+                    last_offset: offset,
+                    record_count: 1,
+                    min_timestamp_unix_nanos: 10,
+                    max_timestamp_unix_nanos: 11,
+                    payload: Arc::from(
+                        crate::encode_trace_block(std::slice::from_ref(&span))
+                            .expect("actual codec"),
+                    ),
+                    correlation_filter: CorrelationBlockFilter::for_spans(std::slice::from_ref(
+                        &span,
+                    )),
+                };
+                let state = stripe
+                    .signal_tiers
+                    .get_mut(&TelemetrySignal::Traces)
+                    .expect("native tier");
+                let tier = state.tiers.get_mut(&partition).expect("partition tier");
+                let source = stage_signal_group(
+                    directory.0.join(format!("stage-{sequence}")),
+                    "signal",
+                    TelemetrySignal::Traces,
+                    sequence,
+                    tier.root().next_block_id,
+                    TierCheckpoint {
+                        next_placement_sequence: sequence + 1,
+                        next_offset: 51 + sequence,
+                    },
+                    &[payload],
+                    &[],
+                )
+                .expect("real immutable group");
+                tier.publish_group(source)
+                    .expect("monotonic checkpoint with late older payload");
+                // The same record is also resident; navigation must deduplicate
+                // its hot/cold copies without changing cursor order.
+                stripe
+                    .traces
+                    .apply_ref(&span, 11)
+                    .expect("resident duplicate");
+            }
+        }
+        let service = factory.service();
+        let _sink = factory.open_shard(ShardId::new(0)).expect("owner starts");
+        let query = CorrelationQuery::new("tenant-a")
+            .with_trace_id(trace)
+            .for_signal(TelemetrySignal::Traces)
+            .with_limit(1);
+        assert_eq!(
+            service
+                .query_correlations(&query)
+                .expect("smallest ref from later group"),
+            vec![expected[0]]
+        );
+        assert_eq!(
+            service
+                .query_correlations(&query.after(expected[0]))
+                .expect("continuation"),
+            vec![expected[1]]
+        );
+    }
+    let recovered =
+        TelemetrySinkFactory::new([ShardId::new(0)], config).expect("actual tier recovery");
+    let service = recovered.service();
+    let _sink = recovered
+        .open_shard(ShardId::new(0))
+        .expect("recovered owner");
+    let query = CorrelationQuery::new("tenant-a")
+        .with_trace_id(trace)
+        .for_signal(TelemetrySignal::Traces)
+        .with_limit(1);
+    assert_eq!(
+        service.query_correlations(&query).expect("cold smallest"),
+        vec![expected[0]]
+    );
+    assert_eq!(
+        service
+            .query_correlations(&query.after(expected[0]))
+            .expect("cold continuation"),
+        vec![expected[1]]
+    );
+}
 
 #[test]
 fn query_worker_registry_keeps_a_sorted_snapshot() {
@@ -108,7 +286,7 @@ fn bounded_fanout_merge_sorts_only_the_selected_prefix() {
 }
 
 impl TempDir {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -182,7 +360,7 @@ fn payload() -> Vec<u8> {
         .expect("STEL encodes")
 }
 
-fn durable_append(
+pub(super) fn durable_append(
     topic_partition: TopicPartition,
     payload: Vec<u8>,
     batch: u128,
@@ -591,6 +769,19 @@ fn trace_and_metric_queries_survive_object_tier_restart() {
         .expect("cold trace query");
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].name.as_ref(), "cold trace");
+    assert_eq!(
+        service
+            .query_traces(&TraceQuery {
+                tenant: Arc::from("tenant-a"),
+                trace_id: Some(trace_id),
+                start_time_unix_nanos: Some(15),
+                end_time_unix_nanos: Some(14),
+                limit: 10,
+                ..TraceQuery::default()
+            })
+            .expect("cold crossing span with retained end and historical start"),
+        spans
+    );
     let points = service
         .query_metrics(&MetricQuery {
             tenant: Arc::from("tenant-a"),
@@ -676,4 +867,51 @@ fn trace_and_metric_queries_survive_object_tier_restart() {
         .expect("object-tier cache diagnostics exist");
     assert_eq!(after_absent.payload.hits, before_absent.payload.hits);
     assert_eq!(after_absent.payload.misses, before_absent.payload.misses);
+    let retained = CorrelationQuery::new("tenant-a")
+        .with_trace_id(trace_id)
+        .with_limit(1);
+    let refs = service
+        .query_correlations_with_retention(&retained, [0, 15, 31])
+        .expect("cold retained correlation");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(
+        refs[0].signal,
+        TelemetrySignal::Traces,
+        "span crosses cutoff while metric point has expired"
+    );
+    let bounded_start = CorrelationQuery {
+        end_time_unix_nanos: Some(14),
+        ..retained.clone()
+    };
+    assert_eq!(
+        service
+            .query_correlations_with_retention(&bounded_start, [0, 15, 31])
+            .expect("cold start-time bound"),
+        refs
+    );
+    let after_span_start = CorrelationQuery {
+        start_time_unix_nanos: Some(11),
+        ..retained.clone()
+    };
+    assert!(
+        service
+            .query_correlations_with_retention(&after_span_start, [0, 15, 31])
+            .expect("preserve start-time filter")
+            .is_empty()
+    );
+    assert!(
+        service
+            .query_correlations_with_retention(&retained, [0, 21, 31])
+            .expect("expired native signals")
+            .is_empty()
+    );
+    service
+        .retain_object_tier_for_signal_windows([0, 15, 31], None)
+        .expect("independent physical maintenance");
+    assert_eq!(
+        service
+            .query_correlations_with_retention(&retained, [0, 15, 31])
+            .expect("cold crossing span after maintenance"),
+        refs
+    );
 }

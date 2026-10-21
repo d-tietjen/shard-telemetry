@@ -76,7 +76,7 @@ impl DurableTelemetryStore {
                 .or_default()
                 .push(timestamp);
         }
-        let retention_cutoff = self.retention_cutoff();
+        let retention_cutoff = self.signal_retention_cutoff(crate::TelemetrySignal::Metrics);
         for timestamps in timestamp_queries.values_mut() {
             timestamps.sort_unstable();
             timestamps.dedup();

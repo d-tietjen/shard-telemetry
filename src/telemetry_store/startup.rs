@@ -1,6 +1,24 @@
 use super::*;
 
 impl DurableTelemetryStore {
+    /// Returns the maximum encoded STEL envelope accepted by this store.
+    ///
+    /// Each envelope must fit the engine's append ceiling. The complete set of
+    /// envelopes in one normalized call must also fit the configured signal
+    /// ingestion ceiling, measured using exact durable encoding sizes.
+    #[must_use]
+    pub fn maximum_append_bytes(&self) -> usize {
+        self.engine
+            .maximum_batch_bytes()
+            .min(self.service.maximum_ingest_bytes())
+    }
+
+    pub(crate) fn bounded_ingest_bytes(&self) -> Option<usize> {
+        self.service
+            .bounded_ingest_bytes()
+            .map(|_| self.maximum_append_bytes())
+    }
+
     /// Returns the common logical partition count used by this local store.
     #[must_use]
     pub const fn telemetry_partition_count(&self) -> u32 {
@@ -119,7 +137,29 @@ impl DurableTelemetryStore {
         for signal in [&mut signals.logs, &mut signals.traces, &mut signals.metrics] {
             signal.logical_partitions = logical_partitions;
             signal.physical_stripes = physical_stripes;
-            signal.retention = config.retention;
+            signal.retention = config.retention.or(signal.retention);
+        }
+        let signal_retention = [
+            signals.logs.retention,
+            signals.traces.retention,
+            signals.metrics.retention,
+        ];
+        if signal_retention
+            .iter()
+            .any(|retention| retention.is_some_and(|window| window.is_zero()))
+        {
+            return Err(LokiApiError::configuration(
+                "signal retention must be nonzero",
+            ));
+        }
+        if signal_retention.iter().any(Option::is_some)
+            && !config.recovery_journal
+            && config.object_store_directory.is_none()
+            && config.s3_object_store.is_none()
+        {
+            return Err(LokiApiError::configuration(
+                "signal retention requires a recovery journal or immutable object tier",
+            ));
         }
         let data_directory_lease = DataDirectoryLease::acquire(&config.data_directory)?;
         let lifetime_rollups = max_lifetime_rollup_series
@@ -191,11 +231,14 @@ impl DurableTelemetryStore {
         let sink_config = OtlpSinkConfig {
             stripe: config.stripe,
             signals,
+            correlations: limits.correlations,
+            native_query_work: limits.native_query_work,
+            native_resident: limits.native_resident,
             state_directory: config
                 .recovery_journal
                 .then(|| config.data_directory.join("index-journal")),
             max_journal_bytes: limits.max_index_journal_bytes,
-            journal_sync_each_append: config.retention.is_some(),
+            journal_sync_each_append: signal_retention.iter().any(Option::is_some),
             object_tier: sink_object_tier,
             ..OtlpSinkConfig::default()
         };
@@ -239,7 +282,7 @@ impl DurableTelemetryStore {
         }
         Ok(Self {
             _data_directory_lease: data_directory_lease,
-            engine,
+            engine: engine.into(),
             service,
             append_durability: Durability::Leader,
             append_gate: None,
@@ -255,7 +298,8 @@ impl DurableTelemetryStore {
             lifetime_rollups,
             remote_write_append: new_remote_write_locks(),
             deletes,
-            retention: config.retention,
+            retention: signal_retention[0],
+            signal_retention,
             retention_runs: AtomicU64::new(0),
             retention_advanced_offsets: AtomicU64::new(0),
             retention_failures: AtomicU64::new(0),
@@ -308,7 +352,19 @@ impl DurableTelemetryStore {
     pub fn attach_with_durability(
         attachment: TelemetryHostAttachment,
     ) -> Result<Self, LokiApiError> {
-        let TelemetryHostAttachment {
+        Self::attach_with_engine_handle(attachment.into())
+    }
+
+    /// Attaches the query and ingestion store to the host's complete engine owner.
+    ///
+    /// This uses the same validation, topic creation and durability behavior as
+    /// [`Self::attach_with_durability`]. It retains the supplied recovery wrapper
+    /// for every store operation; it never extracts or opens another engine.
+    /// The caller still owns startup deadlines, readiness and write permission.
+    pub fn attach_with_engine_handle(
+        attachment: TelemetryEngineAttachment,
+    ) -> Result<Self, LokiApiError> {
+        let TelemetryEngineAttachment {
             data_directory,
             engine,
             service,
@@ -382,6 +438,7 @@ impl DurableTelemetryStore {
             remote_write_append: new_remote_write_locks(),
             deletes,
             retention,
+            signal_retention: [retention; 3],
             retention_runs: AtomicU64::new(0),
             retention_advanced_offsets: AtomicU64::new(0),
             retention_failures: AtomicU64::new(0),
@@ -438,7 +495,16 @@ impl DurableTelemetryStore {
     }
 
     pub(super) fn retention_cutoff(&self) -> Option<u64> {
-        let retention = self.retention?;
+        self.signal_retention_cutoff(crate::TelemetrySignal::Logs)
+    }
+
+    pub(super) fn signal_retention_cutoff(&self, signal: crate::TelemetrySignal) -> Option<u64> {
+        let index = match signal {
+            crate::TelemetrySignal::Logs => 0,
+            crate::TelemetrySignal::Traces => 1,
+            crate::TelemetrySignal::Metrics => 2,
+        };
+        let retention = self.signal_retention[index]?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -453,6 +519,26 @@ impl DurableTelemetryStore {
             (None, Some(cutoff)) => Some(cutoff),
             (requested, None) => requested,
         }
+    }
+
+    /// Bind log retention before analytical selectors choose an optimized owner path.
+    /// Other relations apply retention to their parent span or metric query so
+    /// residual child timestamp filters keep their original meaning.
+    pub(super) fn retained_analytics_request(
+        &self,
+        request: &AnalyticsScanRequest,
+    ) -> AnalyticsScanRequest {
+        let mut retained = request.clone();
+        if request.relation == AnalyticsRelation::Logs
+            && let Some(cutoff) = self.signal_retention_cutoff(crate::TelemetrySignal::Logs)
+        {
+            retained.start_timestamp_unix_nanos = Some(
+                retained
+                    .start_timestamp_unix_nanos
+                    .map_or(cutoff, |start| start.max(cutoff)),
+            );
+        }
+        retained
     }
 
     pub(super) fn standalone_owner_shard(&self, partition: TopicPartition) -> Option<ShardId> {

@@ -4,7 +4,9 @@
 mod filter;
 mod query;
 use query::*;
-pub(crate) use query::{metric_matches_correlation, span_matches_correlation};
+pub(crate) use query::{
+    log_matches_correlation, metric_matches_correlation, span_matches_correlation,
+};
 mod index;
 #[cfg(test)]
 mod tests;
@@ -33,6 +35,25 @@ pub struct CorrelationConfig {
     pub max_refs_per_key: usize,
     /// Maximum references retained across all postings.
     pub max_total_refs: usize,
+}
+
+impl CorrelationConfig {
+    /// Disables retained navigation postings and their identity caches.
+    ///
+    /// Exact signal records supply correlation results without retaining a
+    /// second metadata index. Lookups may therefore decode more signal data.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            max_keys: 0,
+            max_refs_per_key: 0,
+            max_total_refs: 0,
+        }
+    }
+
+    pub(crate) const fn is_enabled(self) -> bool {
+        self.max_keys > 0 && self.max_refs_per_key > 0 && self.max_total_refs > 0
+    }
 }
 
 impl Default for CorrelationConfig {
@@ -217,6 +238,36 @@ pub struct CorrelationIndex {
 struct CorrelationPosting {
     record_ref: TelemetryRecordRef,
     timestamp_unix_nanos: u64,
+    retention_timestamp_unix_nanos: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CorrelationTimestamps {
+    event: u64,
+    retention: u64,
+}
+
+impl From<u64> for CorrelationTimestamps {
+    fn from(timestamp: u64) -> Self {
+        Self {
+            event: timestamp,
+            retention: timestamp,
+        }
+    }
+}
+
+/// Separates retention clocks from correlation's public event-time predicates.
+pub(crate) fn correlation_record_is_retained(
+    signal: TelemetrySignal,
+    timestamp: u64,
+    cutoffs: [u64; 3],
+) -> bool {
+    let cutoff = match signal {
+        TelemetrySignal::Logs => cutoffs[0],
+        TelemetrySignal::Traces => cutoffs[1],
+        TelemetrySignal::Metrics => cutoffs[2],
+    };
+    timestamp >= cutoff
 }
 
 #[derive(Debug)]

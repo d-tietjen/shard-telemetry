@@ -169,6 +169,16 @@ pub fn encode_metric_chunk(points: &[DurableMetricPoint]) -> TelemetryResult<Vec
 
 /// Decodes and verifies one signal-native metric chunk.
 pub fn decode_metric_chunk(encoded: &[u8]) -> TelemetryResult<Vec<DurableMetricPoint>> {
+    decode_metric_chunk_with_work_limits(encoded, None)
+}
+
+pub(crate) fn decode_metric_chunk_with_work_limits(
+    encoded: &[u8],
+    limits: Option<crate::NativeQueryWorkLimits>,
+) -> TelemetryResult<Vec<DurableMetricPoint>> {
+    if let Some(limits) = limits {
+        limits.encoded(encoded.len())?;
+    }
     const FIXED_HEADER: usize = 52;
     if encoded.len() < FIXED_HEADER + 32 || encoded[..4] != METRIC_CHUNK_MAGIC {
         return Err(TelemetryError::InvalidBlockEncoding(
@@ -198,6 +208,9 @@ pub fn decode_metric_chunk(encoded: &[u8]) -> TelemetryResult<Vec<DurableMetricP
         )),
     );
     let count = u32::from_le_bytes(encoded[32..36].try_into().expect("fixed range")) as usize;
+    if let Some(limits) = limits {
+        limits.rows(count)?;
+    }
     let expected_fingerprint = SeriesFingerprint::from_raw(u128::from_le_bytes(
         encoded[36..52].try_into().expect("fixed range"),
     ));
@@ -210,16 +223,23 @@ pub fn decode_metric_chunk(encoded: &[u8]) -> TelemetryResult<Vec<DurableMetricP
     let offsets = decompress_u64(read_section(encoded, &mut cursor, payload_end)?, count)?;
     let timestamps =
         decode_timestamp_delta_of_delta(read_section(encoded, &mut cursor, payload_end)?, count)?;
-    let values = decode_metric_values(read_section(encoded, &mut cursor, payload_end)?, count)?;
+    let values = decode_metric_values(
+        read_section(encoded, &mut cursor, payload_end)?,
+        count,
+        limits,
+    )?;
     let compressed_sidecars = read_section(encoded, &mut cursor, payload_end)?;
     if cursor != payload_end {
         return Err(TelemetryError::InvalidBlockEncoding(
             "trailing metric chunk sections",
         ));
     }
+    let sidecar_limit = limits.map_or(Ok(64 * 1024 * 1024), |limits| {
+        limits.sidecar(compressed_sidecars, 64 * 1024 * 1024)
+    })?;
     let sidecar_bytes = METRIC_DECOMPRESSOR.with_borrow_mut(|decompressor| {
         decompressor
-            .decompress(compressed_sidecars, 64 * 1024 * 1024)
+            .decompress(compressed_sidecars, sidecar_limit)
             .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric sidecar compression"))
     })?;
     let sidecars: MetricChunkSidecars = rmp_serde::from_slice(&sidecar_bytes)
@@ -452,6 +472,7 @@ pub(super) fn encode_metric_values(points: &[&DurableMetricPoint]) -> TelemetryR
 pub(super) fn decode_metric_values(
     encoded: &[u8],
     count: usize,
+    limits: Option<crate::NativeQueryWorkLimits>,
 ) -> TelemetryResult<Vec<MetricValue>> {
     let (&codec, payload) = encoded
         .split_first()
@@ -496,7 +517,7 @@ pub(super) fn decode_metric_values(
             });
         }
         5 => {
-            return decode_zstd_value_lane::<ExplicitHistogramValue>(payload, count).map(
+            return decode_zstd_value_lane::<ExplicitHistogramValue>(payload, count, limits).map(
                 |values| {
                     values
                         .into_iter()
@@ -506,17 +527,16 @@ pub(super) fn decode_metric_values(
             );
         }
         6 => {
-            return decode_zstd_value_lane::<ExponentialHistogramValue>(payload, count).map(
-                |values| {
+            return decode_zstd_value_lane::<ExponentialHistogramValue>(payload, count, limits)
+                .map(|values| {
                     values
                         .into_iter()
                         .map(MetricValue::ExponentialHistogram)
                         .collect()
-                },
-            );
+                });
         }
         7 => {
-            return decode_zstd_value_lane::<SummaryValue>(payload, count)
+            return decode_zstd_value_lane::<SummaryValue>(payload, count, limits)
                 .map(|values| values.into_iter().map(MetricValue::Summary).collect());
         }
         0 => {}
@@ -724,6 +744,7 @@ pub(super) fn encode_zstd_value_lane<T: Serialize>(
 pub(super) fn decode_zstd_value_lane<T: for<'de> Deserialize<'de>>(
     encoded: &[u8],
     count: usize,
+    limits: Option<crate::NativeQueryWorkLimits>,
 ) -> TelemetryResult<Vec<T>> {
     if encoded.len() < 4 {
         return Err(TelemetryError::InvalidBlockEncoding(
@@ -731,6 +752,9 @@ pub(super) fn decode_zstd_value_lane<T: for<'de> Deserialize<'de>>(
         ));
     }
     let raw_len = u32::from_le_bytes(encoded[..4].try_into().expect("fixed range")) as usize;
+    if let Some(limits) = limits {
+        limits.metric_values(raw_len)?;
+    }
     if raw_len > 64 * 1024 * 1024 {
         return Err(TelemetryError::InvalidBlockEncoding(
             "metric value lane exceeds safety limit",

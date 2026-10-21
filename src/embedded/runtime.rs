@@ -1,6 +1,18 @@
 use super::*;
 
 impl EmbeddedTelemetryRuntime {
+    /// Returns the common logical signal partition count used for local routing.
+    #[must_use]
+    pub fn telemetry_partition_count(&self) -> u32 {
+        self.store.telemetry_partition_count()
+    }
+
+    /// Returns the largest encoded durable envelope accepted by local ingestion.
+    #[must_use]
+    pub fn maximum_append_bytes(&self) -> usize {
+        self.store.maximum_append_bytes()
+    }
+
     /// Opens and recovers the local durable store. The data directory remains
     /// exclusively owned until this runtime and all store clones are dropped.
     pub fn open(config: EmbeddedTelemetryConfig) -> Result<Self, LokiApiError> {

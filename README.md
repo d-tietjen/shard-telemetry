@@ -10,7 +10,7 @@ deployments.
 
 ## Project status
 
-This is a pre-release project. The package is versioned 0.2.0; published
+This is a pre-release project. The package is versioned 0.3.0; published
 releases use the `shard-telemetry` crate name. Storage formats, network
 protocol details, and operational defaults may change before a stable release.
 Evaluate it against a representative workload and follow the compatibility
@@ -23,6 +23,8 @@ process, and contributor expectations are public and linked below.
 
 - Native STEL ingestion and query over TCP, with checksummed envelopes and
   durable acknowledgements.
+- Bounded authenticated native status for actual local WAL and applied-index
+  frontiers, with source, retention, scoped-loss and HA coverage explicitly unknown.
 - OTLP/gRPC and OTLP/HTTP ingestion for logs, traces, and metrics.
 - Signal-aware storage, immutable query-index artifacts, and a bounded local
   cache for object-tier reads.
@@ -30,11 +32,100 @@ process, and contributor expectations are public and linked below.
   lifecycle-owned, durable node-local telemetry store.
 - A store-and-forward UpstreamOffloader for forwarding durable embedded
   envelopes to a central ShardTelemetry service.
+- An explicit [immutable evidence publication primitive](EVIDENCE_DATASET.md)
+  for already admitted, organization-split STEL batches; host export lifecycle
+  and central snapshot querying require their own integration.
 - Explicit compatibility boundaries for Loki, Prometheus/PromQL, Tempo/TraceQL,
   and ClickHouse integrations.
 
 Unsupported protocol and query features are rejected explicitly; consult the
 compatibility documents instead of assuming API parity with another system.
+
+Attached hosts with a stream write fence must implement
+`TelemetryAppendGate::append_leader_epoch` using trusted current host authority.
+Every ingestion path supplies that token at its final engine submission; native
+client envelopes cannot override it. The engine checks the token before WAL
+reservation. Existing gates default to no token for unfenced compatibility,
+which cannot authorize a fenced engine. This handoff does not establish HA
+query ownership, indexed quorum, source coverage or retained-query completeness.
+
+Hosts that recover an `EngineHandle` can attach it with
+`TelemetryEngineAttachment` and `DurableTelemetryStore::attach_with_engine_handle`.
+The store retains the complete engine owner, including recovered directory
+ownership, through ingestion and query work. The existing
+`TelemetryHostAttachment` API continues to accept `Arc<StreamEngine>` and uses
+the same attachment implementation. Hosts remain responsible for startup
+deadlines, sink installation, write fencing and readiness.
+
+`TelemetryRecoveredCatalogs::recover` provides a separate bounded catalog
+preparation step on Linux/Android. A single `TelemetryRecoveryBudget` keeps the
+original absolute deadline and cumulative limits for file/path bytes,
+directory advances (including dot entries, retries and EOF), JSON object/value
+counts, decoded strings, declared retained state and work. Regular-file reads
+use nofollow/nonblocking opens and explicit bounded attempts; buffer and path
+capacities are checked after allocation. A tree-free JSON census precedes typed
+decoding, with escaped-string scratch accounted separately. Refusal errors can
+retain actual buffers and physical errors without exposing buffer contents in
+Debug output. These are input and declared-state bounds, not process RSS or a
+hard limit on filesystem syscall duration.
+
+The recovered owner holds the real delete/retry catalogs and releases its
+exclusive directory lease last. Bounded receipt migration reconciles retained
+v1 input even after partial v2 publication, preserves identical retries and
+rejects conflicting identities. Expired v1 entries need no fabricated v2 file;
+stale temporary files are safely rewritten on restart. Existing constructors
+retain their prior behavior. Catalog names must remain stable and writers must
+cooperate with the lease: separate rename/remove/reopen operations do not form
+a kernel-atomic namespace fence. This stage does not open a complete owned
+store or qualify sink/object recovery, worker construction or serving readiness.
+
+`TelemetryAppendPool::build_until` is a separate actual worker producer. It
+requires an explicit worker count and requested stack size, shares the caller's
+`TelemetryRecoveryBudget`, and registers every actual Rayon worker with a
+host-provided `TelemetryTaskRegistry` using the same saved expiry. Each worker
+keeps the complete engine handle until its physical loop exits. The host must
+retain entered thread handles and their actual outcomes even when registration
+returns a late error. Drop the pool before joining the registry; a cooperative
+stop flag alone cannot replace Rayon's termination/physical join sequence.
+Partial startup and late registration failures keep entered work in that
+registry. A successfully constructed pool refused at its final clock check is
+retained in the error until dropped. Worker count, requested stacks, names and
+known callback state are admitted; private Rayon scheduler allocations and OS
+stack rounding are not measured allocator/RSS bounds. This does not yet connect
+bounded journal/object recovery and catalogs into a complete owned attachment.
+
+The internal consuming [log-index publication producer](src/stripe/BOUNDED-PUBLICATION.md)
+installs normal compressed query frames and their watermark using the original
+native resume work and deadline. It retains real input, child results and
+partial query state on refusal. The separate internal
+[consuming log transaction](src/sink/BOUNDED-APPLY.md) joins genuine anchored
+journal commit, query-index commit and publication in the original shared
+application-checkpoint/cache owners. The actual
+[owned log factory](src/sink/BOUNDED-OWNED-LOG.md) connects that transaction to
+the strict sink trait and host-registered workers for recovered single-log
+commands. The opt-in `OwnedLogSinkFactory::new_with_replay_until` accepts an
+explicit complete configured log-partition scope and finite replay limits. Its
+first genuine native checkpoint callback validates the whole cross-shard journal
+chain and rebuilds the actual query/application state on the registered workers
+without rewriting journal bytes. Unsupported transaction shapes, conflicting
+edges, incomplete scope, expiry or partial failure keep the factory terminal;
+original rows and physical outcomes remain retained. The existing `new_until`
+continues to reject nonempty journals. Local replay grants no current control,
+HA query ownership or source-completeness proof. Ordinary live validation,
+serving, other signal/object modes, private product and host integration remain
+gates. Empty engine recovery does not invoke a checkpoint callback: an opt-in
+factory remains quarantined until a genuine configured-partition checkpoint
+turn completes its actual adoption. The explicit
+`AnchoredSinkJournal::open_application_until` producer creates `STELAPP2` files
+for actual global application edges distributed over physical shards. The
+writer borrows the held global application-checkpoint map and original native
+work, stores the unchanged native expected/next and shard coordinates, and
+allows only local sparse nonregression after the global edge matched. Reopen
+still checks the complete cross-anchor chain before any index mutation.
+`open_until` retains the `STELSNK1` domain and its original exact local placement
+comparison. Each opener rejects the other format; mixed-format sources are
+ineligible, and application-format factories require explicit replay opt-in.
+No existing journal is relabeled, rewritten or silently migrated.
 
 ## Related projects
 
@@ -126,6 +217,108 @@ oldest-first. `embedded.storage_health()` reports complete logical and
 allocated directory bytes, rollup bytes and series, WAL payload bytes, index
 backlog, retention failures, quota headroom, and the last successful
 maintenance time.
+
+The durable store preserves separate log, trace, and raw metric retention
+windows when `DurableTelemetryConfig.retention` is `None`. An explicit global
+window overrides all three signal windows. Reads enforce these windows before
+optimized owner queries; trace retention uses the span end time, including
+spans that begin before the cutoff. Events and links follow their parent span,
+and exemplars follow their parent metric point. Maintenance removes complete
+expired signal groups and safely checkpoints their WAL offsets; restart keeps
+the same windows. Retention requires a recovery journal or immutable object
+tier. Lifetime metric rollups keep their separate aggregate semantics.
+When lifetime rollups are enabled, both object-backed WAL reclamation and
+time-based physical retention keep metric source batches until their rollup
+checkpoint is persisted. An indexed append arriving after a flush's rollup
+snapshot remains available for the next checkpoint, including after restart.
+
+Correlation lookups enforce the requested tenant in both navigation indexes
+and cold log reads, including when tenants share a partition, trace ID, or label.
+Correlation event-time bounds are inclusive for every signal, including logs
+that carry only compatibility fields.
+
+An embedded RAM budget disables the optional retained correlation navigation
+postings and identity caches. Correlation lookups then match exact typed signal
+records in the resident indexes and object tier, including logs, span links and
+metric exemplars. This retains query results while trading additional lookup
+and decoding work for lower retained memory. Stores without a RAM budget keep
+the default navigation policy; `DurableTelemetryLimits.correlations` can select
+an explicit policy or disable navigation independently.
+
+RAM-budget mode also supplies `DurableTelemetryLimits.native_query_work`.
+Its `NativeQueryWorkLimits` declare per-owner ceilings for encoded blocks,
+decoded sidecar/variable-value bytes and rows, control objects, distinct winners, and cumulative
+winner materialization. Each byte fragment is derived from one sixteenth of
+the configured RAM allowance divided across configured physical owner stripes; adding
+logical partitions does not multiply that allowance. Cache chunks/read bounds
+follow these ceilings. Cold native queries visit one catalog page, manifest and
+block at a time. Correlation pages retain the smallest exact references across
+all candidates, including later-published groups with earlier offsets.
+Checked log queries also traverse groups and frames lazily, keeping an admitted
+top result set in the requested offset or timestamp order. They preflight
+compressed query-index expansion, structural rows and typed metadata expansion,
+and avoid retaining parsed log frames or posting caches. Exact typed correlation
+filters continue across bounded pages, so a string identity cannot consume the
+limit for an integer identity. Compatibility-field lookups propagate the same
+capacity errors.
+Native tenant-partition discovery follows the same lazy control admission and
+does not retain tenant-partition caches under the work policy. Its aggregate
+counts remain exact and independent of a response page's winner limit.
+
+Winner accounting streams MessagePack into a byte counter rather than creating
+another encoded payload. It charges serialized deep payloads and concrete
+row/key headers before insertion, including replacing older logical versions;
+shared payloads are deliberately charged repeatedly. The merged owner results
+have an aggregate ceiling derived from the owner count. These are conservative
+work/materialization limits, not allocator measurements or a process RSS quota.
+A block, sidecar, winner set or result that exceeds its declared ceiling fails
+with a query-capacity error instead of returning an incomplete successful page.
+Bounded decoding also rejects sidecar frames whose content size cannot be
+verified. Stores with no work policy preserve their existing decoding and query
+behavior. An explicit work policy requires disabled retained correlation
+navigation. Additional scan latency, startup/publication state, allocator
+overhead and process memory still require operational qualification.
+
+`with_max_ram_bytes` requires a local or S3 immutable object tier. A recovery
+journal alone cannot release sealed trace and metric payloads from resident
+storage. Configurations that omit the RAM budget preserve their existing
+journal-only or memory-only choices.
+
+RAM-budget mode supplies `DurableTelemetryLimits.native_resident` as well.
+For allowance `R` and the sum `N` of logical trace and metric partitions,
+`NativeResidentLimits` reserves `R/4` for sealed payloads: each uniquely owned
+partition has ceiling `G = R/(4*N)`. The native publication target and encoded
+append ceiling are at most `G/4`; later group/request overrides cannot enlarge
+these effective ceilings. Each completed bounded append seals its partition
+before evaluating the publication threshold. Actual encoded sealing checks
+the ceiling before removing heads. A failed publication keeps its indexed
+boundary for an identical retry, so retries do not add another sealed copy.
+Other partitions have independent finite allowances.
+
+Decoded append work is derived from `R/(16*physical_owners)` and capped by the
+native head allowances. Record counts, declared decompressed sidecars and log
+structural bytes, and cumulative serialized record/header charges are checked
+before WAL admission. This owner allowance lets ordinary multi-source metric
+metadata use more than a tiny fraction of one logical partition's encoded
+allowance; compressed expansion that exceeds it fails admission. The builder
+reserves separate preflight, owner decode and decoded validation-cache charges,
+in addition to query work and queues, before allocating heads/dictionaries/caches.
+These are finite declared encoded/materialization charges. Allocator/RSS,
+startup metadata and transport concurrency still require measured qualification.
+Unbudgeted configurations retain their existing append, sealing and group policy.
+Enabling a resident policy does not rewrite existing WAL or immutable blocks.
+An over-budget persisted input fails closed when bounded reopen/replay or query
+decoding reads it; existing data must be qualified against the new ceilings.
+
+Normalized in-process calls reject oversized input with `LokiApiError::is_bad_request()`
+before dispatching any partition or reserving a retry identity. Each exact encoded
+STEL envelope must fit the engine's append ceiling, and their combined bytes must
+fit `signals.max_otlp_request_bytes`. This normalized-data ceiling is separate
+from the original decompressed OTLP transport body. With a resident policy,
+HTTP body/gzip limits and OTLP/gRPC decoding also clamp to the effective native
+input ceiling before protocol decoding. Store and embedded runtime
+`maximum_append_bytes()` expose the conservative single-envelope ceiling; native
+transport adapters must also enforce their own complete encoded-frame ceiling.
 
 Use `EmbeddedEvictionPolicy::OffloadToS3` instead of `Delete` to preserve full
 raw history. Publication is write-through: a group becomes authoritative in a

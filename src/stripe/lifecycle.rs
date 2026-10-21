@@ -35,6 +35,7 @@ impl LogStripe {
             compressor: StripeCompressor::new(compression_level)?,
             tier: None,
             next_frame_id: 0,
+            native_query_work: None,
         })
     }
 

@@ -1,6 +1,39 @@
 use super::*;
 
 impl TelemetryService {
+    pub(crate) fn bounded_ingest_bytes(&self) -> Option<usize> {
+        self.native_resident.map(|_| self.max_ingest_bytes)
+    }
+    fn query_result_capacity(&self, limit: usize, owners: usize) -> usize {
+        let capacity = fanout_result_capacity(Some(limit), owners);
+        self.native_query_work.map_or(capacity, |work| {
+            capacity.min(work.max_winner_records.saturating_mul(owners.max(1)))
+        })
+    }
+
+    fn append_query_results<T: serde::Serialize>(
+        &self,
+        target: &mut Vec<T>,
+        incoming: Vec<T>,
+        owners: usize,
+    ) -> TelemetryResult<()> {
+        if let Some(mut work) = self.native_query_work {
+            work.max_winner_records = work.max_winner_records.saturating_mul(owners.max(1));
+            work.max_winner_bytes = work.max_winner_bytes.saturating_mul(owners.max(1));
+            work.winners(target.len().saturating_add(incoming.len()))?;
+            let mut budget = crate::query_work::QueryWorkBudget::new(Some(work));
+            for value in target.iter().chain(incoming.iter()) {
+                budget.replace(None, value, 0)?;
+            }
+        }
+        target.extend(incoming);
+        Ok(())
+    }
+
+    pub(crate) const fn maximum_ingest_bytes(&self) -> usize {
+        self.max_ingest_bytes
+    }
+
     /// Returns shared cold-tier cache occupancy and object-read counters.
     #[must_use]
     pub fn object_tier_cache_stats(&self) -> Option<ObjectTierCacheStats> {
@@ -28,6 +61,7 @@ impl TelemetryService {
     /// Fans a native trace query across all owner stripes and merges by trace/start/offset.
     pub fn query_traces(&self, query: &TraceQuery) -> TelemetryResult<Vec<DurableSpan>> {
         let workers = self.worker_senders()?;
+        let owners = workers.len();
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
             let (response, receiver) = sync_channel(1);
@@ -43,16 +77,17 @@ impl TelemetryService {
                 })?;
             responses.push((shard_id, receiver));
         }
-        let mut spans = Vec::with_capacity(fanout_result_capacity(
-            Some(query.limit.max(1)),
-            responses.len(),
-        ));
+        let mut spans = Vec::with_capacity(self.query_result_capacity(query.limit.max(1), owners));
         for (shard_id, receiver) in responses {
-            spans.extend(receiver.recv().map_err(|_| {
-                TelemetryError::QueryWorkerUnavailable(format!(
-                    "stripe {shard_id} stopped while querying traces"
-                ))
-            })??);
+            self.append_query_results(
+                &mut spans,
+                receiver.recv().map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped while querying traces"
+                    ))
+                })??,
+                owners,
+            )?;
         }
         sort_and_limit(&mut spans, Some(query.limit.max(1)), |left, right| {
             if query.partition.is_some() {
@@ -84,7 +119,8 @@ impl TelemetryService {
     ) -> TelemetryResult<Vec<DurableSpan>> {
         let limit = query.limit.max(1);
         let mut workers = self.worker_senders()?;
-        let mut spans = Vec::with_capacity(limit);
+        let owners = workers.len();
+        let mut spans = Vec::with_capacity(self.query_result_capacity(limit, owners));
         if workers.is_empty() {
             return Ok(spans);
         }
@@ -102,11 +138,15 @@ impl TelemetryService {
                     "stripe {first_shard_id} stopped before accepting an unordered trace query"
                 ))
             })?;
-        spans.extend(first_receiver.recv().map_err(|_| {
-            TelemetryError::QueryWorkerUnavailable(format!(
-                "stripe {first_shard_id} stopped while querying unordered traces"
-            ))
-        })??);
+        self.append_query_results(
+            &mut spans,
+            first_receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {first_shard_id} stopped while querying unordered traces"
+                ))
+            })??,
+            owners,
+        )?;
         if spans.len() >= limit {
             spans.truncate(limit);
             return Ok(spans);
@@ -131,11 +171,15 @@ impl TelemetryService {
             responses.push((shard_id, receiver));
         }
         for (shard_id, receiver) in responses {
-            spans.extend(receiver.recv().map_err(|_| {
-                TelemetryError::QueryWorkerUnavailable(format!(
-                    "stripe {shard_id} stopped while querying unordered traces"
-                ))
-            })??);
+            self.append_query_results(
+                &mut spans,
+                receiver.recv().map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped while querying unordered traces"
+                    ))
+                })??,
+                owners,
+            )?;
         }
         spans.truncate(limit);
         Ok(spans)
@@ -149,7 +193,8 @@ impl TelemetryService {
     ) -> TelemetryResult<Vec<TraceProjection>> {
         let limit = query.limit.max(1);
         let mut workers = self.worker_senders()?;
-        let mut spans = Vec::with_capacity(limit);
+        let owners = workers.len();
+        let mut spans = Vec::with_capacity(self.query_result_capacity(limit, owners));
         if workers.is_empty() {
             return Ok(spans);
         }
@@ -167,11 +212,15 @@ impl TelemetryService {
                     "stripe {first_shard_id} stopped before accepting an unordered projected trace query"
                 ))
             })?;
-        spans.extend(first_receiver.recv().map_err(|_| {
-            TelemetryError::QueryWorkerUnavailable(format!(
-                "stripe {first_shard_id} stopped while querying unordered projected traces"
-            ))
-        })??);
+        self.append_query_results(
+            &mut spans,
+            first_receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {first_shard_id} stopped while querying unordered projected traces"
+                ))
+            })??,
+            owners,
+        )?;
         if spans.len() >= limit {
             spans.truncate(limit);
             return Ok(spans);
@@ -196,11 +245,15 @@ impl TelemetryService {
             responses.push((shard_id, receiver));
         }
         for (shard_id, receiver) in responses {
-            spans.extend(receiver.recv().map_err(|_| {
-                TelemetryError::QueryWorkerUnavailable(format!(
-                    "stripe {shard_id} stopped while querying unordered projected traces"
-                ))
-            })??);
+            self.append_query_results(
+                &mut spans,
+                receiver.recv().map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped while querying unordered projected traces"
+                    ))
+                })??,
+                owners,
+            )?;
         }
         spans.truncate(limit);
         Ok(spans)
@@ -258,6 +311,7 @@ impl TelemetryService {
     /// Fans a native raw metric query across all owner stripes and merges by time/offset.
     pub fn query_metrics(&self, query: &MetricQuery) -> TelemetryResult<Vec<DurableMetricPoint>> {
         let workers = self.worker_senders()?;
+        let owners = workers.len();
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
             let (response, receiver) = sync_channel(1);
@@ -273,16 +327,17 @@ impl TelemetryService {
                 })?;
             responses.push((shard_id, receiver));
         }
-        let mut points = Vec::with_capacity(fanout_result_capacity(
-            Some(query.limit.max(1)),
-            responses.len(),
-        ));
+        let mut points = Vec::with_capacity(self.query_result_capacity(query.limit.max(1), owners));
         for (shard_id, receiver) in responses {
-            points.extend(receiver.recv().map_err(|_| {
-                TelemetryError::QueryWorkerUnavailable(format!(
-                    "stripe {shard_id} stopped while querying metrics"
-                ))
-            })??);
+            self.append_query_results(
+                &mut points,
+                receiver.recv().map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped while querying metrics"
+                    ))
+                })??,
+                owners,
+            )?;
         }
         sort_and_limit(&mut points, Some(query.limit.max(1)), |left, right| {
             if query.partition.is_some() {
@@ -326,6 +381,7 @@ impl TelemetryService {
         query: &MetricTimestampQuery,
     ) -> TelemetryResult<Vec<DurableMetricPoint>> {
         let workers = self.worker_senders()?;
+        let owners = workers.len();
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
             let (response, receiver) = sync_channel(1);
@@ -343,11 +399,15 @@ impl TelemetryService {
         }
         let mut points = Vec::new();
         for (shard_id, receiver) in responses {
-            points.extend(receiver.recv().map_err(|_| {
-                TelemetryError::QueryWorkerUnavailable(format!(
-                    "stripe {shard_id} stopped while executing an exact metric probe"
-                ))
-            })??);
+            self.append_query_results(
+                &mut points,
+                receiver.recv().map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped while executing an exact metric probe"
+                    ))
+                })??,
+                owners,
+            )?;
         }
         points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
         Ok(points)
@@ -384,10 +444,20 @@ impl TelemetryService {
         &self,
         query: &CorrelationQuery,
     ) -> TelemetryResult<Vec<TelemetryRecordRef>> {
+        self.query_correlations_with_retention(query, [0; 3])
+    }
+
+    /// Enforces retention at each owner before its bounded result is collected.
+    pub(crate) fn query_correlations_with_retention(
+        &self,
+        query: &CorrelationQuery,
+        signal_cutoffs: [u64; 3],
+    ) -> TelemetryResult<Vec<TelemetryRecordRef>> {
         if query.limit == 0 {
             return Ok(Vec::new());
         }
         let workers = self.worker_senders()?;
+        let owners = workers.len();
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
             let (response, receiver) = sync_channel(1);
@@ -399,6 +469,7 @@ impl TelemetryService {
             sender
                 .send(SinkCommand::Correlate {
                     query: query.clone(),
+                    signal_cutoffs,
                     buffer,
                     response,
                 })
@@ -417,6 +488,15 @@ impl TelemetryService {
                 ))
             })??;
             if let Some(refs) = refs.as_mut() {
+                if let Some(mut work) = self.native_query_work {
+                    work.max_winner_records = work.max_winner_records.saturating_mul(owners.max(1));
+                    work.max_winner_bytes = work.max_winner_bytes.saturating_mul(owners.max(1));
+                    work.winners(refs.len().saturating_add(worker_refs.len()))?;
+                    let mut budget = crate::query_work::QueryWorkBudget::new(Some(work));
+                    for value in refs.iter().chain(worker_refs.iter()) {
+                        budget.replace(None, value, 0)?;
+                    }
+                }
                 refs.extend(worker_refs.iter().copied());
                 if let Ok(mut pool) = self.correlation_buffers.lock() {
                     pool.recycle(worker_refs);

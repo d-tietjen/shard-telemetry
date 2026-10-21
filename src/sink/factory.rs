@@ -76,6 +76,7 @@ impl TelemetrySinkFactory {
                 )?,
                 None => LogStripe::new(shard_id, config.stripe.clone())?,
             };
+            logs.set_query_work_limits(config.native_query_work);
             if let Some(observer) = &realtime_dictionary {
                 logs.attach_realtime_dictionary(observer.clone());
             }
@@ -117,6 +118,15 @@ impl TelemetrySinkFactory {
             let mut metric_recovery_states = Vec::new();
             if let (Some(tier), Some(caches)) = (&config.object_tier, &tier_caches) {
                 for signal in [TelemetrySignal::Traces, TelemetrySignal::Metrics] {
+                    let mut native_tier = tier.tier;
+                    if let Some(resident) = config.native_resident {
+                        native_tier.target_group_payload_bytes = native_tier
+                            .target_group_payload_bytes
+                            .min(resident.publication_target_bytes());
+                        native_tier.max_group_payload_bytes = native_tier
+                            .max_group_payload_bytes
+                            .min(resident.max_payload_bytes_per_partition);
+                    }
                     let partitions = tier
                         .partitions
                         .iter()
@@ -130,7 +140,7 @@ impl TelemetrySinkFactory {
                         tier.spool_directory.clone(),
                         caches,
                         partitions,
-                        (tier.tier, tier.warm_local_cache_on_publish),
+                        (native_tier, tier.warm_local_cache_on_publish),
                     )? {
                         for checkpoint in opened.checkpoints {
                             merge_recovered_checkpoint(&mut recovered_checkpoints, checkpoint)?;
@@ -145,15 +155,31 @@ impl TelemetrySinkFactory {
             for recovery_state in metric_recovery_states {
                 metrics.restore_accumulator_checkpoints(&recovery_state)?;
             }
+            let mut traces = TraceStripe::new(config.signals.traces.head_memory_bytes_per_stripe)?;
+            traces.set_query_work_limits(config.native_query_work);
+            metrics.set_query_work_limits(config.native_query_work);
+            traces.set_resident_payload_limit(
+                config
+                    .native_resident
+                    .map(|resident| resident.max_payload_bytes_per_partition),
+            );
+            metrics.set_resident_payload_limit(
+                config
+                    .native_resident
+                    .map(|resident| resident.max_payload_bytes_per_partition),
+            );
             let stripe = TelemetryStripeState {
                 stream_shard_id: shard_id,
                 logs,
-                traces: TraceStripe::new(config.signals.traces.head_memory_bytes_per_stripe)?,
+                traces,
                 metrics,
                 correlations: CorrelationIndex::new(config.correlations),
                 log_partitions: config.signals.logs.logical_partitions.get(),
                 signal_tiers,
+                indexed_publications: HashMap::new(),
                 router: TelemetryRouter::from_config(&config.signals),
+                native_query_work: config.native_query_work,
+                native_resident: config.native_resident,
             };
             if available.insert(shard_id, stripe).is_some() {
                 return Err(TelemetryError::DuplicateStripe(shard_id));
@@ -204,6 +230,19 @@ impl TelemetrySinkFactory {
             }
             recovered_checkpoints.insert(transaction.next.topic_partition, transaction.next);
         }
+        let validated_signal_cache = if let Some(resident) = config.native_resident {
+            let owners = u64::from(
+                config
+                    .signals
+                    .traces
+                    .physical_stripes
+                    .get()
+                    .max(config.signals.metrics.physical_stripes.get()),
+            );
+            ValidatedSignalCache::bounded(resident.cache_bytes(owners))
+        } else {
+            ValidatedSignalCache::default()
+        };
         Ok(Self {
             config,
             available: Mutex::new(available),
@@ -212,7 +251,8 @@ impl TelemetrySinkFactory {
             query_workers: Arc::new(RwLock::new(QueryWorkerRegistry::default())),
             correlation_buffers: Arc::new(Mutex::new(CorrelationBufferPool::default())),
             active_log_partition_cache: Arc::new(Mutex::new(HashMap::new())),
-            validated_signal_cache: Arc::new(ValidatedSignalCache::default()),
+            validated_signal_cache: Arc::new(validated_signal_cache),
+            native_validation: Mutex::new(()),
             tier_caches,
             object_store,
         })
@@ -223,6 +263,17 @@ impl TelemetrySinkFactory {
     #[must_use]
     pub fn service(&self) -> TelemetryService {
         TelemetryService {
+            max_ingest_bytes: self.config.native_resident.map_or(
+                self.config.signals.max_otlp_request_bytes,
+                |resident| {
+                    self.config
+                        .signals
+                        .max_otlp_request_bytes
+                        .min(resident.append_work.max_encoded_block_bytes)
+                },
+            ),
+            native_query_work: self.config.native_query_work,
+            native_resident: self.config.native_resident,
             workers: Arc::clone(&self.query_workers),
             correlation_buffers: Arc::clone(&self.correlation_buffers),
             active_log_partition_cache: Arc::clone(&self.active_log_partition_cache),
@@ -235,6 +286,26 @@ impl TelemetrySinkFactory {
 
 impl DurableAppendSinkFactory for TelemetrySinkFactory {
     fn validate_append(&self, payload: &[u8], record_count: NonZeroU32) -> EngineResult<()> {
+        let _materialization = if let Some(resident) = self.config.native_resident {
+            if payload.len() > resident.append_work.max_encoded_block_bytes {
+                return Err(EngineError::InvalidConfig(
+                    "native append exceeds the resident encoded input allowance".into(),
+                ));
+            }
+            resident
+                .append_work
+                .rows(record_count.get() as usize)
+                .map_err(log_error_to_engine)?;
+            resident
+                .append_work
+                .winners(record_count.get() as usize)
+                .map_err(log_error_to_engine)?;
+            Some(self.native_validation.lock().map_err(|_| {
+                EngineError::DurableSinkUnavailable("native append preflight lock poisoned".into())
+            })?)
+        } else {
+            None
+        };
         if !TelemetryEnvelope::is_encoded(payload) {
             return Err(EngineError::InvalidConfig(
                 "durable telemetry appends require the STEL envelope".into(),
@@ -251,29 +322,72 @@ impl DurableAppendSinkFactory for TelemetrySinkFactory {
         }
         let decoded_count = match envelope.signal {
             TelemetrySignal::Logs => {
-                validate_ingest_pack(envelope.payload, envelope.item_count)
-                    .map_err(log_error_to_engine)?;
+                if let Some(resident) = self.config.native_resident {
+                    crate::ingest_pack::validate_ingest_pack_with_work_limits(
+                        envelope.payload,
+                        envelope.item_count,
+                        Some(resident.append_work),
+                    )
+                } else {
+                    validate_ingest_pack(envelope.payload, envelope.item_count)
+                }
+                .map_err(log_error_to_engine)?;
                 envelope.item_count as usize
             }
             TelemetrySignal::Traces => {
-                let records = decode_trace_block(envelope.payload).map_err(log_error_to_engine)?;
+                let records = if let Some(resident) = self.config.native_resident {
+                    crate::trace::decode_trace_block_with_work_limits(
+                        envelope.payload,
+                        None,
+                        Some(resident.append_work),
+                    )
+                } else {
+                    decode_trace_block(envelope.payload)
+                }
+                .map_err(log_error_to_engine)?;
+                let charge = if let Some(resident) = self.config.native_resident {
+                    resident
+                        .charge_records(&records, |record| {
+                            crate::encode_trace_block(std::slice::from_ref(record))
+                        })
+                        .map_err(log_error_to_engine)?
+                } else {
+                    envelope.payload.len()
+                };
                 let decoded_count = records.len();
                 if decoded_count == envelope.item_count as usize {
                     self.validated_signal_cache.insert(
                         envelope.checksum,
-                        envelope.payload.len(),
+                        charge,
                         ValidatedSignalPayload::Traces(records),
                     );
                 }
                 decoded_count
             }
             TelemetrySignal::Metrics => {
-                let records = decode_metric_chunk(envelope.payload).map_err(log_error_to_engine)?;
+                let records = if let Some(resident) = self.config.native_resident {
+                    crate::metric::decode_metric_chunk_with_work_limits(
+                        envelope.payload,
+                        Some(resident.append_work),
+                    )
+                } else {
+                    decode_metric_chunk(envelope.payload)
+                }
+                .map_err(log_error_to_engine)?;
+                let charge = if let Some(resident) = self.config.native_resident {
+                    resident
+                        .charge_records(&records, |record| {
+                            crate::encode_metric_chunk(std::slice::from_ref(record))
+                        })
+                        .map_err(log_error_to_engine)?
+                } else {
+                    envelope.payload.len()
+                };
                 let decoded_count = records.len();
                 if decoded_count == envelope.item_count as usize {
                     self.validated_signal_cache.insert(
                         envelope.checksum,
-                        envelope.payload.len(),
+                        charge,
                         ValidatedSignalPayload::Metrics(records),
                     );
                 }
@@ -300,6 +414,15 @@ impl DurableAppendSinkFactory for TelemetrySinkFactory {
                     "shard-telemetry checkpoint lock poisoned".into(),
                 )
             })
+    }
+
+    #[cfg(unix)]
+    fn load_checkpoint_until(
+        &self,
+        topic_partition: TopicPartition,
+        work: &shard_stream_engine::NativeResumeWork,
+    ) -> shard_stream_engine::NativeResumeCallbackResult<Option<DurableSinkCheckpoint>> {
+        super::bounded_callback::load_checkpoint_until(&self.checkpoints, topic_partition, work)
     }
 
     fn open_shard(&self, shard_id: ShardId) -> EngineResult<Arc<dyn DurableAppendSink>> {
@@ -342,12 +465,12 @@ impl DurableAppendSinkFactory for TelemetrySinkFactory {
             })?
             .insert(shard_id, sender.clone());
         Ok(Arc::new(ShardTelemetryStripeSink {
-            state: Arc::new(SinkState {
+            state: ShardSinkOwner::Legacy(Arc::new(SinkState {
                 shard_id,
                 sender: Mutex::new(Some(sender)),
                 worker: Mutex::new(Some(worker)),
                 query_workers: Arc::clone(&self.query_workers),
-            }),
+            })),
         }))
     }
 }

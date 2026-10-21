@@ -695,9 +695,11 @@ impl LogStripe {
             Some(attribute_tables),
             cached_fields.as_deref(),
         )?;
-        cached_frame.cache_messages(candidates, &decoded);
-        if decode_all_fields {
-            cached_frame.cache_fields(candidates, &decoded);
+        if self.native_query_work.is_none() {
+            cached_frame.cache_messages(candidates, &decoded);
+            if decode_all_fields {
+                cached_frame.cache_fields(candidates, &decoded);
+            }
         }
         if cache_miss || field_cache_miss {
             self.indexed_frame_query_cache

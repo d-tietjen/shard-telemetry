@@ -3,6 +3,11 @@ mod server;
 pub use server::serve_native;
 mod dispatch;
 use dispatch::*;
+mod provider_status;
+#[cfg(test)]
+mod provider_status_qualification;
+#[cfg(test)]
+mod response_qualification;
 #[cfg(test)]
 mod tests;
 
@@ -55,7 +60,9 @@ pub trait NativeRequestGate: Send + Sync + std::fmt::Debug + 'static {
     /// query. The default keeps coordinator-only gates compatible. HA
     /// products override this when a node hosts only a subset of signal
     /// partitions, preventing a local query from being mistaken for a
-    /// cluster-wide result.
+    /// cluster-wide result. Successful query/status responses check this same
+    /// gate again after encoding. `Describe` also checks before advertising query
+    /// capabilities; an append-only response does not require query admission.
     fn check_query(&self) -> Result<(), String> {
         self.check()
     }

@@ -41,13 +41,25 @@ impl TelemetryService {
         cutoff_timestamp_unix_nanos: u64,
         max_payload_bytes_per_partition: Option<u64>,
     ) -> TelemetryResult<TierRetentionReport> {
+        self.retain_object_tier_for_signal_windows(
+            [cutoff_timestamp_unix_nanos; 3],
+            max_payload_bytes_per_partition,
+        )
+    }
+
+    /// Applies independent log, trace, and metric cutoffs on every owner.
+    pub(crate) fn retain_object_tier_for_signal_windows(
+        &self,
+        signal_cutoffs: [u64; 3],
+        max_payload_bytes_per_partition: Option<u64>,
+    ) -> TelemetryResult<TierRetentionReport> {
         let workers = self.worker_senders()?;
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
             let (response, receiver) = sync_channel(1);
             sender
                 .send(SinkCommand::RetainObjectTier {
-                    cutoff_timestamp_unix_nanos,
+                    signal_cutoffs,
                     max_payload_bytes_per_partition,
                     response,
                 })

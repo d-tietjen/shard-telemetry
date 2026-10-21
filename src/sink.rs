@@ -20,13 +20,16 @@ use shard_stream_engine::{
 };
 
 use crate::analytics::RelevanceScorer;
-use crate::correlation::{metric_matches_correlation, span_matches_correlation};
+use crate::correlation::{
+    correlation_record_is_retained, log_matches_correlation, metric_matches_correlation,
+    span_matches_correlation,
+};
 use crate::ingest_pack::validate_ingest_pack;
+use crate::metric::decode_metric_chunk_with_work_limits;
 use crate::metric::{metric_exact_series_point_matches, metric_query_matches};
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
 use crate::stripe::LogMessageMatch;
-use crate::tier::CachedObjectRange;
-use crate::trace::{TraceProjection, decode_trace_block_matching};
+use crate::trace::{TraceProjection, decode_trace_block_with_work_limits};
 use crate::{
     CorrelationConfig, CorrelationIndex, CorrelationQuery, DictionaryCatalog, DurableMetricPoint,
     DurableSpan, LogMatch, LogPredicate, LogQuery, LogStripe, MetricApplyOutcome,
@@ -39,9 +42,28 @@ use crate::{
     decode_signal_recovery_state, decode_trace_block, stage_signal_group,
 };
 
+#[cfg(unix)]
+mod bounded_apply;
+#[cfg(unix)]
+pub(crate) use bounded_apply::ApplicationJournalEdge;
+#[cfg(unix)]
+mod bounded_callback;
+#[cfg(unix)]
+pub(crate) use bounded_callback::{
+    JournalCallbackReceipt, append_application_journal_until, append_journal_until,
+};
+#[cfg(unix)]
+pub(crate) mod owned_log;
+#[cfg(unix)]
+pub use owned_log::{
+    OwnedLogApplyLimits, OwnedLogDecompressionLimits, OwnedLogFactoryLimits, OwnedLogReplayLimits,
+    OwnedLogReplayPlan, OwnedLogShard, OwnedLogSinkFactory, RetainedOwnedLogFactoryError,
+};
 mod factory;
 mod indexing;
 mod object_tier;
+#[cfg(test)]
+mod outage_qualification;
 mod service_logs;
 mod service_routing;
 mod service_signals;
@@ -110,6 +132,10 @@ pub struct OtlpSinkConfig {
     pub signals: ShardTelemetryConfig,
     /// Bounded stripe-local links across signal metadata and labels.
     pub correlations: CorrelationConfig,
+    /// Optional native query working-set ceilings on each owner.
+    pub native_query_work: Option<crate::NativeQueryWorkLimits>,
+    /// Optional per-partition resident payload and append-admission ceilings.
+    pub native_resident: Option<crate::NativeResidentLimits>,
     /// Number of durable append batches waiting to be indexed per shard.
     pub queue_slots: usize,
     /// Directory containing crash-safe stripe-local sink journals.
@@ -132,6 +158,8 @@ impl Default for OtlpSinkConfig {
             stripe: StripeConfig::default(),
             signals: ShardTelemetryConfig::default(),
             correlations: CorrelationConfig::default(),
+            native_query_work: None,
+            native_resident: None,
             queue_slots: 256,
             state_directory: None,
             max_journal_bytes: 64 * 1024 * 1024 * 1024,
@@ -144,12 +172,69 @@ impl Default for OtlpSinkConfig {
 impl OtlpSinkConfig {
     fn validate(&self) -> TelemetryResult<()> {
         self.signals.validate()?;
-        if self.correlations.max_keys == 0
-            || self.correlations.max_refs_per_key == 0
-            || self.correlations.max_total_refs == 0
-        {
+        if let Some(resident) = self.native_resident {
+            resident.validate()?;
+            let tier = self
+                .object_tier
+                .as_ref()
+                .ok_or(TelemetryError::InvalidConfig(
+                    "native resident limits require an immutable tier",
+                ))?;
+            if tier.tier.max_group_payload_bytes < resident.max_payload_bytes_per_partition
+                || resident.append_work.max_winner_bytes
+                    > self
+                        .signals
+                        .traces
+                        .head_memory_bytes_per_stripe
+                        .min(self.signals.metrics.head_memory_bytes_per_stripe)
+            {
+                return Err(TelemetryError::InvalidConfig(
+                    "native resident append allowance exceeds group or head capacity",
+                ));
+            }
+            for (signal, count) in [
+                (
+                    TelemetrySignal::Traces,
+                    self.signals.traces.logical_partitions.get(),
+                ),
+                (
+                    TelemetrySignal::Metrics,
+                    self.signals.metrics.logical_partitions.get(),
+                ),
+            ] {
+                for id in 0..count {
+                    if !tier.partitions.contains(&TopicPartition::new(
+                        signal.topic_id(),
+                        shard_stream_core::LogicalPartitionId::new(u32::from(id)),
+                    )) {
+                        return Err(TelemetryError::InvalidConfig(
+                            "native resident policy requires every admitted signal partition to have a tier",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(limits) = self.native_query_work {
+            limits.validate()?;
+            if self.correlations != CorrelationConfig::disabled() {
+                return Err(TelemetryError::InvalidConfig(
+                    "native query work limits require disabled retained correlation navigation",
+                ));
+            }
+            if self.object_tier.as_ref().is_some_and(|tier| {
+                tier.payload_cache.chunk_bytes
+                    > u64::try_from(limits.max_encoded_block_bytes).unwrap_or(u64::MAX)
+                    || tier.control_cache.chunk_bytes
+                        > u64::try_from(limits.max_control_object_bytes).unwrap_or(u64::MAX)
+            }) {
+                return Err(TelemetryError::InvalidConfig(
+                    "cache chunks exceed native query work ceilings",
+                ));
+            }
+        }
+        if self.correlations != CorrelationConfig::disabled() && !self.correlations.is_enabled() {
             return Err(TelemetryError::InvalidConfig(
-                "correlation index bounds must be nonzero",
+                "correlation index bounds must be all nonzero or all zero to disable navigation",
             ));
         }
         if self.queue_slots == 0 {
@@ -226,6 +311,7 @@ pub struct TelemetrySinkFactory {
     correlation_buffers: Arc<Mutex<CorrelationBufferPool>>,
     active_log_partition_cache: Arc<Mutex<HashMap<Arc<str>, Vec<TopicPartition>>>>,
     validated_signal_cache: Arc<ValidatedSignalCache>,
+    native_validation: Mutex<()>,
     tier_caches: Option<TierCaches>,
     object_store: Option<SharedTelemetryObjectStore>,
 }
@@ -318,17 +404,20 @@ struct ValidatedSignalCacheShard {
     entries: HashMap<[u8; 32], (usize, ValidatedSignalPayload)>,
     order: VecDeque<[u8; 32]>,
     bytes: usize,
+    max_bytes: Option<usize>,
 }
 
 impl ValidatedSignalCacheShard {
     fn insert(&mut self, key: [u8; 32], payload_bytes: usize, payload: ValidatedSignalPayload) {
-        if payload_bytes > MAX_VALIDATED_SIGNAL_CACHE_BYTES_PER_SHARD {
+        let maximum = self
+            .max_bytes
+            .unwrap_or(MAX_VALIDATED_SIGNAL_CACHE_BYTES_PER_SHARD);
+        if payload_bytes > maximum {
             return;
         }
         self.remove(key);
         while (self.entries.len() >= MAX_VALIDATED_SIGNAL_CACHE_ENTRIES_PER_SHARD
-            || self.bytes.saturating_add(payload_bytes)
-                > MAX_VALIDATED_SIGNAL_CACHE_BYTES_PER_SHARD)
+            || self.bytes.saturating_add(payload_bytes) > maximum)
             && !self.entries.is_empty()
         {
             let Some(oldest) = self.order.pop_front() else {
@@ -378,6 +467,18 @@ impl Default for ValidatedSignalCache {
 }
 
 impl ValidatedSignalCache {
+    fn bounded(max_bytes: usize) -> Self {
+        Self {
+            shards: (0..VALIDATED_SIGNAL_CACHE_SHARDS)
+                .map(|_| {
+                    Mutex::new(ValidatedSignalCacheShard {
+                        max_bytes: Some(max_bytes / VALIDATED_SIGNAL_CACHE_SHARDS),
+                        ..Default::default()
+                    })
+                })
+                .collect(),
+        }
+    }
     fn shard(&self, key: [u8; 32]) -> &Mutex<ValidatedSignalCacheShard> {
         let shard =
             usize::from(u16::from_le_bytes([key[0], key[1]])) % VALIDATED_SIGNAL_CACHE_SHARDS;
@@ -437,7 +538,43 @@ struct TelemetryStripeState {
     correlations: CorrelationIndex,
     log_partitions: u16,
     signal_tiers: HashMap<TelemetrySignal, SignalTierState>,
+    indexed_publications: HashMap<TopicPartition, IndexedPublication>,
     router: TelemetryRouter,
+    native_query_work: Option<crate::NativeQueryWorkLimits>,
+    native_resident: Option<crate::NativeResidentLimits>,
+}
+
+/// One fully indexed boundary whose publication has not yet succeeded.
+/// Payloads share the engine's charged pending buffers rather than copying
+/// their bytes. A retry must match the complete original durable descriptors.
+#[derive(Debug)]
+struct IndexedPublication {
+    expected: DurableSinkCheckpoint,
+    next: DurableSinkCheckpoint,
+    appends: Vec<DurableAppend>,
+}
+
+impl IndexedPublication {
+    fn matches(
+        &self,
+        expected: DurableSinkCheckpoint,
+        appends: &[DurableAppend],
+        next: DurableSinkCheckpoint,
+    ) -> bool {
+        self.expected == expected
+            && self.next == next
+            && self.appends.len() == appends.len()
+            && self.appends.iter().zip(appends).all(|(previous, retry)| {
+                previous.event_id == retry.event_id
+                    && previous.physical_shard_id == retry.physical_shard_id
+                    && previous.reservation == retry.reservation
+                    && previous.producer_event_id == retry.producer_event_id
+                    && previous.atomic_group == retry.atomic_group
+                    && previous.delivery == retry.delivery
+                    && previous.payload == retry.payload
+                    && previous.transient_context == retry.transient_context
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -629,6 +766,7 @@ enum SinkCommand {
     },
     Correlate {
         query: CorrelationQuery,
+        signal_cutoffs: [u64; 3],
         buffer: Vec<TelemetryRecordRef>,
         response: SyncSender<TelemetryResult<Vec<TelemetryRecordRef>>>,
     },
@@ -636,7 +774,7 @@ enum SinkCommand {
         response: SyncSender<TelemetryResult<usize>>,
     },
     RetainObjectTier {
-        cutoff_timestamp_unix_nanos: u64,
+        signal_cutoffs: [u64; 3],
         max_payload_bytes_per_partition: Option<u64>,
         response: SyncSender<TelemetryResult<TierRetentionReport>>,
     },
@@ -669,15 +807,28 @@ impl Drop for SinkState {
 }
 
 #[derive(Clone)]
+enum ShardSinkOwner {
+    Legacy(Arc<SinkState>),
+    #[cfg(unix)]
+    Owned(Arc<owned_log::OwnedLogWorker>),
+}
+#[derive(Clone)]
 struct ShardTelemetryStripeSink {
-    state: Arc<SinkState>,
+    state: ShardSinkOwner,
 }
 
 impl fmt::Debug for ShardTelemetryStripeSink {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ShardTelemetryStripeSink")
-            .field("shard_id", &self.state.shard_id)
+            .field(
+                "shard_id",
+                &match &self.state {
+                    ShardSinkOwner::Legacy(s) => s.shard_id,
+                    #[cfg(unix)]
+                    ShardSinkOwner::Owned(s) => s.shard_id(),
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -689,15 +840,23 @@ impl DurableAppendSink for ShardTelemetryStripeSink {
         appends: &[DurableAppend],
         next: DurableSinkCheckpoint,
     ) -> EngineResult<DurableSinkApply> {
+        let state = match &self.state {
+            ShardSinkOwner::Legacy(state) => state,
+            #[cfg(unix)]
+            ShardSinkOwner::Owned(_) => {
+                return Err(EngineError::UnsupportedDurability(
+                    "owned log worker requires original native work",
+                ));
+            }
+        };
         let (response, receiver) = sync_channel(1);
-        let sender = self
-            .state
+        let sender = state
             .sender
             .lock()
             .map_err(|_| EngineError::CorruptState("shard-telemetry sink lock poisoned".into()))?
             .as_ref()
             .cloned()
-            .ok_or(EngineError::WorkerStopped(self.state.shard_id))?;
+            .ok_or(EngineError::WorkerStopped(state.shard_id))?;
         sender
             .send(SinkCommand::Apply(SinkApplyCommand {
                 expected,
@@ -705,10 +864,27 @@ impl DurableAppendSink for ShardTelemetryStripeSink {
                 next,
                 response,
             }))
-            .map_err(|_| EngineError::WorkerStopped(self.state.shard_id))?;
+            .map_err(|_| EngineError::WorkerStopped(state.shard_id))?;
         receiver
             .recv()
-            .map_err(|_| EngineError::WorkerStopped(self.state.shard_id))?
+            .map_err(|_| EngineError::WorkerStopped(state.shard_id))?
+    }
+    #[cfg(unix)]
+    fn apply_until(
+        &self,
+        expected: DurableSinkCheckpoint,
+        appends: &[DurableAppend],
+        next: DurableSinkCheckpoint,
+        work: &shard_stream_engine::NativeResumeWork,
+    ) -> shard_stream_engine::NativeResumeCallbackResult<DurableSinkApply> {
+        match &self.state {
+            ShardSinkOwner::Owned(worker) => worker.apply_until(expected, appends, next, work),
+            ShardSinkOwner::Legacy(_) => {
+                Err(shard_stream_engine::NativeResumeCallbackError::unsupported(
+                    "durable sink has no bounded apply producer",
+                ))
+            }
+        }
     }
 }
 
@@ -726,4 +902,7 @@ pub struct TelemetryService {
     tier_caches: Option<TierCaches>,
     object_store: Option<SharedTelemetryObjectStore>,
     router: TelemetryRouter,
+    max_ingest_bytes: usize,
+    native_query_work: Option<crate::NativeQueryWorkLimits>,
+    native_resident: Option<crate::NativeResidentLimits>,
 }

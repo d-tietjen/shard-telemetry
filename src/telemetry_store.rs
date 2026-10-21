@@ -22,7 +22,7 @@ use shard_stream_core::{
 };
 use shard_stream_engine::{
     DurableSinkCheckpoint, DurableSinkConfig, DurableSinkOptions, EngineConfig, EngineError,
-    StreamEngine, TopicConfig,
+    EngineHandle, StreamEngine, TopicConfig,
 };
 use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest};
 
@@ -46,11 +46,28 @@ use crate::{
 
 mod analytics_signals;
 mod append;
+#[cfg(test)]
+mod append_epoch_qualification;
 mod append_helpers;
+#[cfg(test)]
+mod capacity_qualification;
+mod catalog_recovery;
+pub use catalog_recovery::TelemetryRecoveredCatalogs;
+#[cfg(test)]
+mod correlation_qualification;
+#[cfg(test)]
+mod log_query_qualification;
 mod loki;
 mod native_query;
+#[cfg(all(test, unix))]
+mod owned_engine_attachment_qualification;
+mod provider_status;
+#[cfg(test)]
+mod provider_status_qualification;
 mod remote_write;
 mod retention;
+#[cfg(test)]
+mod retention_qualification;
 mod signal_query;
 mod startup;
 #[cfg(test)]
@@ -268,6 +285,16 @@ pub struct DurableTelemetryConfig {
 pub struct DurableTelemetryLimits {
     /// Per-signal in-memory head and query limits.
     pub signals: crate::ShardTelemetryConfig,
+    /// Retained cross-signal navigation policy.
+    ///
+    /// [`crate::CorrelationConfig::disabled`] allocates no navigation postings
+    /// or identity caches; exact signal storage supplies correlation results.
+    pub correlations: crate::CorrelationConfig,
+    /// Optional per-owner native-query input, decoding and winner ceilings.
+    /// Exhaustion returns an error, never an incomplete successful result.
+    pub native_query_work: Option<crate::NativeQueryWorkLimits>,
+    /// Optional resident native payload and pre-WAL append ceilings.
+    pub native_resident: Option<crate::NativeResidentLimits>,
     /// Maximum bytes retained in each recovery index journal.
     pub max_index_journal_bytes: u64,
     /// Enables the local lifetime rollup with this distinct-series bound.
@@ -312,6 +339,9 @@ impl Default for DurableTelemetryLimits {
     fn default() -> Self {
         Self {
             signals: crate::ShardTelemetryConfig::default(),
+            correlations: crate::CorrelationConfig::default(),
+            native_query_work: None,
+            native_resident: None,
             max_index_journal_bytes: 64 * 1024 * 1024 * 1024,
             max_lifetime_rollup_series: None,
             max_lifetime_rollup_bytes: 512 * 1024 * 1024,
@@ -375,7 +405,7 @@ impl DurableTelemetryConfig {
 /// appends and whose reads execute on the owning ShardTelemetry stripe workers.
 pub struct DurableTelemetryStore {
     _data_directory_lease: DataDirectoryLease,
-    engine: Arc<StreamEngine>,
+    engine: EngineHandle,
     service: TelemetryService,
     append_durability: Durability,
     append_gate: Option<Arc<dyn TelemetryAppendGate>>,
@@ -392,6 +422,7 @@ pub struct DurableTelemetryStore {
     remote_write_append: Box<[Mutex<()>]>,
     deletes: DeleteCatalog,
     retention: Option<Duration>,
+    signal_retention: [Option<Duration>; 3],
     retention_runs: AtomicU64,
     retention_advanced_offsets: AtomicU64,
     retention_failures: AtomicU64,
@@ -417,6 +448,20 @@ pub trait TelemetryAppendGate: Send + Sync + std::fmt::Debug + 'static {
         &self,
         partitions: &[crate::NativePartitionAppend],
     ) -> Result<(), String>;
+
+    /// Supplies the current writer epoch from trusted host authority immediately
+    /// before submitting this partition to the engine.
+    ///
+    /// Hosts with an installed write fence must recheck readiness and leadership
+    /// here and return that authority's epoch. Client envelope fields cannot
+    /// supply it. The engine independently validates the token before reserving
+    /// or writing WAL; a stale token is not an append acknowledgement.
+    ///
+    /// The default preserves existing unfenced gates. Returning `None` cannot
+    /// bypass an engine that requires a writer epoch.
+    fn append_leader_epoch(&self, _topic_partition: TopicPartition) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
 }
 
 /// Durability required before ShardTelemetry acknowledges a WAL append.
@@ -477,6 +522,77 @@ impl std::fmt::Debug for TelemetryHostAttachment {
     }
 }
 
+/// A host attachment that retains the complete stream-engine owner.
+///
+/// Use this attachment when recovery returns an [`EngineHandle`]. Cloning the
+/// handle retains that same recovered engine and its directory ownership. The
+/// attachment creates no engine, write fence, readiness or startup permission.
+/// Hosts must install the matching sink and their actual assignment and fencing
+/// policy before attachment, as for [`TelemetryHostAttachment`].
+#[derive(Clone)]
+pub struct TelemetryEngineAttachment {
+    /// Product-owned directory for delete state, retry receipts and query metadata.
+    pub data_directory: PathBuf,
+    /// The host's already-opened engine, including its retained recovery owner.
+    pub engine: EngineHandle,
+    /// Query service from the exact sink factory installed in this engine.
+    pub service: TelemetryService,
+    /// Common logical signal partition count.
+    pub tenant_partitions: u32,
+    /// Number of physical sink-owner stripes selected by the host.
+    pub ingest_stripes_per_tenant: u32,
+    /// Bound for waiting on local query-index visibility.
+    pub indexed_ack_timeout: Duration,
+    /// Optional logical retention window.
+    pub retention: Option<Duration>,
+    /// WAL durability required before an append acknowledgement.
+    pub append_durability: TelemetryAppendDurability,
+    /// Actual host admission and leader-fencing check for every append path.
+    pub append_gate: Option<Arc<dyn TelemetryAppendGate>>,
+}
+
+impl From<TelemetryHostAttachment> for TelemetryEngineAttachment {
+    fn from(attachment: TelemetryHostAttachment) -> Self {
+        let TelemetryHostAttachment {
+            data_directory,
+            engine,
+            service,
+            tenant_partitions,
+            ingest_stripes_per_tenant,
+            indexed_ack_timeout,
+            retention,
+            append_durability,
+            append_gate,
+        } = attachment;
+        Self {
+            data_directory,
+            engine: engine.into(),
+            service,
+            tenant_partitions,
+            ingest_stripes_per_tenant,
+            indexed_ack_timeout,
+            retention,
+            append_durability,
+            append_gate,
+        }
+    }
+}
+
+impl std::fmt::Debug for TelemetryEngineAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TelemetryEngineAttachment")
+            .field("data_directory", &self.data_directory)
+            .field("tenant_partitions", &self.tenant_partitions)
+            .field("ingest_stripes_per_tenant", &self.ingest_stripes_per_tenant)
+            .field("indexed_ack_timeout", &self.indexed_ack_timeout)
+            .field("retention", &self.retention)
+            .field("append_durability", &self.append_durability)
+            .field("append_gate_configured", &self.append_gate.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl From<TelemetryAppendDurability> for Durability {
     fn from(value: TelemetryAppendDurability) -> Self {
         match value {
@@ -504,7 +620,7 @@ pub struct FetchedTelemetryBatch {
     pub envelope: crate::TelemetryEnvelope,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedAppendReceipt {
     request_id: String,
     payload_digest: String,

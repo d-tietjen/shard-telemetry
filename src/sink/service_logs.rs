@@ -1,6 +1,31 @@
 use super::*;
 
 impl TelemetryService {
+    fn log_query_result_capacity(&self, limit: Option<usize>, owners: usize) -> usize {
+        let capacity = fanout_result_capacity(limit, owners);
+        self.native_query_work.map_or(capacity, |work| {
+            capacity.min(work.max_winner_records.saturating_mul(owners.max(1)))
+        })
+    }
+
+    fn admit_log_query_results<'a>(
+        &self,
+        count: usize,
+        matches: impl Iterator<Item = &'a LogMatch>,
+        owners: usize,
+    ) -> TelemetryResult<()> {
+        if let Some(mut work) = self.native_query_work {
+            work.max_winner_records = work.max_winner_records.saturating_mul(owners.max(1));
+            work.max_winner_bytes = work.max_winner_bytes.saturating_mul(owners.max(1));
+            work.winners(count)?;
+            let mut budget = crate::query_work::LogQueryWorkBudget::new(Some(work));
+            for matched in matches {
+                budget.replace(None, &matched.record, 0)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn query_partitions(&self, queries: &[LogQuery]) -> TelemetryResult<Vec<LogMatch>> {
         let Some(ordering_query) = queries.first() else {
             return Ok(Vec::new());
@@ -24,7 +49,7 @@ impl TelemetryService {
         }
 
         let mut matches =
-            Vec::with_capacity(fanout_result_capacity(ordering_query.limit, worker_count));
+            Vec::with_capacity(self.log_query_result_capacity(ordering_query.limit, worker_count));
         for _ in 0..worker_count {
             let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
                 TelemetryError::QueryWorkerUnavailable(
@@ -32,6 +57,11 @@ impl TelemetryService {
                 )
             })?;
             let worker_matches = worker_result?;
+            self.admit_log_query_results(
+                matches.len().saturating_add(worker_matches.len()),
+                matches.iter().chain(worker_matches.iter()),
+                worker_count,
+            )?;
             matches.reserve(worker_matches.len());
             matches.extend(worker_matches);
         }
@@ -89,10 +119,9 @@ impl TelemetryService {
                 })?;
         }
 
-        let mut matches = Vec::with_capacity(fanout_result_capacity(
-            ordering_query.limit,
-            dispatched_workers,
-        ));
+        let mut matches = Vec::with_capacity(
+            self.log_query_result_capacity(ordering_query.limit, dispatched_workers),
+        );
         for _ in 0..dispatched_workers {
             let (_shard_id, worker_result) = receiver.recv().map_err(|_| {
                 TelemetryError::QueryWorkerUnavailable(
@@ -100,6 +129,11 @@ impl TelemetryService {
                 )
             })?;
             let worker_matches = worker_result?;
+            self.admit_log_query_results(
+                matches.len().saturating_add(worker_matches.len()),
+                matches.iter().chain(worker_matches.iter()),
+                dispatched_workers,
+            )?;
             matches.reserve(worker_matches.len());
             matches.extend(worker_matches);
         }
@@ -184,6 +218,18 @@ impl TelemetryService {
                 )
             })?;
             let worker_matches = worker_result?;
+            self.admit_log_query_results(
+                matches
+                    .iter()
+                    .map(Vec::len)
+                    .chain(worker_matches.iter().map(|(_, batch)| batch.len()))
+                    .fold(0usize, usize::saturating_add),
+                matches
+                    .iter()
+                    .flatten()
+                    .chain(worker_matches.iter().flat_map(|(_, batch)| batch.iter())),
+                dispatched_workers,
+            )?;
             for (index, worker) in worker_matches {
                 let combined = matches.get_mut(index).ok_or_else(|| {
                     TelemetryError::QueryWorkerUnavailable(
@@ -595,12 +641,16 @@ impl TelemetryService {
         &self,
         tenant: Arc<str>,
     ) -> TelemetryResult<Vec<TopicPartition>> {
-        let mut cache = self.active_log_partition_cache.lock().map_err(|_| {
-            TelemetryError::QueryWorkerUnavailable(
-                "active log partition cache lock poisoned".into(),
-            )
-        })?;
-        if let Some(partitions) = cache.get(&tenant) {
+        let mut cache = if self.native_query_work.is_none() {
+            Some(self.active_log_partition_cache.lock().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(
+                    "active log partition cache lock poisoned".into(),
+                )
+            })?)
+        } else {
+            None
+        };
+        if let Some(partitions) = cache.as_ref().and_then(|cache| cache.get(&tenant)) {
             return Ok(partitions.clone());
         }
         let workers = self.worker_senders()?;
@@ -630,7 +680,9 @@ impl TelemetryService {
         }
         partitions.sort_unstable();
         partitions.dedup();
-        cache.insert(tenant, partitions.clone());
+        if let Some(cache) = cache.as_mut() {
+            cache.insert(tenant, partitions.clone());
+        }
         Ok(partitions)
     }
 }

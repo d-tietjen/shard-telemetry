@@ -7,10 +7,7 @@ impl DurableTelemetryStore {
         query: &crate::TraceQuery,
     ) -> Result<Vec<crate::DurableSpan>, LokiApiError> {
         let mut query = query.clone();
-        if let Some(cutoff) = self.retention_cutoff() {
-            if query.end_time_unix_nanos.is_some_and(|end| end <= cutoff) {
-                return Ok(Vec::new());
-            }
+        if let Some(cutoff) = self.signal_retention_cutoff(crate::TelemetrySignal::Traces) {
             query.start_time_unix_nanos = Some(
                 query
                     .start_time_unix_nanos
@@ -41,10 +38,7 @@ impl DurableTelemetryStore {
         query: &crate::TraceQuery,
     ) -> Result<Vec<crate::DurableSpan>, LokiApiError> {
         let mut query = query.clone();
-        if let Some(cutoff) = self.retention_cutoff() {
-            if query.end_time_unix_nanos.is_some_and(|end| end <= cutoff) {
-                return Ok(Vec::new());
-            }
+        if let Some(cutoff) = self.signal_retention_cutoff(crate::TelemetrySignal::Traces) {
             query.start_time_unix_nanos = Some(
                 query
                     .start_time_unix_nanos
@@ -72,7 +66,7 @@ impl DurableTelemetryStore {
         query: &crate::MetricQuery,
     ) -> Result<Vec<crate::DurableMetricPoint>, LokiApiError> {
         let mut query = query.clone();
-        if let Some(cutoff) = self.retention_cutoff() {
+        if let Some(cutoff) = self.signal_retention_cutoff(crate::TelemetrySignal::Metrics) {
             if query.end_time_unix_nanos.is_some_and(|end| end < cutoff) {
                 return Ok(Vec::new());
             }
@@ -107,19 +101,14 @@ impl DurableTelemetryStore {
         &self,
         query: &crate::CorrelationQuery,
     ) -> Result<Vec<crate::TelemetryRecordRef>, LokiApiError> {
-        let mut query = query.clone();
-        if let Some(cutoff) = self.retention_cutoff() {
-            if query.end_time_unix_nanos.is_some_and(|end| end < cutoff) {
-                return Ok(Vec::new());
-            }
-            query.start_time_unix_nanos = Some(
-                query
-                    .start_time_unix_nanos
-                    .map_or(cutoff, |start| start.max(cutoff)),
-            );
-        }
+        let cutoffs = [
+            crate::TelemetrySignal::Logs,
+            crate::TelemetrySignal::Traces,
+            crate::TelemetrySignal::Metrics,
+        ]
+        .map(|signal| self.signal_retention_cutoff(signal).unwrap_or(0));
         self.service
-            .query_correlations(&query)
+            .query_correlations_with_retention(query, cutoffs)
             .map_err(|error| LokiApiError::internal(error.to_string()))
     }
 }

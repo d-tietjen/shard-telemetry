@@ -22,10 +22,12 @@ use crate::{
 };
 
 mod codec;
+mod query_bounded;
 mod query_helpers;
 mod stripe;
 #[cfg(test)]
 mod tests;
+pub(crate) use codec::decode_metric_chunk_with_work_limits;
 use codec::*;
 pub use codec::{decode_metric_chunk, encode_metric_chunk};
 pub use query_helpers::prometheus_string_labels;
@@ -401,6 +403,8 @@ struct SeriesHead {
 #[derive(Debug)]
 pub struct MetricStripe {
     head_budget_bytes: usize,
+    query_work_limits: Option<crate::NativeQueryWorkLimits>,
+    resident_payload_limit: Option<u64>,
     head_bytes: usize,
     out_of_order_nanos: u64,
     chunk_bytes: usize,

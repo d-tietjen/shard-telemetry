@@ -3,6 +3,73 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+mod bounded_decompression;
+mod bounded_frames;
+#[cfg(unix)]
+mod recovery_decompression;
+#[cfg(unix)]
+mod recovery_index;
+#[cfg(unix)]
+mod recovery_messages;
+#[cfg(unix)]
+mod recovery_metadata;
+#[cfg(unix)]
+mod recovery_offsets;
+#[cfg(unix)]
+mod recovery_packed_metadata;
+#[cfg(unix)]
+mod recovery_sections;
+#[cfg(unix)]
+mod recovery_timestamps;
+pub(crate) use bounded_decompression::{FrameDecompressionLimits, FrameWork};
+pub(crate) use bounded_frames::{
+    IndexedFramePreparationLimits, PreparedIndexedIngestFrames, RetainedIndexedFrameError,
+    prepare_indexed_ingest_frames_until,
+};
+#[cfg(unix)]
+pub use recovery_decompression::{
+    PreparedRecoveredLogFrame, RetainedRecoveredLogFrameError, decompress_recovered_log_frame_until,
+};
+#[cfg(unix)]
+pub use recovery_index::{
+    PreparedRecoveredStructuralIndex, RecoveredStructuralIndexLimits,
+    RecoveredStructuralIndexUsage, RetainedRecoveredStructuralIndexError,
+};
+#[cfg(unix)]
+pub use recovery_messages::{
+    PreparedRecoveredMessages, RecoveredMessageBytes, RecoveredMessageLimits,
+    RecoveredMessageUsage, RetainedRecoveredMessageError,
+};
+#[cfg(unix)]
+pub use recovery_metadata::{
+    PreparedRecoveredStructuralMetadataBytes, RecoveredStructuralMetadataByteUsage,
+    RetainedRecoveredStructuralMetadataByteError,
+};
+#[cfg(unix)]
+pub use recovery_offsets::{
+    PreparedRecoveredStructuralOffsets, RecoveredStructuralOffsetLimits,
+    RecoveredStructuralOffsetUsage, RetainedRecoveredStructuralOffsetError,
+};
+#[cfg(unix)]
+pub use recovery_packed_metadata::{
+    PreparedRecoveredPackedMetadata, RecoveredPackedInput, RecoveredPackedMetadataLimits,
+    RecoveredPackedMetadataUsage, RecoveredPackedNode, RecoveredPackedNodeKind,
+    RecoveredPackedRecord, RecoveredPackedRejection, RecoveredPackedValue,
+    RetainedRecoveredPackedMetadataError,
+};
+#[cfg(unix)]
+pub use recovery_sections::{
+    PreparedRecoveredStructuralSections, RecoveredStructuralSection,
+    RecoveredStructuralSectionLimits, RecoveredStructuralSectionUsage,
+    RetainedRecoveredStructuralSectionError,
+};
+
+#[cfg(unix)]
+pub use recovery_timestamps::{
+    PreparedRecoveredStructuralTimestamps, RecoveredStructuralTimestampLimits,
+    RecoveredStructuralTimestampUsage, RetainedRecoveredStructuralTimestampError,
+};
+
 use bytes::Bytes;
 use shard_stream_core::LogicalOffset;
 
@@ -280,9 +347,26 @@ pub(crate) fn validate_ingest_pack(
     payload: &[u8],
     expected_record_count: u32,
 ) -> TelemetryResult<()> {
+    validate_ingest_pack_with_work_limits(payload, expected_record_count, None)
+}
+
+pub(crate) fn validate_ingest_pack_with_work_limits(
+    payload: &[u8],
+    expected_record_count: u32,
+    limits: Option<crate::NativeQueryWorkLimits>,
+) -> TelemetryResult<()> {
+    if let Some(limits) = limits {
+        limits.encoded(payload.len())?;
+        limits.rows(expected_record_count as usize)?;
+    }
     let mut cursor = IngestPackCursor::new(payload, expected_record_count)?;
+    let mut structural_bytes = 0_usize;
     for _ in 0..cursor.group_count {
         let group = cursor.next_group()?;
+        if let Some(limits) = limits {
+            structural_bytes = structural_bytes.saturating_add(group.structural_bytes);
+            limits.metric_values(structural_bytes)?;
+        }
         validate_group(&group)?;
     }
     cursor.finish()

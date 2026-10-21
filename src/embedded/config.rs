@@ -79,14 +79,18 @@ impl EmbeddedTelemetryConfig {
         config
     }
 
-    /// Sets a total bound for storage-engine telemetry state in RAM.
+    /// Derives finite encoded/materialization ceilings from a RAM allowance.
     ///
-    /// Two thirds is divided across log, trace, and metric heads on every
-    /// physical stripe, one twelfth is reserved for compression dictionaries,
-    /// and the remainder is divided across verified payload and control caches.
+    /// One quarter reserves sealed native payloads across logical partitions;
+    /// append and query work have separate per-owner reserves. The remaining
+    /// allowance is divided across queues, heads, dictionaries and caches.
+    /// A local or S3 immutable tier is required. These declared state charges
+    /// do not measure allocator overhead, startup metadata or process RSS.
+    /// Configurations without a RAM allowance retain their existing policy.
     #[must_use]
     pub fn with_max_ram_bytes(mut self, max_bytes: u64) -> Self {
         self.max_ram_bytes = Some(max_bytes);
+        self.local_limits.correlations = crate::CorrelationConfig::disabled();
         let stripes = u64::from(
             self.store
                 .shard_count
@@ -94,6 +98,38 @@ impl EmbeddedTelemetryConfig {
                 .max(1),
         );
         let physical_shards = u64::from(self.store.shard_count.max(1));
+        let mut resident = crate::NativeResidentLimits::for_ram_budget(
+            max_bytes,
+            physical_shards,
+            u16::try_from(self.store.tenant_partitions).unwrap_or(u16::MAX),
+            u16::try_from(self.store.tenant_partitions).unwrap_or(u16::MAX),
+        );
+        resident.clamp_partition_bytes(self.object_tier.max_group_payload_bytes);
+        self.local_limits.native_resident = Some(resident);
+        self.object_tier.target_group_payload_bytes = self
+            .object_tier
+            .target_group_payload_bytes
+            .min(resident.publication_target_bytes());
+        self.object_tier.max_group_payload_bytes = self
+            .object_tier
+            .max_group_payload_bytes
+            .min(resident.max_payload_bytes_per_partition);
+        let work = crate::NativeQueryWorkLimits::for_ram_budget(max_bytes, physical_shards);
+        self.local_limits.native_query_work = Some(work);
+        for (cache, ceiling) in [
+            (
+                &mut self.local_limits.payload_cache,
+                work.max_encoded_block_bytes,
+            ),
+            (
+                &mut self.local_limits.control_cache,
+                work.max_control_object_bytes,
+            ),
+        ] {
+            let ceiling = u64::try_from(ceiling).unwrap_or(u64::MAX);
+            cache.chunk_bytes = cache.chunk_bytes.min(ceiling).max(1);
+            cache.max_read_bytes = cache.max_read_bytes.min(ceiling).max(cache.chunk_bytes);
+        }
         let queue_total = (max_bytes / 16).max(1);
         self.local_limits.queue_bytes_per_shard =
             usize_from_u64((queue_total / physical_shards).max(1));
@@ -116,11 +152,18 @@ impl EmbeddedTelemetryConfig {
             .target_pack_bytes
             .min(u64::try_from(self.local_limits.max_batch_bytes).unwrap_or(u64::MAX))
             .max(1);
-        let component_bytes = max_bytes.saturating_sub(
-            u64::try_from(self.local_limits.queue_bytes_per_shard)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(physical_shards),
-        );
+        let component_bytes = max_bytes
+            .saturating_sub(
+                u64::try_from(self.local_limits.queue_bytes_per_shard)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(physical_shards),
+            )
+            .saturating_sub(resident.reserved_bytes(
+                u16::try_from(self.store.tenant_partitions).unwrap_or(u16::MAX),
+                u16::try_from(self.store.tenant_partitions).unwrap_or(u16::MAX),
+            ))
+            .saturating_sub(resident.materialization_reserve_bytes(physical_shards))
+            .saturating_sub(max_bytes / 16 * 3);
         let head_total = component_bytes.saturating_mul(2) / 3;
         let head_per_stripe = head_total / stripes;
         let logs = (head_per_stripe / 8).max(1);
@@ -152,6 +195,20 @@ impl EmbeddedTelemetryConfig {
         self.local_limits.control_cache.parsed_memory_bytes = control_total / 4;
         self.local_limits.payload_cache.memory_bytes = cache_total.saturating_sub(control_total);
         self.local_limits.payload_cache.parsed_memory_bytes = 0;
+        if let Some(resident) = &mut self.local_limits.native_resident {
+            let decoded = resident
+                .append_work
+                .max_winner_bytes
+                .min(usize_from_u64(traces.min(metrics)));
+            resident.append_work.max_winner_bytes = decoded;
+            resident.append_work.max_decoded_sidecar_bytes = decoded;
+            let row = std::mem::size_of::<crate::DurableSpan>()
+                .max(std::mem::size_of::<crate::DurableMetricPoint>())
+                .max(1);
+            let rows = (decoded / row).max(1);
+            resident.append_work.max_decoded_records = rows;
+            resident.append_work.max_winner_records = rows;
+        }
         self
     }
 
@@ -189,6 +246,13 @@ impl EmbeddedTelemetryConfig {
                 .object_tier
                 .target_group_payload_bytes
                 .min((self.object_tier.max_group_payload_bytes / 2).max(1));
+        }
+        if let Some(resident) = &mut self.local_limits.native_resident {
+            resident.clamp_partition_bytes(self.object_tier.max_group_payload_bytes);
+            self.object_tier.target_group_payload_bytes = self
+                .object_tier
+                .target_group_payload_bytes
+                .min(resident.publication_target_bytes());
         }
         self
     }
@@ -260,12 +324,92 @@ impl EmbeddedTelemetryConfig {
             ));
         }
         if let Some(max_bytes) = self.max_ram_bytes {
+            if self.store.object_store_directory.is_none() && self.store.s3_object_store.is_none() {
+                return Err(LokiApiError::configuration(
+                    "bounded embedded RAM requires a local or S3 immutable object tier",
+                ));
+            }
+            if self.local_limits.correlations != crate::CorrelationConfig::disabled() {
+                return Err(LokiApiError::configuration(
+                    "bounded embedded RAM requires disabled retained correlation navigation",
+                ));
+            }
             let stripes = u64::from(
                 self.store
                     .shard_count
                     .min(self.store.tenant_partitions)
                     .max(1),
             );
+            let work = self.local_limits.native_query_work.ok_or_else(|| {
+                LokiApiError::configuration(
+                    "bounded embedded RAM requires native query work ceilings",
+                )
+            })?;
+            let resident = self.local_limits.native_resident.ok_or_else(|| {
+                LokiApiError::configuration(
+                    "bounded embedded RAM requires native resident ceilings",
+                )
+            })?;
+            resident
+                .validate()
+                .map_err(|error| LokiApiError::configuration(error.to_string()))?;
+            let trace_parts = u16::try_from(self.store.tenant_partitions).unwrap_or(u16::MAX);
+            let owners = u64::from(self.store.shard_count.max(1));
+            let resident_ceiling = crate::NativeResidentLimits::for_ram_budget(
+                max_bytes,
+                owners,
+                trace_parts,
+                trace_parts,
+            );
+            let actual = resident.append_work;
+            let maximum = resident_ceiling.append_work;
+            if resident.max_payload_bytes_per_partition
+                > resident_ceiling.max_payload_bytes_per_partition
+                || self.object_tier.max_group_payload_bytes
+                    < resident.max_payload_bytes_per_partition
+                || actual.max_encoded_block_bytes > maximum.max_encoded_block_bytes
+                || actual.max_decoded_sidecar_bytes > maximum.max_decoded_sidecar_bytes
+                || actual.max_decoded_records > maximum.max_decoded_records
+                || actual.max_winner_records > maximum.max_winner_records
+                || actual.max_winner_bytes > maximum.max_winner_bytes
+                || actual.max_winner_bytes
+                    > self
+                        .local_limits
+                        .signals
+                        .traces
+                        .head_memory_bytes_per_stripe
+                        .min(
+                            self.local_limits
+                                .signals
+                                .metrics
+                                .head_memory_bytes_per_stripe,
+                        )
+            {
+                return Err(LokiApiError::configuration(
+                    "native resident ceilings exceed the RAM policy",
+                ));
+            }
+            work.validate()
+                .map_err(|error| LokiApiError::configuration(error.to_string()))?;
+            let ceiling = crate::NativeQueryWorkLimits::for_ram_budget(
+                max_bytes,
+                u64::from(self.store.shard_count.max(1)),
+            );
+            if work.max_encoded_block_bytes > ceiling.max_encoded_block_bytes
+                || work.max_decoded_sidecar_bytes > ceiling.max_decoded_sidecar_bytes
+                || work.max_decoded_records > ceiling.max_decoded_records
+                || work.max_winner_records > ceiling.max_winner_records
+                || work.max_winner_bytes > ceiling.max_winner_bytes
+                || work.max_control_object_bytes > ceiling.max_control_object_bytes
+                || self.local_limits.payload_cache.chunk_bytes
+                    > u64::try_from(work.max_encoded_block_bytes).unwrap_or(u64::MAX)
+                || self.local_limits.control_cache.chunk_bytes
+                    > u64::try_from(work.max_control_object_bytes).unwrap_or(u64::MAX)
+            {
+                return Err(LokiApiError::configuration(
+                    "native query work ceilings exceed the per-stripe RAM policy",
+                ));
+            }
             let heads = [
                 self.local_limits.signals.logs.head_memory_bytes_per_stripe,
                 self.local_limits
@@ -298,6 +442,9 @@ impl EmbeddedTelemetryConfig {
                 .saturating_add(dictionaries)
                 .saturating_add(caches)
                 .saturating_add(queues)
+                .saturating_add(resident.reserved_bytes(trace_parts, trace_parts))
+                .saturating_add(resident.materialization_reserve_bytes(owners))
+                .saturating_add(max_bytes / 16 * 3)
                 > max_bytes
             {
                 return Err(LokiApiError::configuration(

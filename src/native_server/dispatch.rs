@@ -13,12 +13,16 @@ pub(super) async fn dispatch(
             | NativeOpcode::QueryLogsPage
             | NativeOpcode::QueryMetrics
             | NativeOpcode::QueryTraces
+            | NativeOpcode::ProviderStatus
     ) && let Some(gate) = &config.request_gate
         && let Err(error) = gate.check_query()
     {
         return error_frame(header, NativeStatus::Unavailable, &error);
     }
     match header.opcode {
+        NativeOpcode::ProviderStatus => {
+            super::provider_status::dispatch_provider_status(header, payload, store, config).await
+        }
         NativeOpcode::Ping => ok_frame(header, payload),
         NativeOpcode::Describe => {
             if let Some(gate) = &config.request_gate
@@ -47,6 +51,15 @@ pub(super) async fn dispatch(
                 capabilities = gate.capabilities(capabilities);
             }
             match encode_native_capabilities(&capabilities) {
+                Ok(encoded)
+                    if capabilities.query_logs
+                        || capabilities.query_metrics
+                        || capabilities.query_traces
+                        || capabilities.query_series
+                        || capabilities.append_queryable =>
+                {
+                    query_ok_frame(header, encoded, config)
+                }
                 Ok(encoded) => ok_frame(header, encoded),
                 Err(error) => error_frame(header, NativeStatus::Internal, &error.to_string()),
             }
@@ -417,7 +430,7 @@ pub(super) async fn dispatch(
                 None => worker.await,
             };
             match result {
-                Ok(Ok(encoded)) => ok_frame(header, encoded),
+                Ok(Ok(encoded)) => query_ok_frame(header, encoded, config),
                 Ok(Err(error)) => store_error_frame(header, error),
                 Err(error) => error_frame(
                     header,
@@ -497,7 +510,7 @@ pub(super) async fn dispatch(
                 None => worker.await,
             };
             match result {
-                Ok(Ok(encoded)) => ok_frame(header, encoded),
+                Ok(Ok(encoded)) => query_ok_frame(header, encoded, config),
                 Ok(Err(error)) => store_error_frame(header, error),
                 Err(error) => error_frame(
                     header,
@@ -575,7 +588,7 @@ pub(super) async fn dispatch(
             };
             match result {
                 Ok(Ok(points)) => match encode_native_metric_query_result(&points) {
-                    Ok(encoded) => ok_frame(header, encoded),
+                    Ok(encoded) => query_ok_frame(header, encoded, config),
                     Err(error) => error_frame(header, NativeStatus::Internal, &error.to_string()),
                 },
                 Ok(Err(error)) => store_error_frame(header, error),
@@ -655,7 +668,7 @@ pub(super) async fn dispatch(
             };
             match result {
                 Ok(Ok(spans)) => match encode_native_trace_query_result(&spans) {
-                    Ok(encoded) => ok_frame(header, encoded),
+                    Ok(encoded) => query_ok_frame(header, encoded, config),
                     Err(error) => error_frame(header, NativeStatus::Internal, &error.to_string()),
                 },
                 Ok(Err(error)) => store_error_frame(header, error),
@@ -667,6 +680,23 @@ pub(super) async fn dispatch(
             }
         }
     }
+}
+
+// All callers supply a successfully encoded query-bearing response. Keep the
+// original product gate and check it again only after actual execution/encoding.
+pub(super) fn query_ok_frame(
+    header: NativeFrameHeader,
+    payload: Vec<u8>,
+    config: &NativeServerConfig,
+) -> NativeFrame {
+    #[cfg(test)]
+    super::response_qualification::encoded_response(header.opcode, &payload);
+    if let Some(gate) = &config.request_gate
+        && let Err(error) = gate.check_query()
+    {
+        return error_frame(header, NativeStatus::Unavailable, &error);
+    }
+    ok_frame(header, payload)
 }
 
 pub(super) fn ok_frame(header: NativeFrameHeader, payload: Vec<u8>) -> NativeFrame {

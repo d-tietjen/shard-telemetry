@@ -91,6 +91,8 @@ pub enum NativeOpcode {
     AppendUntracked = 8,
     /// Executes a byte-bounded, cursor-paginated log query.
     QueryLogsPage = 9,
+    /// Observes bounded local WAL and applied-index frontiers without claiming source coverage.
+    ProviderStatus = 10,
 }
 
 impl NativeOpcode {
@@ -105,6 +107,7 @@ impl NativeOpcode {
             7 => Ok(Self::Describe),
             8 => Ok(Self::AppendUntracked),
             9 => Ok(Self::QueryLogsPage),
+            10 => Ok(Self::ProviderStatus),
             _ => Err(NativeProtocolError::new(format!(
                 "unsupported native opcode {value}"
             ))),

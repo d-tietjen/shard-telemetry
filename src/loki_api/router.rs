@@ -85,12 +85,15 @@ pub fn single_tenant_loki_api_router(
 
 pub(super) fn build_loki_router(
     store: Arc<dyn LokiStore>,
-    api_config: LokiApiConfig,
+    mut api_config: LokiApiConfig,
     analytics_bearer_token: Option<Arc<str>>,
     production: Option<Arc<ProductionRuntime>>,
     flush_timeout: Duration,
     include_operational_routes: bool,
 ) -> Router {
+    if let Some(maximum) = store.maximum_ingest_request_bytes() {
+        api_config.max_request_bytes = api_config.max_request_bytes.min(maximum);
+    }
     let (live, _) = broadcast::channel(1_024);
     let analytics_enabled = analytics_bearer_token.is_some();
     let state = ApiState {

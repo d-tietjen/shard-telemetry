@@ -44,6 +44,11 @@ impl DurableTelemetryStore {
         transient_context: Option<Bytes>,
         wait_for_index: bool,
     ) -> Result<crate::NativePartitionAck, LokiApiError> {
+        self.check_append_encoded_sizes(std::iter::once(payload.len()))?;
+        let leader_epoch = self.append_gate.as_ref().map_or(Ok(None), |gate| {
+            gate.append_leader_epoch(topic_partition)
+                .map_err(LokiApiError::unavailable)
+        })?;
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = AppendRequest {
             request_id: u128::from(request_id),
@@ -54,7 +59,7 @@ impl DurableTelemetryStore {
             durability: self.append_durability,
             producer: None,
             atomic_group: None,
-            leader_epoch: None,
+            leader_epoch,
             extension_context: None,
         };
         let appended = if let Some(transient_context) = transient_context {
@@ -98,6 +103,7 @@ impl DurableTelemetryStore {
         &self,
         partitions: &[crate::NativePartitionAppend],
     ) -> Result<(), LokiApiError> {
+        self.check_append_partition_sizes(partitions)?;
         if partitions.is_empty() {
             return Ok(());
         }
@@ -105,6 +111,19 @@ impl DurableTelemetryStore {
             gate.check_append_partitions(partitions)
                 .map_err(LokiApiError::unavailable)
         })
+    }
+
+    pub(super) fn check_append_partition_sizes(
+        &self,
+        partitions: &[crate::NativePartitionAppend],
+    ) -> Result<(), LokiApiError> {
+        self.check_append_encoded_sizes(
+            partitions
+                .iter()
+                .map(|partition| partition.envelope.encoded_len())
+                .collect::<crate::TelemetryResult<Vec<_>>>()
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?,
+        )
     }
 
     pub(super) fn check_append_partition_encoded(
@@ -115,6 +134,7 @@ impl DurableTelemetryStore {
         transient_context: Option<&[u8]>,
         already_validated: bool,
     ) -> Result<(), LokiApiError> {
+        self.check_append_encoded_sizes(std::iter::once(encoded_envelope.len()))?;
         let Some(gate) = &self.append_gate else {
             return Ok(());
         };
@@ -144,5 +164,28 @@ impl DurableTelemetryStore {
             transient_context: transient_context.map(Arc::<[u8]>::from),
         }])
         .map_err(LokiApiError::unavailable)
+    }
+
+    pub(super) fn check_append_encoded_sizes(
+        &self,
+        sizes: impl IntoIterator<Item = usize>,
+    ) -> Result<(), LokiApiError> {
+        let mut total = 0_usize;
+        for size in sizes {
+            if size > self.engine.maximum_batch_bytes() {
+                return Err(LokiApiError::bad_request(
+                    "telemetry envelope exceeds the configured engine append limit",
+                ));
+            }
+            total = total.checked_add(size).ok_or_else(|| {
+                LokiApiError::bad_request("telemetry batch encoding size exceeds usize")
+            })?;
+            if total > self.service.maximum_ingest_bytes() {
+                return Err(LokiApiError::bad_request(
+                    "telemetry batch exceeds the configured signal ingestion limit",
+                ));
+            }
+        }
+        Ok(())
     }
 }
