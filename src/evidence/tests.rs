@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
+use serde::Deserialize;
 use shard_stream_core::{LogicalPartitionId, ShardId};
 
 use super::*;
@@ -15,6 +16,35 @@ use crate::{
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+// Decode original addresses directly: TopicId is u128, while a generic JSON
+// Value cannot preserve these identities through its ordinary numeric model.
+#[derive(Deserialize)]
+struct PublishedManifestIdentity {
+    source: PublishedSourceIdentity,
+    events: Vec<PublishedEventIdentity>,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedSourceIdentity {
+    source_sequence: u64,
+    source_shard_id: ShardId,
+    source_partition: TopicPartition,
+    observed_source_next_offset: LogicalOffset,
+    retained_source_start_offset: Option<LogicalOffset>,
+    clock: serde_json::Value,
+    completeness: serde_json::Value,
+    loss: serde_json::Value,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedEventIdentity {
+    original: TelemetryRecordRef,
+    producer_event_id: Option<String>,
+    process_incarnation: [u8; 16],
+}
 
 struct Directory(PathBuf);
 
@@ -303,8 +333,31 @@ fn typed_signal_payloads_and_original_identities_survive_complete_manifest_last_
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
         assert_eq!(parsed["format_version"], 1);
         assert_eq!(parsed["payload_schema"], "STELv1");
-        assert_eq!(parsed["source"], serde_json::to_value(&c).unwrap());
-        assert_eq!(parsed["events"], serde_json::to_value(&e).unwrap());
+        assert!(signal.topic_id().get() > u128::from(u64::MAX));
+        let identities: PublishedManifestIdentity = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(
+            identities.source,
+            PublishedSourceIdentity {
+                source_sequence: c.source_sequence,
+                source_shard_id: c.source_shard_id,
+                source_partition: c.source_partition,
+                observed_source_next_offset: c.observed_source_next_offset,
+                retained_source_start_offset: c.retained_source_start_offset,
+                clock: serde_json::to_value(&c.clock).unwrap(),
+                completeness: serde_json::to_value(c.completeness).unwrap(),
+                loss: serde_json::to_value(&c.loss).unwrap(),
+            }
+        );
+        assert_eq!(
+            identities.events,
+            e.iter()
+                .map(|event| PublishedEventIdentity {
+                    original: event.original,
+                    producer_event_id: event.producer_event_id.clone(),
+                    process_incarnation: event.process_incarnation,
+                })
+                .collect::<Vec<_>>()
+        );
         assert_eq!(parsed["admission"], serde_json::to_value(&a).unwrap());
         assert_eq!(
             parsed["object_digest"],

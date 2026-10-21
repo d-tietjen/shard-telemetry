@@ -60,6 +60,12 @@ BLAKE3 over the domain `shard-telemetry-evidence-bundle-v1\0` followed by those
 canonical fields without `bundle_id`. The receipt also carries the exact manifest
 BLAKE3 digest and length. ETag/version tokens are not content digests.
 
+Topic IDs in source and event addresses are 128-bit JSON integers. Consumers,
+including central discovery/query adapters, must parse them losslessly using
+typed 128-bit integer decoding or an equivalent decimal-preserving parser.
+Do not round or narrow them through floating-point JSON values when comparing
+original identities.
+
 The source context also retains the original physical shard as provenance, not
 authorization or part of the immutable logical event identity. Each event retains
 its original signal/partition/offset, existing producer event
